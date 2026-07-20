@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Study Logger Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/data/com.termux/files/home/telegram-study-bot
+EnvironmentFile=/data/data/com.termux/files/home/telegram-study-bot/.env
+ExecStart=/data/data/com.termux/files/usr/bin/python /data/data/com.termux/files/home/telegram-study-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

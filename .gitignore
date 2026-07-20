@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Local data
+*.sqlite
+*.db
+sqlite_mirror.db
+backups/
+*.dump
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Telethon test session (contains user credentials)
+test_session.session
+test_session.session-journal
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
