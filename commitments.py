@@ -198,6 +198,40 @@ def run_checks_for_date(
     return results
 
 
+def backfill_checks(
+    *, days: int = 3, end_date: str | None = None,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """Re-verify the last N days (idempotent). Heals streaks after downtime:
+    without this, a bot offline over a nightly check leaves gap days that
+    break streaks the user actually kept."""
+    end = dt.date.fromisoformat((end_date or session_context.local_today_iso())[:10])
+    for offset in range(days, 0, -1):
+        run_checks_for_date((end - dt.timedelta(days=offset)).isoformat(), db_path=db_path)
+
+
+def verify_weekly_goal(
+    goal: dict[str, Any], end_date: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> dict[str, Any]:
+    """Measure a Weekly-period goal over the 7 days ending end_date.
+
+    Same deterministic ledger machinery as daily checks, summed across the
+    week. met is None when the goal can't be verified from the ledger.
+    """
+    end = dt.date.fromisoformat(end_date[:10])
+    target = float(goal.get("target") or 0)
+    total = 0.0
+    for offset in range(7):
+        check = verify_goal_for_date(
+            goal, (end - dt.timedelta(days=offset)).isoformat(), db_path=db_path
+        )
+        if check["met"] is None:
+            return {"title": goal.get("title"), "value": None, "target": target, "met": None}
+        total += check["value"] or 0
+    return {"title": goal.get("title"), "value": total, "target": target,
+            "met": total >= target}
+
+
 def streak(
     goal_id: str, *, as_of: str | None = None, db_path: str | Path = DEFAULT_DB_PATH
 ) -> int:

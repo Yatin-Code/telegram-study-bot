@@ -364,6 +364,17 @@ _TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
+def validate_hhmm(raw: str) -> tuple[bool, str]:
+    """Validate a 24h HH:MM string. Returns (True, canonical) or (False, error)."""
+    match = _TIME_RE.match(str(raw).strip())
+    if not match:
+        return False, "use HH:MM (24h), e.g. 21:30"
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return False, "hours 0-23, minutes 0-59"
+    return True, f"{hour:02d}:{minute:02d}"
+
+
 def setting_entry(key: str) -> dict | None:
     return next((e for e in SETTINGS_REGISTRY if e["key"] == key), None)
 
@@ -389,13 +400,7 @@ def validate_setting(key: str, raw: str) -> tuple[bool, str]:
     raw = str(raw).strip()
     kind = entry["type"]
     if kind == "time":
-        match = _TIME_RE.match(raw)
-        if not match:
-            return False, "use HH:MM (24h), e.g. 21:30"
-        hour, minute = int(match.group(1)), int(match.group(2))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            return False, "hours 0-23, minutes 0-59"
-        return True, f"{hour:02d}:{minute:02d}"
+        return validate_hhmm(raw)
     if kind == "weekday":
         try:
             day = int(raw)

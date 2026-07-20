@@ -1113,10 +1113,14 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             job = await asyncio.to_thread(
                 user_jobs.create_job, draft["chat_id"], data
             )
-            message = (
-                f"⏰ Job created — {user_jobs.describe(job)}\n"
-                "Manage it anytime with /jobs."
-            )
+            message = f"⏰ Job created — {user_jobs.describe(job)}"
+            # A job whose slot already passed today would fire at the next
+            # 60-s scan; pre-claim today so the first run is the next slot.
+            now = session_context.local_now()
+            if user_jobs.should_preclaim_today(job, now):
+                reminders.claim(f"user-job:{job['id']}:{now.date().isoformat()}")
+                message += "\nFirst run: the next scheduled slot (not today — that time already passed)."
+            message += "\nManage it anytime with /jobs."
         else:
             raise study_domain.DomainError("unknown domain draft")
         if kind in ("commitment", "preference"):
@@ -1457,7 +1461,9 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(view_text, reply_markup=markup)
 
 
-async def _run_user_job(job: dict, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _run_user_job(
+    job: dict, context: ContextTypes.DEFAULT_TYPE, *, consume_once: bool = True
+) -> None:
     chat_id = int(job["chat_id"])
     if job["action_kind"] == "message":
         await context.bot.send_message(chat_id=chat_id, text=f"🔔 {job['title']}\n{job['action_text']}")
@@ -1466,7 +1472,7 @@ async def _run_user_job(job: dict, context: ContextTypes.DEFAULT_TYPE) -> None:
             sql_query_flow.answer_question, job["action_text"], chat_id=chat_id
         )
         await context.bot.send_message(chat_id=chat_id, text=f"⏰ {job['title']}\n{answer}")
-    await asyncio.to_thread(user_jobs.mark_ran, job["id"])
+    await asyncio.to_thread(user_jobs.mark_ran, job["id"], consume_once=consume_once)
 
 
 async def on_jobs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1493,7 +1499,7 @@ async def on_jobs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         elif action == "run" and job_id is not None:
             job = user_jobs.get_job(job_id)
             if job:
-                await _run_user_job(job, context)
+                await _run_user_job(job, context, consume_once=False)
             text, markup = _job_detail_view(job_id) or await asyncio.to_thread(_jobs_list_view, chat_id)
             text = "✅ Ran it — result sent below.\n\n" + text
         elif action == "del" and job_id is not None:
@@ -2060,15 +2066,35 @@ async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         ledger = report["ledger"]
         attempted, correct = ledger.get("attempted") or 0, ledger.get("correct") or 0
         accuracy = f"{100 * correct / attempted:.1f}%" if attempted else "no complete data"
-        await context.bot.send_message(
-            chat_id=telegram_allowed_user_id(),
-            text=(
-                f"Weekly growth: CY {ledger.get('cy',0):g}, accuracy {accuracy}, "
-                f"change {report['cy_delta']:+g}, "
-                f"completed work {report['completed_work']}, backlog {report['backlog']}, "
-                f"valid doubt attempts {report['valid_doubt_attempts']}. Use /weekly and /weak for detail."
-            ),
+        text = (
+            f"Weekly growth: CY {ledger.get('cy',0):g}, accuracy {accuracy}, "
+            f"change {report['cy_delta']:+g}, "
+            f"completed work {report['completed_work']}, backlog {report['backlog']}, "
+            f"valid doubt attempts {report['valid_doubt_attempts']}. Use /weekly and /weak for detail."
         )
+        # Weekly-period commitments: same deterministic ledger verification as
+        # the daily checks, summed over the week.
+        try:
+            today = session_context.local_today_iso()
+            weekly_lines = []
+            for goal in await asyncio.to_thread(
+                study_domain._rows, "goals",
+                "archived=0 AND status='Active' AND period='Weekly'",
+            ):
+                check = await asyncio.to_thread(
+                    commitments.verify_weekly_goal, goal, today
+                )
+                if check["met"] is None:
+                    continue
+                mark = "✅" if check["met"] else "❌"
+                weekly_lines.append(
+                    f"{mark} {check['title']}: {check['value']:g}/{check['target']:g} this week"
+                )
+            if weekly_lines:
+                text += "\n\nWeekly commitments:\n" + "\n".join(weekly_lines)
+        except Exception:
+            logger.exception("weekly commitment section failed")
+        await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=text)
     except Exception:
         logger.exception("weekly report job failed")
 
@@ -2108,20 +2134,46 @@ async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("teacher opportunity scan failed")
 
 
+def _nightly_backup() -> None:
+    """Copy the SQLite store + settings.json into backups/, keep last 7 days.
+
+    Notion re-syncs the mirror tables, but op_* rows, commitments, prefs and
+    jobs exist ONLY in this file — losing it loses the operational brain.
+    """
+    import shutil
+    root = Path(__file__).resolve().parent
+    day_dir = root / "backups" / session_context.local_today_iso()
+    day_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("sqlite_mirror.db", "settings.json"):
+        src = root / name
+        if src.exists():
+            shutil.copy2(src, day_dir / name)
+    kept = sorted(p for p in (root / "backups").iterdir() if p.is_dir())
+    for old in kept[:-7]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
 async def _commitment_verify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Nightly: record today's commitment adherence from the ledger. No message."""
+    """Nightly: record today's commitment adherence from the ledger + backup."""
     try:
         await sync.sync_once_locked(db_keys=("ledger",))
         today = session_context.local_today_iso()
         await asyncio.to_thread(commitments.run_checks_for_date, today)
     except Exception:
         logger.exception("commitment verify job failed")
+    try:
+        await asyncio.to_thread(_nightly_backup)
+    except Exception:
+        logger.exception("nightly backup failed")
 
 
 async def _commitment_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Morning: re-verify yesterday (absorbs post-midnight logging), then nudge."""
+    """Morning: backfill recent days (absorbs downtime + late logging), then nudge."""
     try:
         await sync.sync_once_locked(db_keys=("ledger",))
+        # Re-verify the last 3 days so a night with the bot offline doesn't
+        # leave gap days that break streaks the user actually kept.
+        await asyncio.to_thread(commitments.backfill_checks, days=3)
         yesterday = (
             dt.date.fromisoformat(session_context.local_today_iso())
             - dt.timedelta(days=1)

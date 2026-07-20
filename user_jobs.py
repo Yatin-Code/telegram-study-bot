@@ -80,7 +80,7 @@ def validate_parsed(parsed: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
     kind = str(parsed.get("schedule_kind") or "").strip().lower()
     if kind not in SCHEDULE_KINDS:
         return None, "schedule must be daily, weekdays, weekly or once"
-    ok, time_or_err = settings.validate_setting("PLANNING_REMINDER_TIME", str(parsed.get("time") or ""))
+    ok, time_or_err = settings.validate_hhmm(str(parsed.get("time") or ""))
     if not ok:
         return None, f"time: {time_or_err}"
     run_time = time_or_err
@@ -101,6 +101,9 @@ def validate_parsed(parsed: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
             run_date = dt.date.fromisoformat(raw).isoformat()
         except ValueError:
             return None, "one-time jobs need a date (YYYY-MM-DD)"
+        import session_context
+        if run_date < session_context.local_today_iso():
+            return None, f"that date ({run_date}) is already past"
     action_kind = str(parsed.get("action_kind") or "").strip().lower()
     if action_kind not in ACTION_KINDS:
         return None, "action must be ask or message"
@@ -214,12 +217,35 @@ def delete_job(job_id: int, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         conn.commit()
 
 
+def matches_day(data: dict[str, Any], day: dt.date) -> bool:
+    """Would this job's schedule fire on the given calendar day?"""
+    kind = data["schedule_kind"]
+    if kind == "daily":
+        return True
+    if kind == "weekdays":
+        return day.weekday() < 5
+    if kind == "weekly":
+        return data.get("weekday") == day.weekday()
+    return data.get("run_date") == day.isoformat()
+
+
+def should_preclaim_today(data: dict[str, Any], now: dt.datetime) -> bool:
+    """True when creating this job now would make it fire immediately today.
+
+    due_jobs selects run_time <= now, so a job created after its slot has
+    passed would fire at the very next scan — surprising for "daily at
+    08:00" created at 14:00. The creator pre-claims today's dedup key so the
+    first run lands on the next matching slot instead.
+    """
+    return matches_day(data, now.date()) and data["run_time"] <= f"{now:%H:%M}"
+
+
 def update_field(
     job_id: int, field: str, value: str, *, db_path: str | Path = DEFAULT_DB_PATH
 ) -> tuple[bool, str]:
     """Edit a job's time or text. Returns (ok, message)."""
     if field == "time":
-        ok, result = settings.validate_setting("PLANNING_REMINDER_TIME", value)
+        ok, result = settings.validate_hhmm(value)
         if not ok:
             return False, result
         column, value = "run_time", result
@@ -270,14 +296,24 @@ def due_jobs(
     return due
 
 
-def mark_ran(job_id: int, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+def mark_ran(
+    job_id: int, *, consume_once: bool = True, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    """Record a run. consume_once=False (manual ▶ Run now) keeps a 'once' job
+    armed for its real scheduled fire."""
     with _connect(db_path) as conn:
-        conn.execute(
-            f"UPDATE {JOBS_TABLE} SET last_run = ?, "
-            "enabled = CASE WHEN schedule_kind = 'once' THEN 0 ELSE enabled END "
-            "WHERE id = ?",
-            (_utc_now(), job_id),
-        )
+        if consume_once:
+            conn.execute(
+                f"UPDATE {JOBS_TABLE} SET last_run = ?, "
+                "enabled = CASE WHEN schedule_kind = 'once' THEN 0 ELSE enabled END "
+                "WHERE id = ?",
+                (_utc_now(), job_id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE {JOBS_TABLE} SET last_run = ? WHERE id = ?",
+                (_utc_now(), job_id),
+            )
         conn.commit()
 
 

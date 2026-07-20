@@ -86,6 +86,39 @@ def test_once_disables_after_run(db):
     assert user_jobs.get_job(daily["id"], db_path=db)["enabled"] == 1
 
 
+def test_run_now_keeps_once_armed(db):
+    once = make(db, schedule_kind="once", run_date="2026-07-25", run_time="08:00")
+    user_jobs.mark_ran(once["id"], consume_once=False, db_path=db)  # manual ▶ Run now
+    job = user_jobs.get_job(once["id"], db_path=db)
+    assert job["enabled"] == 1 and job["last_run"]
+    user_jobs.mark_ran(once["id"], db_path=db)  # scheduler path consumes
+    assert user_jobs.get_job(once["id"], db_path=db)["enabled"] == 0
+
+
+def test_once_rejects_past_date():
+    data, err = user_jobs.validate_parsed({
+        "schedule_kind": "once", "time": "08:00", "date": "2020-01-01",
+        "action_kind": "message", "action_text": "x",
+    })
+    assert data is None and "past" in err
+
+
+def test_should_preclaim_today():
+    tue_2pm = dt.datetime(2026, 7, 21, 14, 0)  # Tuesday
+    daily_morning = {"schedule_kind": "daily", "run_time": "08:00", "weekday": None, "run_date": None}
+    daily_evening = {"schedule_kind": "daily", "run_time": "21:00", "weekday": None, "run_date": None}
+    weekly_sun = {"schedule_kind": "weekly", "run_time": "08:00", "weekday": 6, "run_date": None}
+    weekly_tue = {"schedule_kind": "weekly", "run_time": "08:00", "weekday": 1, "run_date": None}
+    once_today = {"schedule_kind": "once", "run_time": "08:00", "weekday": None, "run_date": "2026-07-21"}
+    once_future = {"schedule_kind": "once", "run_time": "08:00", "weekday": None, "run_date": "2026-07-25"}
+    assert user_jobs.should_preclaim_today(daily_morning, tue_2pm) is True
+    assert user_jobs.should_preclaim_today(daily_evening, tue_2pm) is False
+    assert user_jobs.should_preclaim_today(weekly_sun, tue_2pm) is False
+    assert user_jobs.should_preclaim_today(weekly_tue, tue_2pm) is True
+    assert user_jobs.should_preclaim_today(once_today, tue_2pm) is True
+    assert user_jobs.should_preclaim_today(once_future, tue_2pm) is False
+
+
 def test_crud_toggle_edit_delete(db):
     job = make(db)
     assert [j["id"] for j in user_jobs.list_jobs(CHAT, db_path=db)] == [job["id"]]

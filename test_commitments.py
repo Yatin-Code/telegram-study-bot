@@ -167,6 +167,34 @@ def test_capture_conflicts_cy_ceiling(db):
     assert any("ceiling" in c["message"] for c in conflicts)
 
 
+def test_backfill_heals_offline_gap(db):
+    """Bot offline for 2 nightly checks -> backfill fills them, streak survives."""
+    goal = make_goal(db)
+    goal_id = goal["notion_page_id"]
+    # Ledger shows the user actually did PYQs on all 4 days.
+    for i, date in enumerate(("2026-07-12", "2026-07-13", "2026-07-14", "2026-07-15")):
+        insert(db, "ledger", notion_page_id=f"l{i}", date=date, exercise_type="PYQs")
+    # Only the first day was verified before the bot went offline.
+    commitments.run_checks_for_date("2026-07-12", db_path=db)
+    assert commitments.streak(goal_id, as_of="2026-07-15", db_path=db) <= 1
+    commitments.backfill_checks(days=3, end_date="2026-07-16", db_path=db)
+    assert commitments.streak(goal_id, as_of="2026-07-15", db_path=db) == 4
+
+
+def test_verify_weekly_goal(db):
+    weekly = make_goal(db, title="Weekly revision", goal_type="Coverage",
+                       metric="revision sessions", target=3, period="Weekly")
+    for i, date in enumerate(("2026-07-10", "2026-07-12", "2026-07-14")):
+        insert(db, "ledger", notion_page_id=f"r{i}", date=date, exercise_type="Revision")
+    check = commitments.verify_weekly_goal(weekly, "2026-07-15", db_path=db)
+    assert check["met"] is True and check["value"] == 3
+    check = commitments.verify_weekly_goal(weekly, "2026-07-11", db_path=db)
+    assert check["met"] is False and check["value"] == 1
+    unverifiable = {"title": "Coaching homework weekly", "goal_type": "Coverage",
+                    "target": 2, "period": "Weekly"}
+    assert commitments.verify_weekly_goal(unverifiable, "2026-07-15", db_path=db)["met"] is None
+
+
 def test_prefs_roundtrip(db):
     pref_id = commitments.add_pref(7, "prefers maths in the morning", db_path=db)
     prefs = commitments.active_prefs(7, db_path=db)
