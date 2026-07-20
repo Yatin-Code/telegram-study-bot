@@ -70,3 +70,19 @@ Notion with a fake Telegram transport.
 
 For a Termux backup, run `bash backup_mirror.sh`. It uses Python's SQLite
 `iterdump`, so the external `sqlite3` executable is not required.
+
+## Deployment (Azure SentinelVM)
+
+Runs as systemd service `studybot` on SentinelVM (Ubuntu 22.04, Central India),
+cloned at `/home/azureuser/studybot` from the private GitHub repo via a
+read-only deploy key. Secrets (`.env`), the SQLite store and `settings.json`
+live only on the VM — never in git.
+
+Update from the phone (Termux):
+
+    git push
+    az vm run-command invoke -g SENTINELRG_INDIA -n SentinelVM \
+      --command-id RunShellScript \
+      --scripts "sudo -u azureuser git -C /home/azureuser/studybot pull && systemctl restart studybot"
+
+Logs: `ssh azureuser@20.219.16.206 'journalctl -u studybot -n 50 --no-pager'`
