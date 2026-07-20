@@ -63,6 +63,7 @@ ACTIONS = (
     "query",
     "ask",
     "set_context",
+    "remember",
     "unknown",
 )
 DATABASE_KEYS = ("ledger", "doubts", "revision")
@@ -74,6 +75,7 @@ Action = Literal[
     "query",
     "ask",
     "set_context",
+    "remember",
     "unknown",
 ]
 
@@ -230,7 +232,7 @@ no markdown, no code fences.
 
 The JSON schema (all keys required):
 {{
-  "action": "log_execution | log_doubt | log_revision | query | ask | set_context | unknown",
+  "action": "log_execution | log_doubt | log_revision | query | ask | set_context | remember | unknown",
   "database": "ledger | doubts | revision | null",
   "fields": {{ ... human field names -> values ... }},
   "filters": {{
@@ -268,12 +270,22 @@ Action meaning:
                    results yet. database is null, no write happens. If the
                    message names an exercise type (MLE, Ex 2A, PYQs, JMYL, ...),
                    put it in filters.exercise.
+- remember      -> the user states a COMMITMENT about future recurring
+                   behaviour or a preference/fact to remember ("from now on
+                   I'll do PYQs every day", "I will revise chem weekly",
+                   "remember that I prefer maths in the morning"). database is
+                   null. Put the FULL statement verbatim in fields.statement.
 - unknown       -> cannot be mapped; set needs_clarification=true
 
 Disambiguation (apply in order):
 - Words like "starting", "start", "beginning", "about to", "now doing",
   "working on" with NO results reported -> set_context (NOT log_execution),
   even if a block/subject/chapter is named.
+- remember is about the FUTURE ("from now on", "every day", "I will",
+  "remember that I..."). A message reporting COMPLETED work with results
+  ("did 20 PYQs today") is log_execution, NOT remember, even if it mentions
+  a habit. A question about commitments ("am I keeping up with PYQs?") is
+  ask, NOT remember.
 - A bare topic + a records-noun ("kinematics doubts", "physics doubts",
   "my doubts", "list doubts", "show revisions") with no new question stated
   -> query (the user wants to VIEW them). Only use log_doubt when the message
@@ -307,14 +319,17 @@ Respond with the JSON object only."""
 
 
 def _build_system_prompt(session_context: Optional[dict[str, Any]]) -> str:
+    import session_context as sc
+    now = sc.local_now()
+    time_line = f"Current local date/time: {now:%Y-%m-%d %H:%M} ({now:%A}).\n"
     if session_context:
         ctx_lines = ", ".join(f"{k}={v}" for k, v in session_context.items() if v)
-        context_block = (
+        context_block = time_line + (
             f"Current session context (inherit when the message omits these): "
             f"{ctx_lines or 'none'}.\n"
         )
     else:
-        context_block = "Current session context: none set.\n"
+        context_block = time_line + "Current session context: none set.\n"
     return SYSTEM_PROMPT_TEMPLATE.format(
         schema_digest=_schema_digest(),
         context_block=context_block,

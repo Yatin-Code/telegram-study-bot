@@ -18,6 +18,7 @@ sqlite_mirror.db
 backups/
 *.dump
 logs/
+settings.json
 
 # Editor / OS
 .vscode/

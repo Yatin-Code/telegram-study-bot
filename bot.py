@@ -34,6 +34,11 @@ from telegram.ext import (
 )
 
 import briefing
+import commitments
+import advisor
+import memory_map
+import onboarding
+import user_jobs
 import draft_store
 import logging_flow
 import operational_store
@@ -58,11 +63,16 @@ logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
     BotCommand("start", "Start the bot"),
+    BotCommand("setup", "First-run setup / fill data gaps"),
     BotCommand("help", "Get help menu"),
     BotCommand("newsession", "Clear current study context"),
-    BotCommand("settings", "Adjust preferences"),
+    BotCommand("settings", "View & edit bot settings"),
+    BotCommand("memory", "See & edit what the bot remembers"),
+    BotCommand("jobs", "Create & manage scheduled jobs"),
     BotCommand("health", "Show bot & mirror health status"),
     BotCommand("goal", "Create or list measurable goals"),
+    BotCommand("remember", "Remember a commitment or preference"),
+    BotCommand("forget", "Forget a remembered item"),
     BotCommand("exam", "Create or list exams"),
     BotCommand("today", "Analyze today's Notion plan"),
     BotCommand("next", "Show the next sequence item"),
@@ -112,8 +122,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• \"execution block 1: solved ex 2A, 20 qs 15 correct, 25 mins\" — log a session\n"
         "• \"doubt: sign of relative velocity\" — log a doubt (inherits context)\n"
         "• \"list doubts\" / \"revision overdue\" — query\n\n"
-        "Commands: /help, /newsession, /health"
+        "Commands: /help, /setup, /newsession, /health"
     )
+    chat_id = update.effective_chat.id
+    if not onboarding.is_complete(chat_id):
+        text, markup = await asyncio.to_thread(_setup_hub_view)
+        await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -124,10 +138,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start - Start the bot\n"
         "/help - Get help menu\n"
         "/newsession - Clear current study context\n"
-        "/settings - Adjust preferences\n\n"
+        "/sync - Force-refresh data from Notion now\n"
+        "/settings - View & edit bot settings (times, targets, model…)\n"
+        "/memory - See & edit what I remember + what's in my context\n"
+        "/setup - Guided setup: exam dates, timetable, commitments…\n"
+        "/jobs - Scheduled jobs, e.g. /jobs every weekday at 21:00 tell me my week CY\n\n"
         "Tell me what you're studying (e.g. \"starting EB-1 physics kinematics\") "
         "and I'll remember it for logging until midnight.\n\n"
         "/goal 300 CY daily\n"
+        "/remember from now on I'll do PYQs every day\n"
+        "/forget <commitment title or preference text>\n"
         "/exam JEE Main mock on 2026-08-15\n"
         "/today /next /backlog /weak /weekly\n"
         "/backlog add title | kind | subject | due date | priority | minutes\n"
@@ -140,40 +160,253 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _settings_home_view() -> tuple[str, InlineKeyboardMarkup]:
+    try:
+        model = config_settings.llm_model()
+    except Exception:
+        model = "(unset)"
+    lines = [
+        "⚙️ Settings — tap a category to view & edit",
+        f"Timezone: {config_settings.user_timezone()} (now {session_context.local_now():%H:%M}) · Model: {model}",
+        "",
+        "✏️ = customised in settings.json · ⏱ = applies after restart",
+        "Secrets (tokens, API keys) live only in .env 🔒",
+    ]
+    buttons = [
+        [InlineKeyboardButton(cat, callback_data=f"settings:cat:{i}")]
+        for i, cat in enumerate(config_settings.SETTINGS_CATEGORIES)
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _settings_category_view(idx: int) -> tuple[str, InlineKeyboardMarkup]:
+    cat = config_settings.SETTINGS_CATEGORIES[idx]
+    entries = [e for e in config_settings.SETTINGS_REGISTRY if e["category"] == cat]
+    lines = [cat, ""]
+    buttons = []
+    for entry in entries:
+        current = config_settings.current_setting_value(entry["key"])
+        marks = ""
+        if config_settings.get_override(entry["key"]) is not None:
+            marks += " ✏️"
+        if entry["restart"]:
+            marks += " ⏱"
+        lines.append(f"• {entry['label']}: {current}{marks}")
+        buttons.append([InlineKeyboardButton(
+            f"✏️ {entry['label']}", callback_data=f"settings:edit:{entry['key']}"
+        )])
+    buttons.append([InlineKeyboardButton("↩ Back", callback_data="settings:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _settings_edit_prompt_view(key: str) -> tuple[str, InlineKeyboardMarkup]:
+    entry = config_settings.setting_entry(key)
+    current = config_settings.current_setting_value(key)
+    idx = config_settings.SETTINGS_CATEGORIES.index(entry["category"])
+    lines = [f"✏️ {entry['label']}", f"Current: {current}"]
+    if entry.get("default"):
+        lines.append(f"Default: {entry['default']}")
+    if entry["type"] == "int":
+        lines.append(f"Allowed: {entry.get('min', '…')}–{entry.get('max', '…')}")
+    elif entry["type"] == "time":
+        lines.append("Format: HH:MM (24h), e.g. 21:30")
+    elif entry["type"] == "tz":
+        lines.append("Format: IANA name, e.g. Asia/Kolkata")
+    if entry["restart"]:
+        lines.append("⏱ Applies after the bot restarts.")
+    lines.append("")
+    lines.append("Send the new value as a message now.")
+    buttons = [[
+        InlineKeyboardButton("↺ Reset to default", callback_data=f"settings:reset:{key}"),
+        InlineKeyboardButton("↩ Back", callback_data=f"settings:cat:{idx}"),
+    ]]
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _settings_weekday_view(key: str) -> tuple[str, InlineKeyboardMarkup]:
+    entry = config_settings.setting_entry(key)
+    idx = config_settings.SETTINGS_CATEGORIES.index(entry["category"])
+    names = config_settings.WEEKDAY_NAMES
+    day_buttons = [
+        InlineKeyboardButton(name, callback_data=f"settings:set:{key}:{i}")
+        for i, name in enumerate(names)
+    ]
+    buttons = [day_buttons[:4], day_buttons[4:],
+               [InlineKeyboardButton("↺ Reset to default", callback_data=f"settings:reset:{key}"),
+                InlineKeyboardButton("↩ Back", callback_data=f"settings:cat:{idx}")]]
+    text = (
+        f"✏️ {entry['label']}\n"
+        f"Current: {config_settings.current_setting_value(key)}\n\n"
+        "Pick a day:"
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _settings_after_change_view(key: str, *, reset: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    entry = config_settings.setting_entry(key)
+    idx = config_settings.SETTINGS_CATEGORIES.index(entry["category"])
+    text, markup = _settings_category_view(idx)
+    if reset:
+        head = f"↺ {entry['label']} reset to default."
+    else:
+        head = f"✅ {entry['label']} → {config_settings.current_setting_value(key)}"
+        if entry["restart"]:
+            head += " ⏱ applies after restart"
+    return head + "\n\n" + text, markup
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
-    from config import settings as cfg
+    draft_store.clear_pending_setting_edit(update.effective_chat.id)
+    text, markup = _settings_home_view()
+    await update.effective_message.reply_text(text, reply_markup=markup)
 
+
+async def on_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        return
     chat_id = update.effective_chat.id
-    ctx = session_context.get_context(chat_id)
-    if ctx:
-        ctx_bits = ", ".join(
-            f"{k}={v}" for k in ("subject", "chapter", "block", "exercise")
-            if (v := ctx.get(k))
-        )
-        ctx_line = ctx_bits or "set (no fields)"
-    else:
-        ctx_line = "none (cleared at local midnight)"
+    parts = query.data.split(":", 3)
+    action = parts[1] if len(parts) > 1 else "home"
+    try:
+        if action == "home":
+            draft_store.clear_pending_setting_edit(chat_id)
+            text, markup = _settings_home_view()
+        elif action == "cat" and len(parts) > 2:
+            draft_store.clear_pending_setting_edit(chat_id)
+            text, markup = _settings_category_view(int(parts[2]))
+        elif action == "edit" and len(parts) > 2:
+            key = parts[2]
+            entry = config_settings.setting_entry(key)
+            if entry is None:
+                return
+            if entry["type"] == "weekday":
+                text, markup = _settings_weekday_view(key)
+            else:
+                draft_store.set_pending_setting_edit(chat_id, key)
+                text, markup = _settings_edit_prompt_view(key)
+        elif action == "set" and len(parts) > 3:
+            key, raw = parts[2], parts[3]
+            ok, result = config_settings.validate_setting(key, raw)
+            if ok:
+                config_settings.set_override(key, result)
+            text, markup = _settings_after_change_view(key)
+        elif action == "reset" and len(parts) > 2:
+            key = parts[2]
+            config_settings.clear_override(key)
+            draft_store.clear_pending_setting_edit(chat_id)
+            text, markup = _settings_after_change_view(key, reset=True)
+        else:
+            return
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except Exception:
+            pass  # "message is not modified" and similar cosmetic failures
+    except Exception as exc:
+        logger.exception("settings callback failed")
+        try:
+            await query.edit_message_text(f"⚠️ Settings action failed: {exc}")
+        except Exception:
+            pass
 
-    fallbacks = cfg.llm_fallback_models()
-    lines = [
-        "*Settings* (read-only)",
-        "",
-        f"LLM provider: `{cfg.llm_provider()}`",
-        f"Model: `{cfg.llm_model()}`",
-        f"Fallback: `{', '.join(fallbacks) if fallbacks else 'none'}`",
-        f"Timezone: `{cfg.user_timezone()}`  (now {session_context.local_now():%H:%M})",
-        f"Planning reminder: `{cfg.planning_reminder_time()}`",
-        f"Weekly report: `{cfg.weekly_report_time()}`",
-        f"Daily CY range: `{cfg.daily_cy_baseline()}–{cfg.daily_cy_ceiling()}`",
-        f"Current session context: {ctx_line}",
-        "",
-        "Preferences live in `.env`. Use /newsession to clear session context.",
-    ]
-    await update.effective_message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+
+async def _apply_setting_reply(message, chat_id: int, key: str, raw: str) -> None:
+    """Consume a text reply as the new value for a pending /settings edit."""
+    entry = config_settings.setting_entry(key)
+    if entry is None:
+        await message.reply_text("That setting no longer exists.")
+        return
+    ok, result = config_settings.validate_setting(key, raw)
+    if not ok:
+        draft_store.set_pending_setting_edit(chat_id, key)
+        await message.reply_text(
+            f"⚠️ {result}. Send the value again, or open /settings to cancel."
+        )
+        return
+    config_settings.set_override(key, result)
+    note = " ⏱ applies after restart" if entry["restart"] else ""
+    await message.reply_text(
+        f"✅ {entry['label']} → {config_settings.current_setting_value(key)}{note}"
     )
+
+
+def _memory_view(chat_id: int, extra_rows: list | None = None):
+    rep = memory_map.report(chat_id)
+    text = memory_map.render(rep)
+    rows = memory_map.keyboard(rep)
+    if extra_rows:
+        rows = extra_rows + rows
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=data) for label, data in row]
+        for row in rows if row
+    ])
+    return text, markup
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    chat_id = update.effective_chat.id
+    text, markup = await asyncio.to_thread(_memory_view, chat_id)
+    await update.effective_message.reply_text(text, reply_markup=markup)
+
+
+async def on_memory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else "refresh"
+    undo_row = None
+    try:
+        if action == "raw":
+            text = await asyncio.to_thread(memory_map.render_raw, chat_id)
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀ Back", callback_data="memory:refresh")
+            ]])
+            try:
+                await query.edit_message_text(text, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        if action == "clearctx":
+            session_context.clear_context(chat_id)
+        elif action == "clearhist":
+            draft_store.clear_qa_history(chat_id)
+        elif action == "delpref" and len(parts) > 2:
+            removed = commitments.deactivate_pref(chat_id, int(parts[2]))
+            if removed:
+                undo_row = [("↩ Undo remove", f"memory:undo:pref:{parts[2]}")]
+        elif action == "pausegoal" and len(parts) > 2:
+            await asyncio.to_thread(
+                operational_store.update, "goals", parts[2], {"status": "Paused"}
+            )
+            undo_row = [("↩ Undo pause", f"memory:undo:goal:{parts[2]}")]
+        elif action == "undo" and len(parts) > 3:
+            if parts[2] == "pref":
+                commitments.reactivate_pref(chat_id, int(parts[3]))
+            else:
+                await asyncio.to_thread(
+                    operational_store.update, "goals", parts[3], {"status": "Active"}
+                )
+        text, markup = await asyncio.to_thread(
+            _memory_view, chat_id, [undo_row] if undo_row else None
+        )
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except Exception:
+            pass  # "message is not modified" on double-refresh
+    except Exception as exc:
+        logger.exception("memory callback failed")
+        try:
+            await query.edit_message_text(f"⚠️ Memory action failed: {exc}")
+        except Exception:
+            pass
 
 
 async def newsession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,6 +414,7 @@ async def newsession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     chat_id = update.effective_chat.id
     session_context.clear_context(chat_id)
+    draft_store.clear_qa_history(chat_id)
     await update.effective_message.reply_text("Session context cleared.")
 
 
@@ -214,6 +448,30 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Pending writes: {logging_flow.pending_count()}",
     ]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force an immediate Notion→SQLite mirror refresh. No LLM involved."""
+    if await _reject_if_unauthorized(update):
+        return
+    status = await update.effective_message.reply_text("🔄 Syncing from Notion…")
+    try:
+        counts = await asyncio.to_thread(
+            sync.sync_once, db_keys=sync.NOTION_SOURCE_KEYS
+        )
+    except Exception as e:
+        logger.exception("manual /sync failed")
+        try:
+            await status.edit_text(f"⚠️ Sync failed: {e}")
+        except Exception:
+            await update.effective_message.reply_text(f"⚠️ Sync failed: {e}")
+        return
+    total = sum(counts.values())
+    detail = ", ".join(f"{k}={v}" for k, v in counts.items()) or "nothing to sync"
+    try:
+        await status.edit_text(f"✅ Synced {total} record(s): {detail}")
+    except Exception:
+        await update.effective_message.reply_text(f"✅ Synced {total} record(s): {detail}")
 
 
 def _command_args(update: Update) -> str:
@@ -325,6 +583,165 @@ async def exam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(f"I could not create that exam safely: {exc}")
 
 
+async def _handle_remember(update: Update, statement: str, chat_id: int) -> None:
+    """Parse a commitment/preference, show conflicts, and ask for confirmation."""
+    message = update.effective_message
+    statement = (statement or "").strip()
+    if not statement:
+        await message.reply_text(
+            "What should I remember? e.g. /remember from now on I'll do PYQs every day"
+        )
+        return
+    try:
+        data = await asyncio.to_thread(domain_parser.parse_commitment, statement)
+    except Exception as exc:
+        logger.exception("commitment parse failed")
+        await message.reply_text(f"I couldn't understand that safely: {exc}")
+        return
+    if data.get("needs_clarification"):
+        await message.reply_text(
+            data.get("clarification_question") or "What exactly should I track?"
+        )
+        return
+    if data.get("kind") == "bot_instruction":
+        # "every weekday tell me X" is a job for the bot, not a study
+        # commitment — route it into the /jobs scheduler with its confirm.
+        await _handle_job_create(
+            update, chat_id, statement,
+            intro="That's a scheduled job for me, not a study commitment — here's what I'll set up:",
+        )
+        return
+    if data.get("kind") == "preference":
+        pref_text = str(data.get("title") or statement).strip()
+        preview = (
+            "Preference to remember\n"
+            f"“{pref_text}”\n"
+            "I'll keep this in mind when advising. Save?"
+        )
+        draft_id = draft_store.create_draft(
+            chat_id,
+            {"kind": "preference", "data": {"chat_id": chat_id, "text": pref_text}},
+            [preview],
+        )
+        await message.reply_text(
+            preview,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Save", callback_data=f"domain:confirm:{draft_id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"domain:cancel:{draft_id}"),
+            ]]),
+        )
+        return
+    goal_data = {
+        key: data.get(key)
+        for key in ("title", "goal_type", "metric", "target", "period", "subject", "source_text")
+    }
+    goal_data["operation_id"] = uuid.uuid4().hex
+    await _sync_domain()
+    conflicts = await asyncio.to_thread(commitments.capture_conflicts, goal_data)
+    verifiable = (
+        goal_data.get("goal_type") in commitments._GOAL_TYPE_EXPR
+        and commitments.ledger_filter_for_goal(goal_data) is not None
+    )
+    lines = [
+        "Commitment draft",
+        f"Title: {goal_data['title']}",
+        f"Track: {float(goal_data['target']):g} {goal_data.get('metric')} per {str(goal_data['period']).lower()}",
+    ]
+    if goal_data.get("subject"):
+        lines.append(f"Subject: {goal_data['subject']}")
+    replace_goal_id = None
+    for conflict in conflicts:
+        lines.append(f"⚠️ {conflict['message']}")
+        if conflict.get("goal_id") and replace_goal_id is None:
+            replace_goal_id = conflict["goal_id"]
+    if verifiable:
+        lines.append("I'll verify this nightly against your ledger and track your streak.")
+        if re.search(r"\b(morning|evening|afternoon|night|noon)\b", statement, re.IGNORECASE):
+            lines.append(
+                "ℹ️ Honest note: I verify this per-DAY from your logs — "
+                "I can't check the time of day yet."
+            )
+    else:
+        lines.append(
+            "⚠️ I can't auto-verify this from your logged sessions — "
+            "I'll only watch your daily plan for it."
+        )
+    lines.append("Save this commitment?")
+    preview = "\n".join(lines)
+    payload: dict = {"kind": "commitment", "data": goal_data}
+    if replace_goal_id:
+        payload["replace_goal_id"] = replace_goal_id
+    draft_id = draft_store.create_draft(chat_id, payload, [preview])
+    buttons = [InlineKeyboardButton("Save", callback_data=f"domain:confirm:{draft_id}")]
+    if replace_goal_id:
+        buttons.append(
+            InlineKeyboardButton("Replace old", callback_data=f"domain:replace:{draft_id}")
+        )
+    buttons.append(InlineKeyboardButton("Cancel", callback_data=f"domain:cancel:{draft_id}"))
+    await message.reply_text(preview, reply_markup=InlineKeyboardMarkup([buttons]))
+
+
+async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    text = _command_args(update)
+    chat_id = update.effective_chat.id
+    if text:
+        await _handle_remember(update, text, chat_id)
+        return
+    await _sync_domain()
+    lines: list[str] = []
+    goals = study_domain._rows(
+        "goals", "archived=0 AND status='Active' AND period IN ('Daily','Weekly')"
+    )
+    if goals:
+        lines.append("Commitments:")
+        today = session_context.local_today_iso()
+        for i, goal in enumerate(goals, 1):
+            entry = (
+                f"{i}. {goal.get('title')} — {float(goal.get('target') or 0):g} "
+                f"{goal.get('metric') or ''} ({goal.get('period')})"
+            )
+            goal_id = goal.get("notion_page_id")
+            if goal_id and goal.get("period") == "Daily":
+                days = commitments.streak(goal_id, as_of=today)
+                stats = commitments.adherence(goal_id, as_of=today)
+                if stats["total"]:
+                    entry += f" — streak {days}, last 7d {stats['met']}/{stats['total']}"
+            lines.append(entry)
+    prefs = commitments.active_prefs(chat_id)
+    if prefs:
+        lines.append("Preferences:")
+        lines.extend(f"#{p['id']} {p['text']}" for p in prefs)
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+        or "Nothing remembered yet. Try /remember from now on I'll do PYQs every day"
+    )
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    text = _command_args(update)
+    chat_id = update.effective_chat.id
+    if not text:
+        await update.effective_message.reply_text(
+            "Tell me what to forget: /forget <preference text or #id, or commitment title>"
+        )
+        return
+    pref = commitments.deactivate_pref(chat_id, text.lstrip("#").strip())
+    if pref:
+        await update.effective_message.reply_text(f"Forgotten: “{pref['text']}”")
+        return
+    try:
+        await asyncio.to_thread(study_domain.update_goal_status, text, "Paused")
+        await update.effective_message.reply_text(
+            "Commitment paused — nightly checks stop. Use /goal resume <name> to restart it."
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Nothing matched that: {exc}")
+
+
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -342,10 +759,20 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lines.append(f"{int(row.get('sequence') or 0)}. {row.get('title')} [{row.get('status') or 'Planned'}]")
         lines.extend(f"Warning: {w}" for w in facts["warnings"])
         lines.extend(f"Blocked: {e}" for e in facts["errors"])
-        lines.extend(
-            f"Suggestion: {s.get('action')} — {s.get('reason')}"
-            for s in facts.get("suggestions", [])
-        )
+        for s in facts.get("suggestions", []):
+            line = f"Suggestion: {s.get('action')} — {s.get('reason')}"
+            if s.get("kind") == "goal" and s.get("goal"):
+                try:
+                    row = next(
+                        (g for g in commitments.active_daily_goals()
+                         if str(g.get("title")) == str(s["goal"])), None,
+                    )
+                    days = commitments.streak(row["notion_page_id"]) if row and row.get("notion_page_id") else 0
+                    if days:
+                        line += f" ({days}-day streak at risk)"
+                except Exception:
+                    pass
+            lines.append(line)
         await update.effective_message.reply_text("\n".join(lines) or "No Notion plan items found for today.")
     except Exception as exc:
         await update.effective_message.reply_text(f"Plan analysis unavailable: {exc}")
@@ -641,7 +1068,7 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         draft_store.delete_draft(draft_id)
         await query.edit_message_text("Cancelled. Nothing was saved.")
         return
-    if action != "confirm":
+    if action not in ("confirm", "replace"):
         return
     try:
         kind = draft["payload"].get("kind")
@@ -652,8 +1079,55 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif kind == "exam":
             await asyncio.to_thread(study_domain.create_exam, data)
             message = "Exam saved to SQLite."
+        elif kind == "commitment":
+            replaced = draft["payload"].get("replace_goal_id")
+            if action == "replace" and replaced:
+                await asyncio.to_thread(
+                    operational_store.update, "goals", replaced, {"status": "Cancelled"}
+                )
+            await asyncio.to_thread(study_domain.create_goal, data)
+            message = (
+                "Commitment saved — I'll verify it nightly against your ledger "
+                "and nudge you each morning."
+            )
+        elif kind == "preference":
+            await asyncio.to_thread(
+                commitments.add_pref, data["chat_id"], data["text"]
+            )
+            message = "Preference remembered."
+        elif kind == "setup_ai":
+            results, skip = await asyncio.to_thread(
+                onboarding.apply_ai_actions, draft["chat_id"], data.get("actions") or []
+            )
+            message = "🤖 Done:\n" + "\n".join(results)
+            if skip:
+                nxt = await asyncio.to_thread(onboarding.advance, draft["chat_id"])
+                if nxt:
+                    next_text, next_markup = await asyncio.to_thread(_setup_section_view, nxt)
+                else:
+                    next_text, next_markup = await asyncio.to_thread(_setup_hub_view)
+                await context.bot.send_message(
+                    chat_id=draft["chat_id"], text=next_text, reply_markup=next_markup
+                )
+        elif kind == "job":
+            job = await asyncio.to_thread(
+                user_jobs.create_job, draft["chat_id"], data
+            )
+            message = (
+                f"⏰ Job created — {user_jobs.describe(job)}\n"
+                "Manage it anytime with /jobs."
+            )
         else:
             raise study_domain.DomainError("unknown domain draft")
+        if kind in ("commitment", "preference"):
+            try:
+                warn = await asyncio.to_thread(
+                    memory_map.budget_warning, draft["chat_id"]
+                )
+                if warn:
+                    message += "\n" + warn
+            except Exception:
+                logger.debug("budget warning failed", exc_info=True)
         draft_store.delete_draft(draft_id)
         await query.edit_message_text(message)
     except Exception as exc:
@@ -686,6 +1160,380 @@ async def on_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(f"Plan state was not changed: {exc}")
 
 
+def _setup_hub_view() -> tuple[str, InlineKeyboardMarkup]:
+    stats = onboarding.status()
+    lines = [
+        "🚀 Setup — what I need to run every engine",
+        "(Ledger, doubts & revision sync from Notion automatically — these "
+        "are the things I can't discover myself.)",
+        "",
+    ]
+    for section in onboarding.SECTIONS:
+        st = stats.get(section["id"], {"ok": False, "detail": ""})
+        mark = "✅" if st["ok"] else "⚠️"
+        lines.append(f"{mark} {section['title']} — {st['detail']}")
+    lines.append("")
+    lines.append("Tap a section to fill it, or run everything in order.")
+    sec_buttons = [
+        InlineKeyboardButton(s["title"], callback_data=f"onb:sec:{s['id']}")
+        for s in onboarding.SECTIONS
+    ]
+    rows = [sec_buttons[i:i + 2] for i in range(0, len(sec_buttons), 2)]
+    rows.append([
+        InlineKeyboardButton("▶ Run full setup", callback_data="onb:runall"),
+        InlineKeyboardButton("✔ Finish", callback_data="onb:finish"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _setup_section_view(section_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    section = onboarding.section_by_id(section_id)
+    prompt = section["prompt"]
+    if section_id == "chapters":
+        prompt = onboarding.chapters_prompt()
+    lines = [section["title"], "", prompt]
+    if section.get("hint"):
+        lines.append(section["hint"])
+    lines.append("💡 Free-form? Start with `ai ` and describe — I'll work out what to do.")
+    rows: list[list[InlineKeyboardButton]] = []
+    if section["kind"] == "buttons":
+        opts = [
+            InlineKeyboardButton(label, callback_data=f"onb:pick:{section_id}:{value}")
+            for label, value in section.get("options", [])
+        ]
+        rows.extend(opts[i:i + 2] for i in range(0, len(opts), 2))
+    if section_id == "rhythm":
+        rows.append([InlineKeyboardButton("⏰ Open reminder settings", callback_data="settings:cat:0")])
+    last = []
+    if section["kind"] == "loop":
+        last.append(InlineKeyboardButton("Done ✅", callback_data="onb:done"))
+    last.append(InlineKeyboardButton("Skip ▸", callback_data="onb:skip"))
+    last.append(InlineKeyboardButton("↩ Hub", callback_data="onb:hub"))
+    rows.append(last)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _setup_finish_summary() -> str:
+    stats = onboarding.status()
+    lines = ["🎉 Setup done — here's where you stand:", ""]
+    for section in onboarding.SECTIONS:
+        st = stats.get(section["id"], {"ok": False, "detail": ""})
+        lines.append(f"{'✅' if st['ok'] else '⚠️'} {section['title']} — {st['detail']}")
+    lines.append("")
+    lines.append("Edit anytime: /setup · /settings · /memory. Now just study and talk to me normally.")
+    return "\n".join(lines)
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    onboarding.clear(update.effective_chat.id)
+    text, markup = await asyncio.to_thread(_setup_hub_view)
+    await update.effective_message.reply_text(text, reply_markup=markup)
+
+
+async def _setup_after_answer(chat_id: int, reply: str, advance_now: bool):
+    if advance_now:
+        nxt = await asyncio.to_thread(onboarding.advance, chat_id)
+    else:
+        state = onboarding.active_section(chat_id)
+        nxt = state[0] if state else None
+    if nxt:
+        text, markup = await asyncio.to_thread(_setup_section_view, nxt)
+    else:
+        text, markup = await asyncio.to_thread(_setup_hub_view)
+    return reply + "\n\n" + text, markup
+
+
+async def on_onboarding_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    parts = query.data.split(":", 3)
+    action = parts[1] if len(parts) > 1 else "hub"
+    try:
+        if action == "hub":
+            onboarding.clear(chat_id)
+            text, markup = await asyncio.to_thread(_setup_hub_view)
+        elif action == "sec" and len(parts) > 2:
+            onboarding.start(chat_id, parts[2], "single")
+            text, markup = await asyncio.to_thread(_setup_section_view, parts[2])
+        elif action == "runall":
+            stats = await asyncio.to_thread(onboarding.status)
+            first = next(
+                (sid for sid in onboarding.SECTION_IDS if not stats[sid]["ok"]), None
+            )
+            if first is None:
+                onboarding.mark_complete(chat_id)
+                text, markup = await asyncio.to_thread(_setup_hub_view)
+                text = "🎉 Everything is already set!\n\n" + text
+            else:
+                onboarding.start(chat_id, first, "run_all")
+                text, markup = await asyncio.to_thread(_setup_section_view, first)
+        elif action == "pick" and len(parts) > 3:
+            _ok, reply, adv = await asyncio.to_thread(
+                onboarding.apply_answer, chat_id, parts[2], parts[3]
+            )
+            text, markup = await _setup_after_answer(chat_id, reply, adv)
+        elif action in ("skip", "done"):
+            nxt = await asyncio.to_thread(onboarding.advance, chat_id)
+            if nxt:
+                text, markup = await asyncio.to_thread(_setup_section_view, nxt)
+            else:
+                text, markup = await asyncio.to_thread(_setup_hub_view)
+        elif action == "finish":
+            onboarding.mark_complete(chat_id)
+            summary = await asyncio.to_thread(_setup_finish_summary)
+            try:
+                await query.edit_message_text(summary)
+            except Exception:
+                pass
+            return
+        else:
+            return
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except Exception:
+            pass  # "message is not modified" and similar cosmetic failures
+    except Exception as exc:
+        logger.exception("onboarding callback failed")
+        try:
+            await query.edit_message_text(f"⚠️ Setup action failed: {exc}")
+        except Exception:
+            pass
+
+
+async def _handle_setup_ai(update: Update, chat_id: int, section_id: str, text: str) -> None:
+    """AI escape hatch: free-form setup answer → bounded action plan → confirm."""
+    message = update.effective_message
+    section = onboarding.section_by_id(section_id) or {"title": section_id, "prompt": ""}
+    prompt = section.get("prompt") or (
+        onboarding.chapters_prompt() if section_id == "chapters" else ""
+    )
+    status_msg = await message.reply_text("🤖 Working out what to do…")
+    try:
+        parsed = await asyncio.to_thread(
+            domain_parser.parse_setup_ai, section["title"], prompt, text
+        )
+    except Exception as exc:
+        logger.exception("setup AI parse failed")
+        await status_msg.edit_text(f"⚠️ AI couldn't process that: {exc}")
+        return
+    if parsed.get("needs_clarification"):
+        await status_msg.edit_text(
+            parsed.get("clarification_question") or "Could you clarify that?"
+        )
+        return
+    actions, errors = onboarding.validate_ai_actions(parsed.get("actions") or [])
+    reply = str(parsed.get("reply") or "").strip()
+    if not actions:
+        note = ("\n(nothing safe to do: " + "; ".join(errors) + ")") if errors else ""
+        await status_msg.edit_text(
+            (reply or "I couldn't find anything actionable there.") + note
+        )
+        return
+    lines = [f"🤖 {reply}" if reply else "🤖 Here's what I'll do:", ""]
+    lines.extend(onboarding.describe_ai_actions(actions))
+    if errors:
+        lines.append("")
+        lines.append("⚠️ Ignored (invalid): " + "; ".join(errors))
+    lines.append("")
+    lines.append("Go ahead?")
+    preview = "\n".join(lines)
+    draft_id = draft_store.create_draft(
+        chat_id, {"kind": "setup_ai", "data": {"actions": actions}}, [preview]
+    )
+    await status_msg.edit_text(
+        preview,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Confirm ✅", callback_data=f"domain:confirm:{draft_id}"),
+            InlineKeyboardButton("Cancel", callback_data=f"domain:cancel:{draft_id}"),
+        ]]),
+    )
+
+
+def _jobs_list_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    jobs = user_jobs.list_jobs(chat_id)
+    lines = ["⏰ Your scheduled jobs"]
+    rows: list[list[InlineKeyboardButton]] = []
+    if jobs:
+        lines.append("")
+        for job in jobs:
+            state = "▶" if job["enabled"] else "⏸"
+            lines.append(f"{state} #{job['id']} {job['title']} — {user_jobs.schedule_text(job)}")
+            rows.append([InlineKeyboardButton(
+                f"⚙ {job['title'][:28]}", callback_data=f"jobs:view:{job['id']}"
+            )])
+    else:
+        lines.append("")
+        lines.append("No jobs yet.")
+    lines.append("")
+    lines.append("Create one in plain words:\n/jobs every weekday at 21:00 tell me my overall week cognitive yield")
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="jobs:list")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _job_detail_view(job_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    job = user_jobs.get_job(job_id)
+    if job is None:
+        return None
+    lines = [
+        f"⚙ Job #{job['id']}: {job['title']}",
+        f"When: {user_jobs.schedule_text(job)}",
+        f"Does: {'🤖 answers' if job['action_kind'] == 'ask' else '🔔 sends'} “{job['action_text']}”",
+        f"State: {'active ▶' if job['enabled'] else 'paused ⏸'}"
+        + (f" · last ran {str(job['last_run'])[:16]}" if job.get("last_run") else ""),
+    ]
+    toggle = ("⏸ Pause", "pause") if job["enabled"] else ("▶ Resume", "resume")
+    rows = [
+        [InlineKeyboardButton(toggle[0], callback_data=f"jobs:toggle:{job_id}"),
+         InlineKeyboardButton("▶ Run now", callback_data=f"jobs:run:{job_id}")],
+        [InlineKeyboardButton("✏️ Time", callback_data=f"jobs:edittime:{job_id}"),
+         InlineKeyboardButton("✏️ Text", callback_data=f"jobs:edittext:{job_id}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"jobs:del:{job_id}")],
+        [InlineKeyboardButton("↩ All jobs", callback_data="jobs:list")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _handle_job_create(
+    update: Update, chat_id: int, text: str, intro: str | None = None
+) -> None:
+    message = update.effective_message
+    status_msg = await message.reply_text("⏰ Working out the schedule…")
+    try:
+        parsed = await asyncio.to_thread(domain_parser.parse_job, text)
+    except Exception as exc:
+        logger.exception("job parse failed")
+        await status_msg.edit_text(f"⚠️ Couldn't parse that job: {exc}")
+        return
+    if parsed.get("needs_clarification"):
+        await status_msg.edit_text(
+            parsed.get("clarification_question") or "What time should this run?"
+        )
+        return
+    data, error = user_jobs.validate_parsed(parsed)
+    if data is None:
+        await status_msg.edit_text(f"⚠️ {error}")
+        return
+    lines = [intro] if intro else []
+    lines += [
+        "⏰ Job draft",
+        f"Title: {data['title']}",
+        f"When: {user_jobs.schedule_text(data)}",
+        f"Does: {'🤖 answer' if data['action_kind'] == 'ask' else '🔔 send'} “{data['action_text']}”",
+    ]
+    for overlap in user_jobs.builtin_overlaps(data):
+        lines.append(f"⚠️ {overlap}")
+    note = str(parsed.get("note") or "").strip()
+    if note:
+        lines.append(f"ℹ️ {note}")
+    lines.append("Create this job?")
+    preview = "\n".join(lines)
+    draft_id = draft_store.create_draft(
+        chat_id, {"kind": "job", "data": data}, [preview]
+    )
+    await status_msg.edit_text(
+        preview,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Create ✅", callback_data=f"domain:confirm:{draft_id}"),
+            InlineKeyboardButton("Cancel", callback_data=f"domain:cancel:{draft_id}"),
+        ]]),
+    )
+
+
+async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    chat_id = update.effective_chat.id
+    text = _command_args(update)
+    if text:
+        await _handle_job_create(update, chat_id, text)
+        return
+    user_jobs.clear_pending_edit(chat_id)
+    view_text, markup = await asyncio.to_thread(_jobs_list_view, chat_id)
+    await update.effective_message.reply_text(view_text, reply_markup=markup)
+
+
+async def _run_user_job(job: dict, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = int(job["chat_id"])
+    if job["action_kind"] == "message":
+        await context.bot.send_message(chat_id=chat_id, text=f"🔔 {job['title']}\n{job['action_text']}")
+    else:
+        answer = await asyncio.to_thread(
+            sql_query_flow.answer_question, job["action_text"], chat_id=chat_id
+        )
+        await context.bot.send_message(chat_id=chat_id, text=f"⏰ {job['title']}\n{answer}")
+    await asyncio.to_thread(user_jobs.mark_ran, job["id"])
+
+
+async def on_jobs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else "list"
+    job_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    try:
+        if action == "view" and job_id is not None:
+            detail = _job_detail_view(job_id)
+            if detail is None:
+                text, markup = await asyncio.to_thread(_jobs_list_view, chat_id)
+            else:
+                text, markup = detail
+        elif action == "toggle" and job_id is not None:
+            job = user_jobs.get_job(job_id)
+            if job:
+                user_jobs.set_enabled(job_id, not job["enabled"])
+            text, markup = _job_detail_view(job_id) or await asyncio.to_thread(_jobs_list_view, chat_id)
+        elif action == "run" and job_id is not None:
+            job = user_jobs.get_job(job_id)
+            if job:
+                await _run_user_job(job, context)
+            text, markup = _job_detail_view(job_id) or await asyncio.to_thread(_jobs_list_view, chat_id)
+            text = "✅ Ran it — result sent below.\n\n" + text
+        elif action == "del" and job_id is not None:
+            job = user_jobs.get_job(job_id)
+            title = job["title"] if job else "?"
+            text = f"Delete job “{title}” for good?"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Yes, delete", callback_data=f"jobs:delyes:{job_id}"),
+                InlineKeyboardButton("↩ Keep", callback_data=f"jobs:view:{job_id}"),
+            ]])
+        elif action == "delyes" and job_id is not None:
+            user_jobs.delete_job(job_id)
+            text, markup = await asyncio.to_thread(_jobs_list_view, chat_id)
+            text = "🗑 Deleted.\n\n" + text
+        elif action in ("edittime", "edittext") and job_id is not None:
+            field = "time" if action == "edittime" else "text"
+            user_jobs.set_pending_edit(chat_id, job_id, field)
+            prompt = (
+                "Send the new time as HH:MM (24h)." if field == "time"
+                else "Send the new question/reminder text."
+            )
+            text = f"✏️ Editing job #{job_id} {field}.\n{prompt}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩ Cancel", callback_data=f"jobs:view:{job_id}")
+            ]])
+        else:  # list
+            user_jobs.clear_pending_edit(chat_id)
+            text, markup = await asyncio.to_thread(_jobs_list_view, chat_id)
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.exception("jobs callback failed")
+        try:
+            await query.edit_message_text(f"⚠️ Jobs action failed: {exc}")
+        except Exception:
+            pass
+
+
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -701,6 +1549,61 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         await message.reply_text("received")
         return
+
+    # /settings edit in progress: the next text message is the new value.
+    pending_setting = draft_store.get_pending_setting_edit(chat_id)
+    if pending_setting:
+        await _apply_setting_reply(message, chat_id, pending_setting, text)
+        return
+
+    # /jobs edit in progress: the next text message is the new time/text.
+    pending_job = user_jobs.get_pending_edit(chat_id)
+    if pending_job:
+        job_id, field = pending_job
+        ok, result = await asyncio.to_thread(user_jobs.update_field, job_id, field, text)
+        if ok:
+            job = user_jobs.get_job(job_id)
+            await message.reply_text(
+                f"✅ Job #{job_id} updated — {user_jobs.describe(job)}" if job
+                else f"✅ Job #{job_id} updated."
+            )
+        else:
+            user_jobs.set_pending_edit(chat_id, job_id, field)
+            await message.reply_text(f"⚠️ {result}. Send it again, or open /jobs to cancel.")
+        return
+
+    # /setup wizard in progress: route the text to the active section.
+    onb_state = onboarding.active_section(chat_id)
+    if onb_state:
+        section_id, _mode = onb_state
+        lowered = text.lstrip().lower()
+        if lowered.startswith(("ai ", "ai:", "ai,")):
+            stripped = text.lstrip()[2:].lstrip(" :,").strip()
+            await _handle_setup_ai(update, chat_id, section_id, stripped or text)
+            return
+        if section_id == "commitments":
+            # Reuses the /remember preview+confirm; the wizard loop stays
+            # active so the next message adds another commitment.
+            await _handle_remember(update, text, chat_id)
+            return
+        _ok, reply, adv = await asyncio.to_thread(
+            onboarding.apply_answer, chat_id, section_id, text
+        )
+        if not _ok:
+            reply += "\n💡 Or start your message with `ai ` and describe it — I'll figure out what to do."
+        if adv:
+            reply_text, markup = await _setup_after_answer(chat_id, reply, True)
+            await message.reply_text(reply_text, reply_markup=markup)
+        else:
+            await message.reply_text(reply)
+        return
+
+    # One-time nudge toward /setup for a fresh install.
+    if not onboarding.is_complete(chat_id) and reminders.claim("onboarding-hint:v1"):
+        await message.reply_text(
+            "🚀 First time? Run /setup — 2 minutes, and every engine "
+            "(planner, streaks, teacher alerts) comes alive."
+        )
 
     # Gap 3: if a field-edit is pending for this chat, apply the new value.
     editing = draft_store.get_editing_draft_for_chat(chat_id)
@@ -772,6 +1675,11 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if intent.action == "remember":
+        statement = str(intent.fields.get("statement") or "").strip() or text
+        await _handle_remember(update, statement, chat_id)
+        return
+
     if intent.action in ("query", "ask"):
         # Route both structured queries and free-form questions through the
         # LLM SQL loop — it can answer anything the mirror knows, including
@@ -780,28 +1688,74 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         question = text
         if intent.action == "ask":
             question = intent.fields.get("question") or text
-        await _handle_question(update, question, intent=intent)
+        await _handle_question(update, question, intent=intent, chat_id=chat_id)
         return
 
     await message.reply_text("received")
 
 
-async def _handle_question(update: Update, question: str, intent=None) -> None:
+async def _handle_question(
+    update: Update, question: str, intent=None, chat_id: int | None = None
+) -> None:
     """Answer a free-form question about the user's study data via the SQL loop.
 
     Falls back to a short apology if both the LLM and the legacy query_flow
-    are unavailable.
+    are unavailable. When chat_id is given, a rolling window of recent
+    (question, answer) turns is loaded for follow-up context and the new turn
+    is saved after a successful answer.
     """
     message = update.effective_message
+    if chat_id is None:
+        chat_id = update.effective_chat.id
     try:
         import sql_query_flow
-        answer = await asyncio.to_thread(sql_query_flow.answer_question, question)
+        from config import settings as _cfg
+        try:
+            pairs = _cfg.query_history_pairs()
+        except Exception:
+            pairs = draft_store.QA_HISTORY_MAX_PAIRS
+        history = await asyncio.to_thread(
+            draft_store.recent_qa, chat_id, limit_pairs=pairs
+        )
+
+        # Live progress: edit a single status message in place as the loop
+        # drills. Steps arrive from a worker thread, so hand them to the event
+        # loop via call_soon_threadsafe.
+        loop = asyncio.get_running_loop()
+        status_msg = await message.reply_text("🔍 Thinking…")
+        steps: list[str] = []
+
+        def _render() -> str:
+            shown = steps[-6:]
+            return "🔍 " + "\n".join(shown) if shown else "🔍 Thinking…"
+
+        async def _update_status(text: str) -> None:
+            try:
+                await status_msg.edit_text(text)
+            except Exception:
+                pass  # ignore "message not modified" / rate limits
+
+        def _on_step(kind: str, detail: str) -> None:
+            steps.append(detail)
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(_update_status(_render()))
+            )
+
+        answer = await asyncio.to_thread(
+            sql_query_flow.answer_question,
+            question, history=history, on_step=_on_step, chat_id=chat_id,
+        )
         if answer.startswith("⚠️") and intent is not None and intent.action == "query":
             result = await asyncio.to_thread(query_flow.run_query, intent)
             answer = query_flow.format_result(result)
-        await message.reply_text(
-            answer, disable_web_page_preview=True
-        )
+        # Only remember successful answers, so an error turn never poisons the
+        # follow-up window.
+        if not answer.startswith("⚠️"):
+            await asyncio.to_thread(draft_store.record_qa, chat_id, question, answer)
+        try:
+            await status_msg.edit_text(answer, disable_web_page_preview=True)
+        except Exception:
+            await message.reply_text(answer, disable_web_page_preview=True)
     except Exception:
         logger.exception("SQL query loop failed for question=%r", question)
         await message.reply_text(
@@ -1154,6 +2108,49 @@ async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("teacher opportunity scan failed")
 
 
+async def _commitment_verify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nightly: record today's commitment adherence from the ledger. No message."""
+    try:
+        await sync.sync_once_locked(db_keys=("ledger",))
+        today = session_context.local_today_iso()
+        await asyncio.to_thread(commitments.run_checks_for_date, today)
+    except Exception:
+        logger.exception("commitment verify job failed")
+
+
+async def _commitment_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Morning: re-verify yesterday (absorbs post-midnight logging), then nudge."""
+    try:
+        await sync.sync_once_locked(db_keys=("ledger",))
+        yesterday = (
+            dt.date.fromisoformat(session_context.local_today_iso())
+            - dt.timedelta(days=1)
+        ).isoformat()
+        nudge = await asyncio.to_thread(advisor.morning_nudge, yesterday)
+        if nudge is None or not reminders.claim(f"commitment-nudge:{yesterday}"):
+            return
+        drift = await asyncio.to_thread(advisor.trajectory_warnings)
+        if drift:
+            nudge += "\n\n📉 Watch:\n" + "\n".join(f"- {w}" for w in drift)
+        await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=nudge)
+    except Exception:
+        logger.exception("commitment nudge job failed")
+
+
+async def _user_jobs_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fire due user-created jobs (dedup via reminders.claim per job per day)."""
+    try:
+        now = session_context.local_now()
+        for job in await asyncio.to_thread(user_jobs.due_jobs, now):
+            if reminders.claim(f"user-job:{job['id']}:{now.date().isoformat()}"):
+                try:
+                    await _run_user_job(job, context)
+                except Exception:
+                    logger.exception("user job %s failed", job["id"])
+    except Exception:
+        logger.exception("user jobs scan failed")
+
+
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(BOT_COMMANDS)
     logger.info("Registered %d bot commands", len(BOT_COMMANDS))
@@ -1170,10 +2167,11 @@ async def post_init(application: Application) -> None:
     # directly in Notion that don't go through the bot — without it, the
     # mirror only updates on bot-initiated writes.
     if application.job_queue is not None:
+        sync_secs = config_settings.sync_interval_seconds()
         application.job_queue.run_repeating(
             _periodic_sync,
-            interval=SYNC_INTERVAL_SECONDS,
-            first=SYNC_INTERVAL_SECONDS,
+            interval=sync_secs,
+            first=sync_secs,
             name="periodic_sync",
         )
         application.job_queue.run_repeating(
@@ -1198,6 +2196,14 @@ async def post_init(application: Application) -> None:
             _weekly_report_job, time=_clock(config_settings.weekly_report_time()),
             days=tuple(range(7)), name="weekly_report",
         )
+        application.job_queue.run_daily(
+            _commitment_verify_job, time=_clock(config_settings.commitment_check_time()),
+            days=tuple(range(7)), name="commitment_verify",
+        )
+        application.job_queue.run_daily(
+            _commitment_nudge_job, time=_clock(config_settings.commitment_nudge_time()),
+            days=tuple(range(7)), name="commitment_nudge",
+        )
         application.job_queue.run_repeating(
             _exam_reminder_scan, interval=600, first=120, name="exam_reminders"
         )
@@ -1207,7 +2213,10 @@ async def post_init(application: Application) -> None:
         application.job_queue.run_repeating(
             _schedule_watch_scan, interval=300, first=90, name="schedule_watcher"
         )
-        logger.info("Scheduled periodic sync every %ds", SYNC_INTERVAL_SECONDS)
+        application.job_queue.run_repeating(
+            _user_jobs_scan, interval=60, first=75, name="user_jobs"
+        )
+        logger.info("Scheduled periodic sync every %ds", sync_secs)
     else:
         logger.warning("JobQueue unavailable — periodic sync NOT scheduled")
 
@@ -1245,9 +2254,15 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("newsession", newsession))
-    app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("setup", setup_command))
+    app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("health", health))
+    app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("goal", goal_command))
+    app.add_handler(CommandHandler("remember", remember_command))
+    app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("exam", exam_command))
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("next", next_command))
@@ -1265,6 +2280,10 @@ def main() -> None:
     app.add_handler(CommandHandler("question_review", question_review_command))
     app.add_handler(CommandHandler("complete_exam_analysis", complete_exam_analysis_command))
     app.add_handler(CallbackQueryHandler(on_domain_callback, pattern=r"^domain:"))
+    app.add_handler(CallbackQueryHandler(on_memory_callback, pattern=r"^memory:"))
+    app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^settings:"))
+    app.add_handler(CallbackQueryHandler(on_onboarding_callback, pattern=r"^onb:"))
+    app.add_handler(CallbackQueryHandler(on_jobs_callback, pattern=r"^jobs:"))
     app.add_handler(CallbackQueryHandler(on_plan_callback, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_log_callback, pattern=r"^log:"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, catch_all))

@@ -425,6 +425,17 @@ def build_write_plan(
             return plan
         props[title_key] = synth
 
+    # Commitment advisor (trigger a): late in the day, an execution log that
+    # ignores a still-unmet daily commitment gets a visible warning in the
+    # preview — the user confirms with eyes open. Advisory only: any failure
+    # here must never block logging.
+    if db_key == "ledger":
+        try:
+            import advisor
+            plan.warnings.extend(advisor.log_warnings(props, db_path=db_path))
+        except Exception:
+            logger.debug("commitment advisor check failed", exc_info=True)
+
     plan.properties = props
     plan.preview_lines = _render_preview(db_key, props, plan.cross_log_doubt, plan.resolved_names)
     return plan

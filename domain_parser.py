@@ -19,9 +19,14 @@ class DomainParseError(ValueError):
 
 
 def _call(kind: str, text: str, contract: str) -> dict[str, Any]:
+    import session_context
+    now = session_context.local_now()
     prompt = f"""You extract one {kind} for a personal JEE study system.
-Return one JSON object only. Never infer a date, number, subject, exam result,
-or target that the user did not state. Use null for missing facts.
+Current local date/time: {now:%Y-%m-%d %H:%M} ({now:%A}). Use it to resolve
+relative dates the user states ("tomorrow", "next month", "10th august" ->
+the next 10 August from today). Return one JSON object only. Never invent a
+date, number, subject, exam result, or target that the user did not state or
+that does not follow from the current date. Use null for missing facts.
 
 Contract:
 {contract}
@@ -116,6 +121,180 @@ the target to minutes and use goal_type Duration. Rank goals may use target 1.
     data["needs_clarification"] = False
     data["source_text"] = text
     return data
+
+
+def parse_commitment(text: str) -> dict[str, Any]:
+    """Parse a remembered statement into a measurable commitment or a preference.
+
+    Commitments become op_goals rows (period Daily/Weekly) so the planner and
+    the nightly ledger verification both watch them; preferences are stored
+    as free text and only injected into prompts.
+    """
+    data = _call("commitment or preference", text, """
+{
+  "kind": "commitment|preference|bot_instruction",
+  "title": string|null,
+  "goal_type": "CY|Duration|Coverage"|null,
+  "metric": string|null,
+  "target": number|null,
+  "period": "Daily|Weekly"|null,
+  "subject": "Chem|Maths|Physics"|null,
+  "needs_clarification": boolean,
+  "clarification_question": string|null
+}
+A commitment is a measurable recurring promise. "PYQs every day" -> kind
+commitment, title "Daily PYQs", goal_type Coverage, metric "sessions",
+target 1, period Daily. "2 hours of maths daily" -> goal_type Duration,
+target 120 (hours become minutes), subject Maths. "300 CY per day" ->
+goal_type CY, metric cognitive_yield, target 300. Keep the activity name
+(PYQ, revision, ...) inside the title. A count of sessions uses goal_type
+Coverage with metric "sessions". A preference or fact with nothing to count
+("I prefer maths in the morning") is kind preference — leave goal_type,
+target and period null and put the statement in title.
+An instruction for the BOT to do/send/tell something on a schedule ("every
+weekday tell me my week's cognitive yield", "remind me each sunday to plan")
+is kind bot_instruction — set title to the statement, everything else null.
+""")
+    if data.get("needs_clarification"):
+        return data
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind not in ("commitment", "preference", "bot_instruction"):
+        kind = "commitment" if data.get("target") is not None else "preference"
+    data["kind"] = kind
+    data["source_text"] = text
+    if kind == "bot_instruction":
+        data["needs_clarification"] = False
+        if not data.get("title"):
+            data["title"] = text.strip()
+        return data
+    if kind == "preference":
+        data["needs_clarification"] = False
+        if not data.get("title"):
+            data["title"] = text.strip()
+        return data
+    if not data.get("title") or data.get("target") is None:
+        return {
+            **data,
+            "needs_clarification": True,
+            "clarification_question": "What exactly should I track, and how much per day or week?",
+        }
+    data["goal_type"] = _enum(data.get("goal_type") or "Coverage", "goal_type", notion_schema.GOAL_TYPE_OPTIONS, nullable=False)
+    data["period"] = _enum(data.get("period") or "Daily", "period", notion_schema.GOAL_PERIOD_OPTIONS, nullable=False)
+    data["subject"] = _enum(data.get("subject"), "subject", notion_schema.SUBJECT_OPTIONS)
+    data["target"] = _number(data["target"], "target")
+    if not data.get("metric"):
+        data["metric"] = "sessions" if data["goal_type"] == "Coverage" else data["goal_type"]
+    data["needs_clarification"] = False
+    return data
+
+
+SETUP_AI_ACTION_TYPES = (
+    "remember_preference",
+    "create_commitment",
+    "create_work_item",
+    "create_exam",
+    "create_timetable_entry",
+    "set_setting",
+    "skip_section",
+)
+
+
+def parse_setup_ai(section_title: str, section_prompt: str, text: str) -> dict[str, Any]:
+    """Interpret a free-form /setup answer into a bounded list of actions.
+
+    The model may only choose from SETUP_AI_ACTION_TYPES; every action is
+    re-validated deterministically (onboarding.validate_ai_actions) before
+    anything is shown or executed, and nothing runs without the user tapping
+    Confirm.
+    """
+    setting_keys = ", ".join(e["key"] for e in settings.SETTINGS_REGISTRY)
+    contract = f"""
+{{
+  "reply": string,          // one short, friendly sentence answering the user
+  "actions": [              // zero or more, ONLY these types:
+    {{"type": "remember_preference", "text": string}},
+    {{"type": "create_commitment", "statement": string}},
+    {{"type": "create_work_item", "title": string,
+      "kind": "Coaching Homework|Current Syllabus|Revision|PYQ|Short Notes|Backlog|Other",
+      "subject": "Chem|Maths|Physics"|null, "due_date": "YYYY-MM-DD"|null}},
+    {{"type": "create_exam", "title": string,
+      "kind": "JEE Main Mock|JEE Advanced Mock|Coaching Test|JEE Main|JEE Advanced|Other",
+      "exam_date": "YYYY-MM-DD"}},
+    {{"type": "create_timetable_entry", "subject": "Chem|Maths|Physics",
+      "weekday": "Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday",
+      "start": "HH:MM", "end": "HH:MM", "teacher": string|null}},
+    {{"type": "set_setting", "key": one of [{setting_keys}], "value": string}},
+        // weekday-type settings (TIMETABLE_REMINDER_WEEKDAY) use "0"=Monday … "6"=Sunday
+    {{"type": "skip_section"}}
+  ],
+  "needs_clarification": boolean,
+  "clarification_question": string|null
+}}
+
+Context: the user is inside the "{section_title}" step of a study-bot setup
+wizard, which asked: {section_prompt!r}
+They answered in free form instead of the requested format. Work out what
+should actually happen using ONLY the action types above. Prefer the
+smallest set of actions that honours the intent. Examples:
+- "my schedule changes constantly, I'll tell you at the end of every week"
+  (timetable step) -> remember_preference("coaching schedule changes weekly;
+  user updates it at the end of each week") + set_setting
+  TIMETABLE_REMINDER_WEEKDAY "6" (Sunday check-in) + skip_section.
+- "make my baseline 260" -> set_setting DAILY_CY_BASELINE "260".
+- "remind me to add my mock dates next month" -> create_work_item
+  (title "Add mock exam dates", kind Other, due_date next month).
+- "I'll do PYQs daily" -> create_commitment("PYQs every day").
+- "skip this" -> skip_section only.
+Never invent dates, numbers or names the user did not state. If the intent
+is genuinely unclear, set needs_clarification=true with one short question
+and an empty actions list."""
+    data = _call("setup assistant plan", text, contract)
+    if not isinstance(data.get("actions"), list):
+        data["actions"] = []
+    data.setdefault("reply", "")
+    data.setdefault("needs_clarification", False)
+    return data
+
+
+def parse_job(text: str) -> dict[str, Any]:
+    """Parse a natural-language scheduled-job request for /jobs.
+
+    A job makes the bot ACT at a time: action_kind "ask" answers a saved
+    question from the study database and sends the result; "message" sends a
+    fixed reminder text. Validated deterministically by
+    user_jobs.validate_parsed before anything is created.
+    """
+    weekday_name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][
+        settings.timetable_reminder_weekday()
+    ]
+    builtins = (
+        f"weekly growth report every {weekday_name} at {settings.weekly_report_time()}; "
+        f"morning commitment nudge daily at {settings.commitment_nudge_time()}; "
+        f"nightly commitment check at {settings.commitment_check_time()}; "
+        f"planning check daily at {settings.planning_reminder_time()}"
+    )
+    return _call("scheduled job", text, f"""
+{{
+  "title": string|null,               // short label, e.g. "Weekday CY report"
+  "schedule_kind": "daily|weekdays|weekly|once",
+  "time": "HH:MM",                    // 24h local time — REQUIRED
+  "weekday": integer 0..6|null,       // required for weekly (0=Monday ... 6=Sunday)
+  "date": "YYYY-MM-DD"|null,          // required for once
+  "action_kind": "ask|message",
+  "action_text": string,
+  "note": string|null,
+  "needs_clarification": boolean,
+  "clarification_question": string|null
+}}
+action_kind "ask": at that time the bot ANSWERS action_text as a question
+against the user's study database (ledger/goals/doubts/...) and sends the
+answer. Use it for any report/analysis request, e.g. "tell me my overall
+week cognitive yield" -> action_text "What is my overall cognitive yield for
+the last 7 days?". action_kind "message": send action_text verbatim as a
+reminder. "every weekday" -> schedule_kind weekdays. If the user states NO
+time, set needs_clarification=true asking what time.
+These bot schedules already exist: {builtins}. If the request overlaps or
+duplicates one of them, still fill the job but say so plainly in "note".""")
 
 
 def parse_exam(text: str) -> dict[str, Any]:

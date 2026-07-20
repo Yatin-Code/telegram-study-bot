@@ -26,6 +26,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from config import settings as _settings
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
 
@@ -66,10 +68,15 @@ def create_draft(
     preview_lines: list[str],
     message_id: int | None = None,
     *,
-    ttl_minutes: int = DEFAULT_TTL_MINUTES,
+    ttl_minutes: int | None = None,
     db_path: str | Path = DEFAULT_DB_PATH,
 ) -> str:
     """Store a draft and return its draft_id (12-char hex token)."""
+    if ttl_minutes is None:
+        try:
+            ttl_minutes = _settings.draft_ttl_minutes()
+        except Exception:
+            ttl_minutes = DEFAULT_TTL_MINUTES
     draft_id = uuid.uuid4().hex[:12]
     now = _utc_now()
     expires = now + dt.timedelta(minutes=ttl_minutes)
@@ -294,5 +301,181 @@ def clear_pending_clarification(
         _init_clarification(conn)
         conn.execute(
             f"DELETE FROM {CLARIFICATION_TABLE} WHERE chat_id = ?", (chat_id,)
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Conversation history for the ask/query answer loop (follow-up context)
+# ---------------------------------------------------------------------------
+# A rolling window of the last few (question, answer) turns per chat, so a
+# follow-up like "what about physics?" can be answered against the prior
+# question. This is deliberately separate from the three existing context
+# layers and never feeds them:
+#   - session context (subject/chapter/... for logging inheritance)
+#   - pending clarification (bot-asked follow-up merge)
+#   - the within-question SQL loop's ephemeral message list
+# Only the ask/query path writes here; only sql_query_flow reads it.
+
+QA_HISTORY_TABLE = "chat_qa_history"
+QA_HISTORY_MAX_PAIRS = 5            # 5 user + 5 assistant = 10 messages max
+QA_HISTORY_TTL_MINUTES = 60         # ignore turns older than this on read
+QA_ANSWER_MAX_CHARS = 1500          # bound stored answers so the prompt stays small
+
+
+def _init_qa_history(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {QA_HISTORY_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{QA_HISTORY_TABLE}_chat "
+        f"ON {QA_HISTORY_TABLE}(chat_id, id)"
+    )
+    conn.commit()
+
+
+def record_qa(
+    chat_id: int,
+    question: str,
+    answer: str,
+    *,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """Append a (question, answer) turn, then trim to the newest N pairs."""
+    question = (question or "").strip()
+    answer = (answer or "").strip()
+    if not question or not answer:
+        return
+    if len(answer) > QA_ANSWER_MAX_CHARS:
+        answer = answer[:QA_ANSWER_MAX_CHARS] + "…"
+    with _connect(db_path) as conn:
+        _init_qa_history(conn)
+        conn.execute(
+            f"INSERT INTO {QA_HISTORY_TABLE} "
+            "(chat_id, question, answer, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, question, answer, _utc_now().isoformat()),
+        )
+        # Keep only the newest QA_HISTORY_MAX_PAIRS rows for this chat.
+        conn.execute(
+            f"DELETE FROM {QA_HISTORY_TABLE} WHERE chat_id = ? AND id NOT IN ("
+            f"  SELECT id FROM {QA_HISTORY_TABLE} WHERE chat_id = ? "
+            f"  ORDER BY id DESC LIMIT ?"
+            f")",
+            (chat_id, chat_id, QA_HISTORY_MAX_PAIRS),
+        )
+        conn.commit()
+
+
+def recent_qa(
+    chat_id: int,
+    *,
+    limit_pairs: int = QA_HISTORY_MAX_PAIRS,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> list[dict[str, str]]:
+    """Return recent turns oldest-first as [{"question":..., "answer":...}].
+
+    Turns older than the QA-history TTL (settings, default 60 min) are skipped
+    (and pruned) so a follow-up never binds to a stale, unrelated earlier
+    conversation.
+    """
+    try:
+        ttl_minutes = _settings.qa_history_ttl_minutes()
+    except Exception:
+        ttl_minutes = QA_HISTORY_TTL_MINUTES
+    cutoff = (
+        _utc_now() - dt.timedelta(minutes=ttl_minutes)
+    ).isoformat()
+    with _connect(db_path) as conn:
+        _init_qa_history(conn)
+        conn.execute(
+            f"DELETE FROM {QA_HISTORY_TABLE} WHERE chat_id = ? AND created_at < ?",
+            (chat_id, cutoff),
+        )
+        conn.commit()
+        rows = conn.execute(
+            f"SELECT question, answer FROM {QA_HISTORY_TABLE} "
+            "WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+            (chat_id, max(1, limit_pairs)),
+        ).fetchall()
+    return [{"question": r["question"], "answer": r["answer"]} for r in reversed(rows)]
+
+
+def clear_qa_history(chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        _init_qa_history(conn)
+        conn.execute(
+            f"DELETE FROM {QA_HISTORY_TABLE} WHERE chat_id = ?", (chat_id,)
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Pending /settings edit (which setting a chat is currently typing a value for)
+# ---------------------------------------------------------------------------
+# Mirrors the pending-clarification pattern: one row per chat, short TTL, the
+# next text message is consumed as the new value for the stored setting key.
+
+SETTING_EDIT_TABLE = "pending_setting_edits"
+SETTING_EDIT_TTL_MINUTES = 5
+
+
+def _init_setting_edit(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {SETTING_EDIT_TABLE} (
+            chat_id INTEGER PRIMARY KEY,
+            setting_key TEXT NOT NULL,
+            asked_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def set_pending_setting_edit(
+    chat_id: int, setting_key: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    with _connect(db_path) as conn:
+        _init_setting_edit(conn)
+        conn.execute(
+            f"INSERT OR REPLACE INTO {SETTING_EDIT_TABLE} "
+            "(chat_id, setting_key, asked_at) VALUES (?, ?, ?)",
+            (chat_id, setting_key, _utc_now().isoformat()),
+        )
+        conn.commit()
+
+
+def get_pending_setting_edit(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> Optional[str]:
+    """Fetch-and-clear the setting key awaiting a value. None if absent/stale."""
+    with _connect(db_path) as conn:
+        _init_setting_edit(conn)
+        row = conn.execute(
+            f"SELECT * FROM {SETTING_EDIT_TABLE} WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            f"DELETE FROM {SETTING_EDIT_TABLE} WHERE chat_id = ?", (chat_id,)
+        )
+        conn.commit()
+    asked = dt.datetime.fromisoformat(row["asked_at"])
+    if (_utc_now() - asked).total_seconds() > SETTING_EDIT_TTL_MINUTES * 60:
+        return None
+    return row["setting_key"]
+
+
+def clear_pending_setting_edit(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    with _connect(db_path) as conn:
+        _init_setting_edit(conn)
+        conn.execute(
+            f"DELETE FROM {SETTING_EDIT_TABLE} WHERE chat_id = ?", (chat_id,)
         )
         conn.commit()

@@ -42,7 +42,10 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "study-bot/1.0"
 REQUEST_TIMEOUT = 45.0
-MAX_ITERATIONS = 4
+# Safety ceiling only — the loop stops as soon as the model answers. Overridable
+# via QUERY_MAX_ITERATIONS in .env (see settings.query_max_iterations). Used when
+# answer_question is called without an explicit max_iterations.
+MAX_ITERATIONS = 12
 MAX_ROWS_FEEDBACK = 40
 
 # Regex to pull a fenced ```sql ... ``` block (or plain SQL) out of the
@@ -99,6 +102,12 @@ Or:
 RULES
 -----
 - Only SELECT / WITH ... SELECT statements are allowed. Writes are blocked.
+- CONVERSATION HISTORY (earlier turns, if any) is provided ONLY to resolve
+  references in the CURRENT question (e.g. "what about physics?", "and last
+  month?"). Treat every new question as standalone unless it explicitly refers
+  back. NEVER reuse a number, total, or fact from an earlier answer — ALWAYS
+  re-run SQL to get fresh figures. If the new question is unrelated to the
+  history, ignore the history entirely.
 - Always filter `archived = 0` unless the user explicitly asks for
   deleted/archived entries.
 - Subject and status values are CASE-SENSITIVE in this SQLite. ALWAYS use
@@ -141,18 +150,37 @@ RULES
 - The user's local date is {local_date}. For "today" and relative study-day
   questions, use this explicit date instead of SQLite date('now'), which is UTC.
 
+{now_block}
+
 SCHEMA
 ------
 {schema}
 """
 
 
-def _build_system_prompt() -> str:
-    return SYSTEM_PROMPT.format(
+def _build_system_prompt(chat_id: int | None = None) -> str:
+    try:
+        import advisor
+        now_block = advisor.now_block(chat_id)
+    except Exception:
+        now_block = ""
+    prompt = SYSTEM_PROMPT.format(
         max_iter=MAX_ITERATIONS,
         local_date=session_context.local_today_iso(),
+        now_block=now_block,
         schema=sql_tool.schema_digest(),
     )
+    # Persistent memory: active commitments (with deterministic adherence
+    # stats) and free-form preferences. Advisory context only — the model is
+    # told figures still come from SQL. Failure here must never break answers.
+    try:
+        import advisor
+        block = advisor.memory_prompt_block(chat_id)
+        if block:
+            prompt += "\n\n" + block
+    except Exception:
+        logger.debug("memory prompt block failed", exc_info=True)
+    return prompt
 
 
 def _call_llm(messages: list[dict[str, str]], *, model: str | None = None) -> str:
@@ -263,23 +291,70 @@ def _format_results(result: dict[str, Any], sql: str) -> str:
     return "\n".join(lines)
 
 
+def _summarise_sql(sql: str) -> str:
+    """One-line, human-readable gist of a SQL query for the live trace."""
+    flat = " ".join(sql.split())
+    tables = re.findall(r"\b(?:FROM|JOIN)\s+\"?([A-Za-z_][A-Za-z0-9_]*)\"?", flat, re.IGNORECASE)
+    verb = "counting" if re.search(r"\bCOUNT\s*\(", flat, re.IGNORECASE) else (
+        "averaging" if re.search(r"\bAVG\s*\(", flat, re.IGNORECASE) else "querying"
+    )
+    tbl = ", ".join(dict.fromkeys(tables)) or "data"
+    label = f"{verb} {tbl}"
+    return label[:80]
+
+
 def answer_question(
     user_question: str,
     *,
     db_path: str | Path | None = None,
-    max_iterations: int = MAX_ITERATIONS,
+    max_iterations: int | None = None,
+    history: list[dict[str, str]] | None = None,
+    on_step: "callable | None" = None,
+    chat_id: int | None = None,
 ) -> str:
     """Run the SQL query loop and return a natural-language answer.
+
+    `history` is an optional list of prior turns, oldest-first, each a dict
+    with "question" and "answer" keys. They are injected before the current
+    question so follow-ups ("what about physics?") resolve against earlier
+    turns. History is read-only here: it never mixes with the within-question
+    SQL feedback appended below, which stays scoped to this single call.
+
+    `max_iterations` is a safety ceiling only — the loop returns as soon as the
+    model emits an answer. Defaults to settings.query_max_iterations().
+
+    `on_step(kind, detail)` is an optional callback invoked as the loop works,
+    for live progress display. `kind` is one of "sql", "result", "retry",
+    "answer"; `detail` is a short human string. Callback errors are swallowed.
 
     On any LLM failure, falls back to a short message noting the issue.
     """
     if db_path is None:
         db_path = sql_tool.DEFAULT_DB_PATH
+    if max_iterations is None:
+        try:
+            max_iterations = settings.query_max_iterations()
+        except Exception:
+            max_iterations = MAX_ITERATIONS
+
+    def _emit(kind: str, detail: str) -> None:
+        if on_step is None:
+            return
+        try:
+            on_step(kind, detail)
+        except Exception:
+            logger.debug("on_step callback raised", exc_info=True)
 
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": _build_system_prompt()},
-        {"role": "user", "content": user_question},
+        {"role": "system", "content": _build_system_prompt(chat_id)},
     ]
+    for turn in history or []:
+        q = (turn.get("question") or "").strip()
+        a = (turn.get("answer") or "").strip()
+        if q and a:
+            messages.append({"role": "user", "content": q})
+            messages.append({"role": "assistant", "content": a})
+    messages.append({"role": "user", "content": user_question})
 
     for iteration in range(1, max_iterations + 1):
         try:
@@ -296,22 +371,28 @@ def answer_question(
         # If we got both (e.g. SQL then an answer in the same message), prefer SQL.
         if sql:
             logger.info("SQL loop iter=%d query: %s", iteration, sql[:200])
+            _emit("sql", f"Step {iteration}: {_summarise_sql(sql)}")
             policy_error = _active_filter_error(sql, user_question)
             if policy_error:
                 feedback = f"ERROR (active-row policy): {policy_error}"
+                _emit("retry", "adjusting query (active-row policy)")
             else:
                 try:
                     result = sql_tool.run_sql(sql, db_path=db_path)
                 except sql_tool.SQLRejectedError as e:
                     feedback = f"ERROR (rejected): {e}"
+                    _emit("retry", "query rejected, retrying")
                 except sql_tool.SQLExecutionError as e:
                     feedback = f"ERROR (sqlite): {e}"
+                    _emit("retry", "SQL error, retrying")
                 else:
                     feedback = _format_results(result, sql)
+                    _emit("result", f"→ {result['row_count']} row(s)")
             messages.append({"role": "user", "content": feedback})
             continue
 
         if answer:
+            _emit("answer", "writing answer")
             return answer
 
         # Model said neither SQL nor ANSWER — prompt it to answer.

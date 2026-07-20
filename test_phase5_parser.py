@@ -58,6 +58,13 @@ CASES: list[tuple[str, dict | None, dict]] = [
      {"action": "query", "database": "revision"}),
     ("list block donuts", None, {"action": "query"}),
 
+    # ---- remember (commitments / preferences) ----
+    ("from now on i'll do pyqs every day", None, {"action": "remember"}),
+    ("remember that i prefer maths in the morning", None, {"action": "remember"}),
+    # Completed work with results must stay a log, not a remember.
+    ("did 20 pyqs today, 15 correct, 40 mins", None,
+     {"action": "log_execution", "database": "ledger"}),
+
     # ---- edge / clarification ----
     ("doubt about that thing from earlier", None,
      {"action": "log_doubt"}),
