@@ -70,6 +70,7 @@ BOT_COMMANDS = [
     BotCommand("settings", "View & edit bot settings"),
     BotCommand("memory", "See & edit what the bot remembers"),
     BotCommand("jobs", "Create & manage scheduled jobs"),
+    BotCommand("bug", "Note something that went wrong"),
     BotCommand("health", "Show bot & mirror health status"),
     BotCommand("goal", "Create or list measurable goals"),
     BotCommand("remember", "Remember a commitment or preference"),
@@ -447,6 +448,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Last sync: {last_sync}",
         f"• Context: {_format_context(ctx)}",
         f"• Pending writes: {logging_flow.pending_count()}",
+        f"• Errors last 24h: {_errors_last_24h()}",
     ]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -584,6 +586,15 @@ async def exam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(f"I could not create that exam safely: {exc}")
 
 
+def _relevance_warning(parsed: dict) -> list[str]:
+    """One honest line when a capture doesn't look study-related. Never blocks."""
+    if parsed.get("study_related", True):
+        return []
+    note = str(parsed.get("relevance_note") or "").strip()
+    line = "⚠️ This doesn't look related to your studies — keep it anyway?"
+    return [f"{line} ({note})" if note else line]
+
+
 async def _handle_remember(update: Update, statement: str, chat_id: int) -> None:
     """Parse a commitment/preference, show conflicts, and ask for confirmation."""
     message = update.effective_message
@@ -614,11 +625,10 @@ async def _handle_remember(update: Update, statement: str, chat_id: int) -> None
         return
     if data.get("kind") == "preference":
         pref_text = str(data.get("title") or statement).strip()
-        preview = (
-            "Preference to remember\n"
-            f"“{pref_text}”\n"
-            "I'll keep this in mind when advising. Save?"
-        )
+        lines = ["Preference to remember", f"“{pref_text}”"]
+        lines.extend(_relevance_warning(data))
+        lines.append("I'll keep this in mind when advising. Save?")
+        preview = "\n".join(lines)
         draft_id = draft_store.create_draft(
             chat_id,
             {"kind": "preference", "data": {"chat_id": chat_id, "text": pref_text}},
@@ -646,7 +656,7 @@ async def _handle_remember(update: Update, statement: str, chat_id: int) -> None
     lines = [
         "Commitment draft",
         f"Title: {goal_data['title']}",
-        f"Track: {float(goal_data['target']):g} {goal_data.get('metric')} per {str(goal_data['period']).lower()}",
+        f"Track: {commitments.format_target(goal_data['target'], goal_data.get('metric'), goal_data['period'])}",
     ]
     if goal_data.get("subject"):
         lines.append(f"Subject: {goal_data['subject']}")
@@ -655,6 +665,7 @@ async def _handle_remember(update: Update, statement: str, chat_id: int) -> None
         lines.append(f"⚠️ {conflict['message']}")
         if conflict.get("goal_id") and replace_goal_id is None:
             replace_goal_id = conflict["goal_id"]
+    lines.extend(_relevance_warning(data))
     if verifiable:
         lines.append("I'll verify this nightly against your ledger and track your streak.")
         if re.search(r"\b(morning|evening|afternoon|night|noon)\b", statement, re.IGNORECASE):
@@ -700,8 +711,8 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         today = session_context.local_today_iso()
         for i, goal in enumerate(goals, 1):
             entry = (
-                f"{i}. {goal.get('title')} — {float(goal.get('target') or 0):g} "
-                f"{goal.get('metric') or ''} ({goal.get('period')})"
+                f"{i}. {goal.get('title')} — "
+                f"{commitments.format_target(goal.get('target'), goal.get('metric'), goal.get('period'))}"
             )
             goal_id = goal.get("notion_page_id")
             if goal_id and goal.get("period") == "Daily":
@@ -1341,6 +1352,7 @@ async def _handle_setup_ai(update: Update, chat_id: int, section_id: str, text: 
         return
     lines = [f"🤖 {reply}" if reply else "🤖 Here's what I'll do:", ""]
     lines.extend(onboarding.describe_ai_actions(actions))
+    lines.extend(_relevance_warning(parsed))
     if errors:
         lines.append("")
         lines.append("⚠️ Ignored (invalid): " + "; ".join(errors))
@@ -1432,6 +1444,7 @@ async def _handle_job_create(
     ]
     for overlap in user_jobs.builtin_overlaps(data):
         lines.append(f"⚠️ {overlap}")
+    lines.extend(_relevance_warning(parsed))
     note = str(parsed.get("note") or "").strip()
     if note:
         lines.append(f"ℹ️ {note}")
@@ -1541,6 +1554,140 @@ async def on_jobs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
 
 
+_NOTES_PROMPT = (
+    "📝 Key takeaways from this block? (mistakes, formulas, insights — "
+    "saved onto this ledger entry)"
+)
+
+
+def _notes_prompt_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✔ Skip", callback_data="debrief:done"),
+    ]])
+
+
+async def on_debrief_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    action = query.data.split(":", 1)[1] if ":" in query.data else "done"
+    try:
+        state = draft_store.get_session_debrief(chat_id)
+        if action == "next" and state and state["stage"] == "doubts":
+            draft_store.advance_session_debrief(chat_id)
+            await query.edit_message_text(_NOTES_PROMPT, reply_markup=_notes_prompt_markup())
+            return
+        draft_store.clear_session_debrief(chat_id)
+        await query.edit_message_text("✅ Block wrapped up.")
+    except Exception as exc:
+        logger.exception("debrief callback failed")
+        try:
+            await query.edit_message_text(f"⚠️ Debrief failed: {exc}")
+        except Exception:
+            pass
+
+
+_DEBRIEF_SKIP_WORDS = {"no", "none", "nope", "nah", "skip", "no doubts", "nothing"}
+
+
+async def _handle_debrief_text(message, chat_id: int, state: dict, text: str) -> None:
+    if state["stage"] == "doubts":
+        if text.strip().lower() in _DEBRIEF_SKIP_WORDS:
+            draft_store.advance_session_debrief(chat_id)
+            await message.reply_text(_NOTES_PROMPT, reply_markup=_notes_prompt_markup())
+            return
+        doubt_id, url = await asyncio.to_thread(
+            logging_flow.add_session_debrief_doubt, state["ledger_page_id"], text
+        )
+        if doubt_id:
+            await message.reply_text(
+                "❓ Doubt logged & linked to this block. Another? "
+                "(or tap ✔ No doubts above)"
+            )
+        else:
+            await message.reply_text(
+                "⚠️ Couldn't save that doubt right now — it was NOT stored. "
+                "Try again or log it later with 'doubt: …'."
+            )
+        return
+    # notes stage: one message, saved onto the entry.
+    if text.strip().lower() in _DEBRIEF_SKIP_WORDS:
+        draft_store.clear_session_debrief(chat_id)
+        await message.reply_text("✅ Block wrapped up.")
+        return
+    try:
+        await asyncio.to_thread(
+            logging_flow.append_session_notes, state["ledger_page_id"], text
+        )
+        draft_store.clear_session_debrief(chat_id)
+        await message.reply_text("📝 Saved onto this session. ✅ Block wrapped up.")
+    except Exception as exc:
+        logger.exception("debrief notes failed")
+        draft_store.clear_session_debrief(chat_id)
+        await message.reply_text(f"⚠️ Couldn't save the notes: {exc}")
+
+
+async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Soak instrumentation: capture anything odd the moment it's noticed."""
+    if await _reject_if_unauthorized(update):
+        return
+    chat_id = update.effective_chat.id
+    text = _command_args(update)
+    if not text:
+        await update.effective_message.reply_text(
+            "Describe what went wrong: /bug the answer said 20 but I logged 10"
+        )
+        return
+    bug_id = draft_store.add_bug_report(chat_id, text)
+    await update.effective_message.reply_text(
+        f"🐛 Noted as #{bug_id}. See all with /bugs — thank you, this is how the bot earns trust."
+    )
+
+
+async def bugs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    chat_id = update.effective_chat.id
+    args = _command_args(update)
+    done_match = re.match(r"^done\s+#?(\d+)$", args, re.IGNORECASE)
+    if done_match:
+        ok = draft_store.close_bug_report(chat_id, int(done_match.group(1)))
+        await update.effective_message.reply_text(
+            "✅ Closed." if ok else "No open bug with that number."
+        )
+        return
+    bugs = draft_store.list_bug_reports(chat_id)
+    if not bugs:
+        await update.effective_message.reply_text(
+            "No open bug notes. Report one anytime: /bug <what happened>"
+        )
+        return
+    lines = ["🐛 Open bug notes (close with /bugs done <n>):"]
+    lines += [f"#{b['id']} [{str(b['created_at'])[:10]}] {b['text']}" for b in bugs]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+def _errors_last_24h() -> int:
+    cutoff = dt.datetime.now() - dt.timedelta(hours=24)
+    count = 0
+    try:
+        with open(LOG_FILE, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if " ERROR " not in line:
+                    continue
+                try:
+                    stamp = dt.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if stamp >= cutoff:
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -1577,6 +1724,12 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             user_jobs.set_pending_edit(chat_id, job_id, field)
             await message.reply_text(f"⚠️ {result}. Send it again, or open /jobs to cancel.")
+        return
+
+    # Block-close debrief in progress: texts are doubts, then takeaways.
+    debrief = draft_store.get_session_debrief(chat_id)
+    if debrief:
+        await _handle_debrief_text(message, chat_id, debrief, text)
         return
 
     # /setup wizard in progress: route the text to the active section.
@@ -1980,6 +2133,24 @@ async def on_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
             reply_markup=markup,
         )
+        # Block-close debrief: capture doubts + takeaways while they're fresh,
+        # linked to the entry that was just saved.
+        if (
+            payload.get("db_key") == "ledger"
+            and result.get("status") == "saved"
+            and result.get("page_id")
+        ):
+            draft_store.set_session_debrief(draft["chat_id"], str(result["page_id"]))
+            await context.bot.send_message(
+                chat_id=draft["chat_id"],
+                text=(
+                    "❓ Any doubts from this block? Send them one per message — "
+                    "I'll link each to this session."
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✔ No doubts", callback_data="debrief:next"),
+                ]]),
+            )
 
 
 SYNC_INTERVAL_SECONDS = 240  # 4 minutes — within the spec's 3-5 min range
@@ -2094,6 +2265,12 @@ async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text += "\n\nWeekly commitments:\n" + "\n".join(weekly_lines)
         except Exception:
             logger.exception("weekly commitment section failed")
+        try:
+            open_bugs = draft_store.list_bug_reports(telegram_allowed_user_id())
+            if open_bugs:
+                text += f"\n🐛 {len(open_bugs)} open bug note(s) this week — /bugs to triage."
+        except Exception:
+            logger.exception("weekly bug note failed")
         await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=text)
     except Exception:
         logger.exception("weekly report job failed")
@@ -2310,6 +2487,8 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("setup", setup_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
+    app.add_handler(CommandHandler("bug", bug_command))
+    app.add_handler(CommandHandler("bugs", bugs_command))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("goal", goal_command))
@@ -2336,6 +2515,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(on_onboarding_callback, pattern=r"^onb:"))
     app.add_handler(CallbackQueryHandler(on_jobs_callback, pattern=r"^jobs:"))
+    app.add_handler(CallbackQueryHandler(on_debrief_callback, pattern=r"^debrief:"))
     app.add_handler(CallbackQueryHandler(on_plan_callback, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_log_callback, pattern=r"^log:"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, catch_all))

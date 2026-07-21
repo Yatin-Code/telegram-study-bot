@@ -300,12 +300,43 @@ def create_goal(data: dict[str, Any], *, db_path: str | Path = DEFAULT_DB_PATH) 
     return _create("goals", props, db_path=db_path)
 
 
+def _goal_match_for_status_change(
+    query: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> dict[str, Any] | None:
+    """Title-match a goal, preferring live goals.
+
+    Cancelled/Completed goals keep their titles forever; without this
+    preference, cancelling "Daily PYQs", recreating it, and cancelling again
+    is permanently "ambiguous".
+    """
+    query_l = query.strip().lower()
+    if not query_l:
+        return None
+    table = operational_store.table_for("goals")
+    with _connect(db_path) as conn:
+        rows = [dict(r) for r in conn.execute(
+            f'SELECT * FROM "{table}" WHERE archived=0 '
+            'AND LOWER(COALESCE(title, "")) LIKE ? LIMIT 20',
+            (f"%{query_l}%",),
+        ).fetchall()]
+    live = [r for r in rows if r.get("status") not in ("Cancelled", "Completed")]
+    pool = live or rows
+    if len(pool) == 1:
+        return pool[0]
+    exact = [r for r in pool if str(r.get("title") or "").strip().lower() == query_l]
+    if len(exact) == 1:
+        return exact[0]
+    if len(pool) > 1:
+        raise DomainError(f"ambiguous goals query {query!r}")
+    return None
+
+
 def update_goal_status(
     goal: str, status: str, *, db_path: str | Path = DEFAULT_DB_PATH
 ) -> dict[str, Any]:
     if status not in notion_schema.GOAL_STATUS_OPTIONS:
         raise DomainError(f"invalid goal status: {status!r}")
-    row = _title_match("goals", goal, db_path=db_path)
+    row = _goal_match_for_status_change(goal, db_path=db_path)
     if not row:
         raise DomainError(f"no goal matches {goal!r}")
     operational_store.update(

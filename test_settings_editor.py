@@ -153,6 +153,29 @@ def test_advisor_threshold_honours_override(tmp_path):
     assert not any("accuracy" in w for w in advisor.trajectory_warnings(today="2026-07-21", db_path=db))
 
 
+def test_session_debrief_state_machine(tmp_path):
+    db = tmp_path / "debrief.db"
+    assert draft_store.get_session_debrief(9, db_path=db) is None
+    draft_store.set_session_debrief(9, "ledger-page-1", db_path=db)
+    state = draft_store.get_session_debrief(9, db_path=db)
+    assert state == {"ledger_page_id": "ledger-page-1", "stage": "doubts"}
+    # non-clearing read: the doubts loop needs it to persist
+    assert draft_store.get_session_debrief(9, db_path=db) is not None
+    draft_store.advance_session_debrief(9, db_path=db)
+    assert draft_store.get_session_debrief(9, db_path=db)["stage"] == "notes"
+    draft_store.clear_session_debrief(9, db_path=db)
+    assert draft_store.get_session_debrief(9, db_path=db) is None
+    # stale rows expire
+    draft_store.set_session_debrief(9, "ledger-page-2", db_path=db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_session_debrief SET asked_at = ?",
+            ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=20)).isoformat(),),
+        )
+        conn.commit()
+    assert draft_store.get_session_debrief(9, db_path=db) is None
+
+
 def test_pending_setting_edit_roundtrip_and_ttl(tmp_path):
     db = tmp_path / "pend.db"
     draft_store.set_pending_setting_edit(5, "WEEKLY_REPORT_TIME", db_path=db)

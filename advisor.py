@@ -303,9 +303,9 @@ def memory_prompt_block(
         )
         for goal in goals:
             entry = (
-                f"- {goal.get('title')} — target {float(goal.get('target') or 0):g} "
-                f"{goal.get('metric') or ''} per {str(goal.get('period') or '').lower()}"
-            ).rstrip()
+                f"- {goal.get('title')} — target "
+                f"{commitments.format_target(goal.get('target'), goal.get('metric'), goal.get('period'))}"
+            )
             goal_id = goal.get("notion_page_id")
             if goal_id and goal.get("period") == "Daily":
                 days = commitments.streak(goal_id, as_of=today, db_path=db_path)

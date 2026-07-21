@@ -530,7 +530,7 @@ def _render_preview(
         label = prop.get("notion_name", human_name)
         shown = value
         if prop.get("type") == "relation":
-            shown = f"→ {resolved_names.get(human_name, value)}"
+            shown = str(resolved_names.get(human_name, value))
         lines.append(f"• {label}: {shown}")
     if cross_log_doubt:
         lines.append(f"• ↳ cross-log doubt: {cross_log_doubt}")
@@ -592,6 +592,37 @@ def commit_write(
         logger.warning("Notion write failed, queuing locally: %r", exc)
         enqueue_pending(payload, db_path=db_path)
         return {"status": "queued", "detail": str(exc)}
+
+
+def add_session_debrief_doubt(
+    ledger_page_id: str, doubt_text: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> tuple[Optional[str], Optional[str]]:
+    """Block-close debrief: create a doubt linked to the just-finished block.
+
+    Reuses the cross-log machinery so the doubt inherits subject/chapter/
+    exercise rollups via the ledger relation — that's what makes
+    "list doubts from physics MLE" answerable later.
+    """
+    doubt_id, url = _cross_log_doubt(
+        ledger_page_id, doubt_text, operation_id=uuid.uuid4().hex
+    )
+    if doubt_id:
+        try:
+            sync.sync_once(db_path=db_path, db_keys=("doubts", "ledger"))
+        except Exception:
+            logger.exception("debrief doubt sync failed (doubt already saved)")
+    return doubt_id, url
+
+
+def append_session_notes(
+    ledger_page_id: str, text: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    """Block-close debrief: save key takeaways onto the ledger entry."""
+    notion.update_page(ledger_page_id, {"key_points_notes": text})
+    try:
+        sync.sync_once(db_path=db_path, db_keys=("ledger",))
+    except Exception:
+        logger.exception("debrief notes sync failed (notes already saved)")
 
 
 def _cross_log_doubt(

@@ -220,7 +220,10 @@ def render(rep: dict[str, Any]) -> str:
     if rep["commitments"]:
         lines.append("Commitments (⏸ to pause):")
         for i, c in enumerate(rep["commitments"], 1):
-            entry = f"{i}. {c['title']} — {c['target']:g} {c['metric']} ({c['period']})"
+            entry = (
+                f"{i}. {c['title']} — "
+                f"{commitments.format_target(c['target'], c['metric'], c['period'])}"
+            )
             if c["streak"] is not None:
                 entry += f" · streak {c['streak']}"
             if c["adherence"]:

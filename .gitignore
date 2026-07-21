@@ -31,3 +31,4 @@ test_session.session-journal
 
 # Local Claude Code settings (machine-specific)
 .claude/settings.local.json
+live_e2e_*.log

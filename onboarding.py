@@ -110,7 +110,7 @@ SECTIONS: list[dict[str, Any]] = [
         ),
     },
     {
-        "id": "commitments", "title": "✅ Daily commitments",
+        "id": "commitments", "title": "🔥 Daily commitments",
         "kind": "loop",
         "prompt": (
             "What will you do EVERY day? I verify these nightly against your "

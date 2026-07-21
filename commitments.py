@@ -96,6 +96,18 @@ def _connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def format_target(target: Any, metric: Any, period: Any) -> str:
+    """Human wording for a commitment target: '1 session/day', '3 sessions/week'."""
+    value = float(target or 0)
+    unit = str(metric or "").strip() or "times"
+    if value == 1 and unit.endswith("s") and not unit.endswith("ss"):
+        unit = unit[:-1]
+    period_text = {"Daily": "/day", "Weekly": "/week"}.get(
+        str(period or ""), f" per {str(period or '?').lower()}"
+    )
+    return f"{value:g} {unit}{period_text}"
+
+
 # ---------------------------------------------------------------------------
 # Deterministic ledger verification
 # ---------------------------------------------------------------------------

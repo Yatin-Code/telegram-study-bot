@@ -23,6 +23,7 @@ this script only talks to Telegram).
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sys
 import time
 from pathlib import Path
@@ -141,6 +142,11 @@ def text_of(msg) -> str:
     return (msg.text or "") if msg else ""
 
 
+def first_int(text: str) -> int:
+    m = re.findall(r"\b\d+\b", text or "")
+    return int(m[0]) if m else 0
+
+
 def main() -> int:
     global client
     client = _ensure_session()
@@ -208,29 +214,39 @@ def main() -> int:
     check("D3 /remember lists", "PYQ" in text_of(r).upper())
 
     # ---------------- E. context + REAL log to Notion + verify back ----------------
+    # Ground-truth aware: baseline counts first, then assert the exact delta.
+    r = send("how many questions did i attempt today?", timeout=150)
+    base_att = first_int(text_of(r))
+    r = send("how many questions did i get correct today?", timeout=150)
+    base_cor = first_int(text_of(r))
+    log("INFO", f"baseline today: attempted={base_att} correct={base_cor}")
     r = send("starting EB-1 physics kinematics mle", timeout=120)
     check("E1 set context + briefing", "Context set" in text_of(r))
     r = send("done, solved 10 questions 8 correct in 25 mins", timeout=120)
     check("E2 log preview", bool(r and r.buttons) and "10" in text_of(r))
-    confirmed = click(r, "Confirm", wait_new=True)
-    check("E3 log committed", "logged" in text_of(confirmed).lower()
-          or "✅" in text_of(confirmed) or "saved" in text_of(confirmed).lower())
+    confirmed = click(r, "Confirm", wait_new=True, new_timeout=60)
+    # The confirm EDITS to "Logged"; the debrief prompt arrives as a NEW message.
+    debrief = confirmed if "doubts from this block" in text_of(confirmed).lower() else wait_reply(_last_id, timeout=30)
+    check("E3 log committed + debrief prompt",
+          debrief is not None and "doubts from this block" in text_of(debrief).lower())
+
+    # ---------------- F. debrief: doubt + takeaway, then query them back ----------------
+    r = send("why does the sign flip in relative velocity E2E-test case", timeout=120)
+    check("F1 debrief doubt linked", "linked" in text_of(r).lower())
+    r = send("no", timeout=60)   # advance to notes stage
+    check("F1b notes prompt", "takeaway" in text_of(r).lower() or "Key takeaways" in text_of(r))
+    r = send("takeaway: always fix the reference frame before assigning signs", timeout=90)
+    check("F1c notes saved", "Saved onto this session" in text_of(r))
     time.sleep(5)
     r = send("/sync", timeout=120)
     r = send("how many questions did i attempt today?", timeout=150)
-    check("E4 answer from mirror", "10" in text_of(r))
+    check("E4 attempted delta = +10", first_int(text_of(r)) == base_att + 10,
+          f"got {first_int(text_of(r))}, want {base_att + 10}")
     r = send("and how many of those were correct?", timeout=150)
-    check("E5 follow-up window", "8" in text_of(r))
-
-    # ---------------- F. doubt ----------------
-    r = send("doubt: why does the sign flip in relative velocity E2E-test case", timeout=120)
-    if r and r.buttons:
-        confirmed = click(r, "Confirm", wait_new=True)
-        check("F1 doubt logged", "✅" in text_of(confirmed) or "logged" in text_of(confirmed).lower())
-    else:
-        check("F1 doubt logged", "✅" in text_of(r) or "doubt" in text_of(r).lower())
-    r = send("list doubts", timeout=150)
-    check("F2 doubt listed", "relative velocity" in text_of(r).lower())
+    check("E5 correct delta = +8 (follow-up)", first_int(text_of(r)) == base_cor + 8,
+          f"got {first_int(text_of(r))}, want {base_cor + 8}")
+    r = send("list doubts from physics mle", timeout=150)
+    check("F2 debrief doubt queryable", "relative velocity" in text_of(r).lower())
 
     # ---------------- G. /jobs lifecycle ----------------
     r = send("/jobs")

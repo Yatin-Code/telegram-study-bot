@@ -139,9 +139,15 @@ def parse_commitment(text: str) -> dict[str, Any]:
   "target": number|null,
   "period": "Daily|Weekly"|null,
   "subject": "Chem|Maths|Physics"|null,
+  "study_related": boolean,
+  "relevance_note": string|null,
   "needs_clarification": boolean,
   "clarification_question": string|null
 }
+study_related: does this genuinely relate to JEE prep / studying? Things like
+testing the bot, chores, entertainment, unrelated personal matters -> false,
+with a one-line relevance_note. Study habits, subjects, revision, exams,
+focus preferences -> true.
 A commitment is a measurable recurring promise. "PYQs every day" -> kind
 commitment, title "Daily PYQs", goal_type Coverage, metric "sessions",
 target 1, period Daily. "2 hours of maths daily" -> goal_type Duration,
@@ -162,6 +168,7 @@ is kind bot_instruction — set title to the statement, everything else null.
         kind = "commitment" if data.get("target") is not None else "preference"
     data["kind"] = kind
     data["source_text"] = text
+    data["study_related"] = bool(data.get("study_related", True))
     if kind == "bot_instruction":
         data["needs_clarification"] = False
         if not data.get("title"):
@@ -228,7 +235,9 @@ def parse_setup_ai(section_title: str, section_prompt: str, text: str) -> dict[s
     {{"type": "skip_section"}}
   ],
   "needs_clarification": boolean,
-  "clarification_question": string|null
+  "clarification_question": string|null,
+  "study_related": boolean,       // does the request relate to JEE prep/studying?
+  "relevance_note": string|null   // one line when study_related is false
 }}
 
 Context: the user is inside the "{section_title}" step of a study-bot setup
@@ -253,6 +262,7 @@ and an empty actions list."""
         data["actions"] = []
     data.setdefault("reply", "")
     data.setdefault("needs_clarification", False)
+    data["study_related"] = bool(data.get("study_related", True))
     return data
 
 
@@ -273,7 +283,7 @@ def parse_job(text: str) -> dict[str, Any]:
         f"nightly commitment check at {settings.commitment_check_time()}; "
         f"planning check daily at {settings.planning_reminder_time()}"
     )
-    return _call("scheduled job", text, f"""
+    data = _call("scheduled job", text, f"""
 {{
   "title": string|null,               // short label, e.g. "Weekday CY report"
   "schedule_kind": "daily|weekdays|weekly|once",
@@ -283,6 +293,8 @@ def parse_job(text: str) -> dict[str, Any]:
   "action_kind": "ask|message",
   "action_text": string,
   "note": string|null,
+  "study_related": boolean,       // does this job relate to JEE prep/studying?
+  "relevance_note": string|null,  // one line when study_related is false
   "needs_clarification": boolean,
   "clarification_question": string|null
 }}
@@ -295,6 +307,8 @@ reminder. "every weekday" -> schedule_kind weekdays. If the user states NO
 time, set needs_clarification=true asking what time.
 These bot schedules already exist: {builtins}. If the request overlaps or
 duplicates one of them, still fill the job but say so plainly in "note".""")
+    data["study_related"] = bool(data.get("study_related", True))
+    return data
 
 
 def parse_exam(text: str) -> dict[str, Any]:

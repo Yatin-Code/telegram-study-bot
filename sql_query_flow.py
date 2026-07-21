@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -184,13 +185,37 @@ def _build_system_prompt(chat_id: int | None = None) -> str:
 
 
 def _call_llm(messages: list[dict[str, str]], *, model: str | None = None) -> str:
-    """Call the configured LLM with a full message history and return text."""
-    model = model or settings.llm_model()
+    """Call the LLM with retry + fallback models.
+
+    Gateways throw transient 502/429s; a single-shot call turns every blip
+    into a user-facing ⚠️. Each candidate model gets one retry on transient
+    errors, then the next fallback model is tried.
+    """
     provider = settings.llm_provider()
+    candidates = list(dict.fromkeys(
+        [model or settings.llm_model(), *settings.llm_fallback_models()]
+    ))
+    last_error: Exception | None = None
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-        if provider == "anthropic":
-            return _anthropic_chat(client, model, messages)
-        return _openai_chat(client, model, messages)
+        for candidate in candidates:
+            for attempt in (1, 2):
+                try:
+                    if provider == "anthropic":
+                        return _anthropic_chat(client, candidate, messages)
+                    return _openai_chat(client, candidate, messages)
+                except httpx.HTTPStatusError as exc:
+                    last_error = exc
+                    status = exc.response.status_code
+                    if status < 500 and status != 429:
+                        break  # real request problem — try the next model, no retry
+                    logger.warning("LLM %s attempt %d failed (%s), retrying/falling back",
+                                   candidate, attempt, status)
+                    time.sleep(1.5 * attempt)
+                except (httpx.TransportError, httpx.TimeoutException) as exc:
+                    last_error = exc
+                    logger.warning("LLM %s attempt %d network error: %r", candidate, attempt, exc)
+                    time.sleep(1.5 * attempt)
+    raise last_error if last_error else RuntimeError("no LLM candidates configured")
 
 
 def _openai_chat(

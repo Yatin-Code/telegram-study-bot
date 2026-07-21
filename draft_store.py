@@ -416,6 +416,80 @@ def clear_qa_history(chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH) -> 
 
 
 # ---------------------------------------------------------------------------
+# Block-close debrief (doubts + key points right after a confirmed ledger log)
+# ---------------------------------------------------------------------------
+# One row per chat: which just-logged ledger page we're debriefing and which
+# stage we're at ("doubts" loop, then a single "notes" answer).
+
+DEBRIEF_TABLE = "pending_session_debrief"
+DEBRIEF_TTL_MINUTES = 10
+
+
+def _init_debrief(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {DEBRIEF_TABLE} (
+            chat_id INTEGER PRIMARY KEY,
+            ledger_page_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            asked_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def set_session_debrief(
+    chat_id: int, ledger_page_id: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    with _connect(db_path) as conn:
+        _init_debrief(conn)
+        conn.execute(
+            f"INSERT OR REPLACE INTO {DEBRIEF_TABLE} "
+            "(chat_id, ledger_page_id, stage, asked_at) VALUES (?, ?, 'doubts', ?)",
+            (chat_id, ledger_page_id, _utc_now().isoformat()),
+        )
+        conn.commit()
+
+
+def get_session_debrief(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> Optional[dict[str, str]]:
+    """Current debrief state (NOT cleared on read — the doubts stage loops)."""
+    with _connect(db_path) as conn:
+        _init_debrief(conn)
+        row = conn.execute(
+            f"SELECT * FROM {DEBRIEF_TABLE} WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        asked = dt.datetime.fromisoformat(row["asked_at"])
+        if (_utc_now() - asked).total_seconds() > DEBRIEF_TTL_MINUTES * 60:
+            conn.execute(f"DELETE FROM {DEBRIEF_TABLE} WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+            return None
+    return {"ledger_page_id": row["ledger_page_id"], "stage": row["stage"]}
+
+
+def advance_session_debrief(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    """Move from the doubts loop to the single notes question (refreshes TTL)."""
+    with _connect(db_path) as conn:
+        _init_debrief(conn)
+        conn.execute(
+            f"UPDATE {DEBRIEF_TABLE} SET stage = 'notes', asked_at = ? WHERE chat_id = ?",
+            (_utc_now().isoformat(), chat_id),
+        )
+        conn.commit()
+
+
+def clear_session_debrief(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    with _connect(db_path) as conn:
+        _init_debrief(conn)
+        conn.execute(f"DELETE FROM {DEBRIEF_TABLE} WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+# ---------------------------------------------------------------------------
 # Pending /settings edit (which setting a chat is currently typing a value for)
 # ---------------------------------------------------------------------------
 # Mirrors the pending-clarification pattern: one row per chat, short TTL, the
@@ -479,3 +553,62 @@ def clear_pending_setting_edit(
             f"DELETE FROM {SETTING_EDIT_TABLE} WHERE chat_id = ?", (chat_id,)
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Bug reports (7-day soak instrumentation: /bug <text>, /bugs)
+# ---------------------------------------------------------------------------
+
+BUGS_TABLE = "bug_reports"
+
+
+def _init_bugs(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {BUGS_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open'
+        )
+    """)
+    conn.commit()
+
+
+def add_bug_report(
+    chat_id: int, text: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> int:
+    with _connect(db_path) as conn:
+        _init_bugs(conn)
+        cur = conn.execute(
+            f"INSERT INTO {BUGS_TABLE} (chat_id, text, created_at) VALUES (?, ?, ?)",
+            (chat_id, text.strip(), _utc_now().isoformat()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_bug_reports(
+    chat_id: int, *, open_only: bool = True, db_path: str | Path = DEFAULT_DB_PATH
+) -> list[dict[str, Any]]:
+    with _connect(db_path) as conn:
+        _init_bugs(conn)
+        where = "chat_id = ?" + (" AND status = 'open'" if open_only else "")
+        rows = conn.execute(
+            f"SELECT * FROM {BUGS_TABLE} WHERE {where} ORDER BY id", (chat_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def close_bug_report(
+    chat_id: int, bug_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> bool:
+    with _connect(db_path) as conn:
+        _init_bugs(conn)
+        cur = conn.execute(
+            f"UPDATE {BUGS_TABLE} SET status = 'closed' "
+            "WHERE id = ? AND chat_id = ? AND status = 'open'",
+            (bug_id, chat_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1

@@ -195,6 +195,17 @@ def test_verify_weekly_goal(db):
     assert commitments.verify_weekly_goal(unverifiable, "2026-07-15", db_path=db)["met"] is None
 
 
+def test_cancel_recreate_cancel_not_ambiguous(db):
+    """Cancelled goals must not poison title matching forever (E2E run-3 bug)."""
+    make_goal(db)
+    sd.update_goal_status("Daily PYQs", "Cancelled", db_path=db)
+    make_goal(db)  # recreate same title
+    result = sd.update_goal_status("Daily PYQs", "Cancelled", db_path=db)
+    assert result["status"] == "Cancelled"
+    rows = sd._rows("goals", "archived=0 AND title='Daily PYQs'", db_path=db)
+    assert all(r["status"] == "Cancelled" for r in rows) and len(rows) == 2
+
+
 def test_prefs_roundtrip(db):
     pref_id = commitments.add_pref(7, "prefers maths in the morning", db_path=db)
     prefs = commitments.active_prefs(7, db_path=db)
