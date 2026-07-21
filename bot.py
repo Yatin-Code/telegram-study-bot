@@ -39,6 +39,7 @@ import advisor
 import memory_map
 import onboarding
 import user_jobs
+import sql_query_flow
 import draft_store
 import logging_flow
 import operational_store
@@ -1714,7 +1715,6 @@ async def _handle_question(
     if chat_id is None:
         chat_id = update.effective_chat.id
     try:
-        import sql_query_flow
         from config import settings as _cfg
         try:
             pairs = _cfg.query_history_pairs()
