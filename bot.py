@@ -74,6 +74,7 @@ BOT_COMMANDS = [
     BotCommand("newsession", "Clear current study context"),
     BotCommand("settings", "View & edit bot settings"),
     BotCommand("memory", "See & edit what the bot remembers"),
+    BotCommand("inspect", "Inspect SQLite/Notion/context state"),
     BotCommand("jobs", "Create & manage scheduled jobs"),
     BotCommand("bug", "Note something that went wrong"),
     BotCommand("health", "Show bot & mirror health status"),
@@ -563,6 +564,289 @@ async def newsession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session_context.clear_context(chat_id)
     draft_store.clear_qa_history(chat_id)
     await update.effective_message.reply_text("Session context cleared.")
+
+
+def _inspect_home_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Main inspection menu."""
+    text = (
+        "🔍 *Data Inspector*\n\n"
+        "See exactly what the bot knows. Use this to verify:\n"
+        "• Notion sync is working\n"
+        "• Reset actually cleared data\n"
+        "• Bot has access to your records\n\n"
+        "Choose a data source:"
+    )
+    buttons = [
+        [InlineKeyboardButton("📊 SQLite Mirror", callback_data="inspect:menu:sqlite")],
+        [InlineKeyboardButton("☁️ Notion Sync Status", callback_data="inspect:menu:notion")],
+        [InlineKeyboardButton("🧠 In-Context Memory", callback_data="inspect:menu:context")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _inspect_sqlite_menu() -> tuple[str, InlineKeyboardMarkup]:
+    """SQLite table selection menu."""
+    import sqlite3
+    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        counts = {}
+        for table in ("ledger", "doubts", "revision", "daily_plan", "goals", "work_items", "exams", "timetable"):
+            try:
+                row = conn.execute(f'SELECT COUNT(*) AS n FROM "{table}" WHERE archived=0').fetchone()
+                counts[table] = row["n"] if row else 0
+            except:
+                counts[table] = 0
+        conn.close()
+        
+        text = (
+            "📊 *SQLite Mirror*\n\n"
+            f"• Ledger: {counts['ledger']} active sessions\n"
+            f"• Doubts: {counts['doubts']} active doubts\n"
+            f"• Revision: {counts['revision']} active items\n"
+            f"• Daily Plan: {counts['daily_plan']} active tasks\n"
+            f"• Goals: {counts['goals']} active goals\n"
+            f"• Work Items: {counts['work_items']} backlog items\n"
+            f"• Exams: {counts['exams']} scheduled\n"
+            f"• Timetable: {counts['timetable']} classes\n\n"
+            "Tap a table to see recent records:"
+        )
+    except Exception as e:
+        text = f"⚠️ SQLite read failed: {e}"
+        counts = {}
+    
+    buttons = []
+    if counts:
+        buttons.append([
+            InlineKeyboardButton(f"Ledger ({counts.get('ledger', 0)})", callback_data="inspect:table:ledger"),
+            InlineKeyboardButton(f"Doubts ({counts.get('doubts', 0)})", callback_data="inspect:table:doubts"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(f"Revision ({counts.get('revision', 0)})", callback_data="inspect:table:revision"),
+            InlineKeyboardButton(f"Goals ({counts.get('goals', 0)})", callback_data="inspect:table:goals"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(f"Exams ({counts.get('exams', 0)})", callback_data="inspect:table:exams"),
+            InlineKeyboardButton(f"Plan ({counts.get('daily_plan', 0)})", callback_data="inspect:table:daily_plan"),
+        ])
+    buttons.append([InlineKeyboardButton("↩ Back", callback_data="inspect:home")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboardMarkup]:
+    """Show recent records from a table."""
+    import sqlite3
+    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
+    
+    # Map table to title column and display columns
+    config = {
+        "ledger": ("task", ["date", "task", "questions_attempted", "questions_correct", "cognitive_yield"]),
+        "doubts": ("core_concept", ["date_logged", "core_concept", "status"]),
+        "revision": ("chapter_module", ["next_execution_date", "chapter_module", "subject"]),
+        "daily_plan": ("title", ["plan_date", "sequence", "title", "status"]),
+        "goals": ("title", ["title", "target", "metric", "period", "status"]),
+        "work_items": ("title", ["title", "kind", "priority", "status"]),
+        "exams": ("exam_name", ["exam_date", "exam_name", "maximum_marks", "target_marks"]),
+        "timetable": ("title", ["weekday", "start_time", "end_time", "title", "subject"]),
+    }
+    
+    if table not in config:
+        return f"⚠️ Unknown table: {table}", InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩ Back", callback_data="inspect:menu:sqlite")
+        ]])
+    
+    title_col, display_cols = config[table]
+    
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE archived=0 ORDER BY last_edited_time DESC LIMIT ?',
+            (limit,)
+        ).fetchall()
+        conn.close()
+        
+        if not rows:
+            text = f"📊 *{table.title()}*\n\nNo active records found."
+        else:
+            lines = [f"📊 *{table.title()}* (showing {len(rows)} most recent)\n"]
+            for i, row in enumerate(rows, 1):
+                lines.append(f"\n*{i}.* {row[title_col] or '(untitled)'}")
+                for col in display_cols:
+                    val = row[col] if col in row.keys() else None
+                    if val is not None and val != "":
+                        # Truncate long values
+                        val_str = str(val)
+                        if len(val_str) > 100:
+                            val_str = val_str[:97] + "..."
+                        lines.append(f"  • {col}: {val_str}")
+            text = "\n".join(lines)
+    except Exception as e:
+        text = f"⚠️ Failed to read {table}: {e}"
+    
+    buttons = [
+        [InlineKeyboardButton("↩ Back to Tables", callback_data="inspect:menu:sqlite")],
+        [InlineKeyboardButton("🏠 Home", callback_data="inspect:home")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _inspect_notion_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Notion sync status view."""
+    import sqlite3
+    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
+    
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        sync_rows = conn.execute(
+            "SELECT * FROM sync_meta ORDER BY last_completed_at DESC"
+        ).fetchall()
+        conn.close()
+        
+        if not sync_rows:
+            text = "☁️ *Notion Sync Status*\n\nNo sync history found."
+        else:
+            lines = ["☁️ *Notion Sync Status*\n"]
+            for row in sync_rows:
+                db_key = row["db_key"]
+                completed = row["last_completed_at"] or "never"
+                count = row["last_row_count"] or 0
+                error = row["last_error"]
+                
+                status = "✅" if not error else "⚠️"
+                lines.append(f"\n{status} *{db_key}*")
+                lines.append(f"  • Last sync: {completed}")
+                lines.append(f"  • Records synced: {count}")
+                if error:
+                    lines.append(f"  • Error: {error[:100]}")
+            text = "\n".join(lines)
+    except Exception as e:
+        text = f"⚠️ Failed to read sync status: {e}"
+    
+    buttons = [
+        [InlineKeyboardButton("🔄 Force Sync Now", callback_data="inspect:action:sync")],
+        [InlineKeyboardButton("↩ Back", callback_data="inspect:home")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _inspect_context_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """In-context memory view."""
+    ctx = session_context.get_context(chat_id)
+    elapsed = session_context.elapsed_minutes(chat_id)
+    history = draft_store.recent_qa(chat_id, limit_pairs=3)
+    
+    lines = ["🧠 *In-Context Memory*\n"]
+    
+    # Session context
+    lines.append("*Current Session:*")
+    if ctx and any(ctx.values()):
+        for key in session_context.CONTEXT_KEYS:
+            if ctx.get(key):
+                lines.append(f"  • {key}: {ctx[key]}")
+        if elapsed is not None:
+            lines.append(f"  • elapsed: {round(elapsed)} min")
+    else:
+        lines.append("  (no active session)")
+    
+    # Recent Q&A history
+    lines.append("\n*Recent Q&A History:*")
+    if history:
+        for i, turn in enumerate(history, 1):
+            q = turn["question"][:60] + "..." if len(turn["question"]) > 60 else turn["question"]
+            lines.append(f"  {i}. Q: {q}")
+    else:
+        lines.append("  (no recent queries)")
+    
+    # Pending drafts
+    try:
+        import sqlite3
+        db = Path(__file__).resolve().parent / "sqlite_mirror.db"
+        conn = sqlite3.connect(str(db))
+        draft_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM drafts WHERE chat_id = ?", (chat_id,)
+        ).fetchone()[0]
+        conn.close()
+        lines.append(f"\n*Pending Drafts:* {draft_count}")
+    except:
+        pass
+    
+    text = "\n".join(lines)
+    buttons = [
+        [InlineKeyboardButton("🗑 Clear Session", callback_data="inspect:action:clearsession")],
+        [InlineKeyboardButton("↩ Back", callback_data="inspect:home")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def inspect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main /inspect command handler."""
+    if await _reject_if_unauthorized(update):
+        return
+    text, markup = _inspect_home_view()
+    await update.effective_message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+
+async def on_inspect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inspect inline keyboard navigation."""
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        return
+    
+    chat_id = update.effective_chat.id
+    parts = query.data.split(":", 3)
+    action = parts[1] if len(parts) > 1 else "home"
+    param = parts[2] if len(parts) > 2 else None
+    
+    try:
+        if action == "home":
+            text, markup = _inspect_home_view()
+        elif action == "menu":
+            if param == "sqlite":
+                text, markup = _inspect_sqlite_menu()
+            elif param == "notion":
+                text, markup = _inspect_notion_view()
+            elif param == "context":
+                text, markup = _inspect_context_view(chat_id)
+            else:
+                return
+        elif action == "table" and param:
+            text, markup = _inspect_table_view(param)
+        elif action == "action":
+            if param == "sync":
+                await query.edit_message_text("🔄 Syncing from Notion...")
+                try:
+                    counts = await asyncio.to_thread(sync.sync_once)
+                    total = sum(counts.values())
+                    detail = ", ".join(f"{k}={v}" for k, v in counts.items())
+                    text, markup = _inspect_notion_view()
+                    text = f"✅ Synced {total} records ({detail})\n\n" + text
+                except Exception as e:
+                    text = f"⚠️ Sync failed: {e}"
+                    _, markup = _inspect_notion_view()
+            elif param == "clearsession":
+                session_context.clear_context(chat_id)
+                draft_store.clear_qa_history(chat_id)
+                text, markup = _inspect_context_view(chat_id)
+                text = "✅ Session cleared.\n\n" + text
+            else:
+                return
+        else:
+            return
+        
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass  # "message is not modified"
+    except Exception as exc:
+        logger.exception("inspect callback failed")
+        try:
+            await query.edit_message_text(f"⚠️ Inspect action failed: {exc}")
+        except Exception:
+            pass
 
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3016,6 +3300,7 @@ def main() -> None:
     app.add_handler(CommandHandler("newsession", newsession))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("inspect", inspect_command))
     app.add_handler(CommandHandler("setup", setup_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("bug", bug_command))
@@ -3048,6 +3333,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=r"^reset:"))
     app.add_handler(CallbackQueryHandler(on_memory_callback, pattern=r"^memory:"))
     app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^settings:"))
+    app.add_handler(CallbackQueryHandler(on_inspect_callback, pattern=r"^inspect:"))
     app.add_handler(CallbackQueryHandler(on_onboarding_callback, pattern=r"^onb:"))
     app.add_handler(CallbackQueryHandler(on_jobs_callback, pattern=r"^jobs:"))
     app.add_handler(CallbackQueryHandler(on_debrief_callback, pattern=r"^debrief:"))
