@@ -38,3 +38,25 @@ test_session.session-journal
 # Local Claude Code settings (machine-specific)
 .claude/settings.local.json
 live_e2e_*.log
+
+# Live test files (require Telethon credentials, break CI)
+test_live_e2e.py
+test_live_telegram.py
+test_handlers_live.py
+test_jobs_live.py
+test_live_features.py
+test_setup_ai_live.py
+
+# Unnecessary files
+.botdiff.txt
+*.webm
+*.tar.gz
+model_probe.py
+probe.js
+gemini_models.json
+groq_models.json
+or_models.json
+install.sh.[0-9]
+fedora.sh*
+fix-psutil.sh
+telegram-study-bot-gap-fixes.pdf
