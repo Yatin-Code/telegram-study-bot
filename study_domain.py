@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import re
 import sqlite3
 import uuid
@@ -95,6 +96,8 @@ def _require_nonnegative(name: str, value: Any, *, integer: bool = False) -> int
         number = float(value)
     except (TypeError, ValueError) as exc:
         raise DomainError(f"{name} must be numeric") from exc
+    if not math.isfinite(number):
+        raise DomainError(f"{name} must be finite")
     if number < 0:
         raise DomainError(f"{name} cannot be negative")
     if integer and not number.is_integer():
@@ -111,7 +114,31 @@ def _require_number(name: str, value: Any) -> int | float | None:
         number = float(value)
     except (TypeError, ValueError) as exc:
         raise DomainError(f"{name} must be numeric") from exc
+    if not math.isfinite(number):
+        raise DomainError(f"{name} must be finite")
     return int(number) if number.is_integer() else number
+
+
+def _require_priority(value: Any) -> int:
+    priority = _require_nonnegative("priority", value, integer=True)
+    if priority is None or not 1 <= priority <= 100:
+        raise DomainError("priority must be between 1 and 100")
+    return int(priority)
+
+
+def _require_bool(name: str, value: Any, *, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("yes", "true", "on", "1", "allowed", "doubts"):
+        return True
+    if text in ("no", "false", "off", "0", "not allowed"):
+        return False
+    raise DomainError(f"{name} must be yes or no")
 
 
 def _iso_date(value: Any, *, required: bool = False) -> str | None:
@@ -119,14 +146,11 @@ def _iso_date(value: Any, *, required: bool = False) -> str | None:
         if required:
             raise DomainError("date is required")
         return None
-    text = str(value)
+    text = str(value).strip()
     try:
         dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
-        try:
-            dt.date.fromisoformat(text[:10])
-        except ValueError:
-            raise DomainError(f"invalid ISO date: {value!r}") from exc
+        raise DomainError(f"invalid ISO date: {value!r}") from exc
     return text
 
 
@@ -179,7 +203,7 @@ def create_work_item(props: dict[str, Any], *, db_path: str | Path = DEFAULT_DB_
     props.setdefault("interruptible", True)
     props["kind"] = _require_enum("kind", props.get("kind"), notion_schema.WORK_KIND_OPTIONS, default="Other")
     props["status"] = _require_enum("status", props.get("status"), notion_schema.WORK_STATUS_OPTIONS, default="Inbox")
-    props["priority"] = _require_nonnegative("priority", props["priority"], integer=True)
+    props["priority"] = _require_priority(props["priority"])
     for key in ("estimated_min", "expected_cy", "remaining_units", "total_units"):
         if key in props:
             props[key] = _require_nonnegative(key, props[key])
@@ -227,6 +251,10 @@ def create_timetable_entry(
     title = str(data.get("title") or "").strip()
     if not title:
         title = f"{weekday} {start} {kind}"
+    questions_allowed = _require_bool(
+        "questions_allowed", data.get("questions_allowed"),
+        default=(kind == "Doubt Window"),
+    )
     return _create("timetable", {
         "title": title,
         "weekday": weekday,
@@ -235,6 +263,7 @@ def create_timetable_entry(
         "subject": subject,
         "teacher": data.get("teacher"),
         "kind": kind,
+        "questions_allowed": questions_allowed,
         "location": data.get("location"),
         "effective_from": _iso_date(data.get("effective_from")),
         "effective_to": _iso_date(data.get("effective_to")),
@@ -251,6 +280,18 @@ def set_timetable_active(
         raise DomainError(f"no timetable entry matches {entry!r}")
     return operational_store.update(
         "timetable", row["notion_page_id"], {"active": bool(active)},
+        db_path=db_path,
+    )
+
+
+def set_timetable_questions_allowed(
+    entry: str, allowed: bool, *, db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    row = _title_match("timetable", entry, db_path=db_path)
+    if not row:
+        raise DomainError(f"no timetable entry matches {entry!r}")
+    return operational_store.update(
+        "timetable", row["notion_page_id"], {"questions_allowed": bool(allowed)},
         db_path=db_path,
     )
 
@@ -288,7 +329,7 @@ def create_goal(data: dict[str, Any], *, db_path: str | Path = DEFAULT_DB_PATH) 
         "period": period,
         "subject": data.get("subject"),
         "deadline": _iso_date(data.get("deadline")),
-        "priority": _require_nonnegative("priority", data.get("priority") or 50, integer=True),
+        "priority": _require_priority(50 if data.get("priority") is None else data.get("priority")),
         "minimum": minimum,
         "hard_constraint": bool(data.get("hard_constraint", False)),
         "source_text": data.get("source_text"),
@@ -414,6 +455,10 @@ def record_exam_summary(exam: str, data: dict[str, Any], *, db_path: str | Path 
     attempted = values.get("attempted")
     correct = values.get("correct")
     incorrect = values.get("incorrect")
+    if attempted is not None and correct is not None and correct > attempted:
+        raise DomainError("correct cannot exceed attempted")
+    if attempted is not None and incorrect is not None and incorrect > attempted:
+        raise DomainError("incorrect cannot exceed attempted")
     if attempted is not None and correct is not None and incorrect is not None:
         if correct + incorrect > attempted:
             raise DomainError("correct + incorrect cannot exceed attempted")
@@ -499,7 +544,7 @@ def create_plan_item(props: dict[str, Any], *, db_path: str | Path = DEFAULT_DB_
         "expected_cy": _require_nonnegative("expected_cy", props.get("expected_cy")),
         "estimated_min": _require_nonnegative("estimated_min", props.get("estimated_min")),
         "status": props.get("status") or "Planned",
-        "priority": _require_nonnegative("priority", props.get("priority") or 50, integer=True),
+        "priority": _require_priority(50 if props.get("priority") is None else props.get("priority")),
         "interruptible": bool(props.get("interruptible", True)),
         "exit_condition": props.get("exit_condition"),
         "planner_note": planner_note,
@@ -615,19 +660,46 @@ def record_doubt_attempt(
 
 
 def eligible_doubts(*, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
-    result = []
+    return [row for row in doubt_queue(db_path=db_path) if row["readiness"] == "ready"]
+
+
+def doubt_queue(*, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    """All open doubts with evidence-derived readiness, including legacy rows."""
+    result: list[dict[str, Any]] = []
     for doubt in _rows(
         "doubts",
         "archived=0 AND LOWER(COALESCE(status,'')) NOT IN ('resolved','dismissed')",
         db_path=db_path,
     ):
-        valid_count = sum(
-            1 for attempt in _attempt_rows(doubt["notion_page_id"], db_path=db_path)
+        attempts = [
+            attempt for attempt in _attempt_rows(doubt["notion_page_id"], db_path=db_path)
             if attempt.get("valid")
-        )
-        if valid_count >= 2:
-            result.append({**doubt, "valid_attempts": valid_count, "teacher_ready": 1})
-    return result
+        ]
+        valid_count = len(attempts)
+        def _duration(row: dict[str, Any]) -> float:
+            try:
+                value = float(row.get("duration_min") or 0)
+                return value if math.isfinite(value) else 0
+            except (TypeError, ValueError):
+                return 0
+
+        serious = any(_duration(attempt) >= 10 for attempt in attempts)
+        readiness = "ready" if valid_count >= 2 else ("attempting" if valid_count else "new")
+        status = str(doubt.get("status") or "").strip()
+        workflow = str(doubt.get("workflow_state") or "").strip()
+        result.append({
+            **doubt,
+            "valid_attempts": valid_count,
+            "teacher_ready": int(valid_count >= 2),
+            "serious_attempt": serious,
+            "readiness": readiness,
+            "metadata_incomplete": not bool(status and workflow),
+        })
+    order = {"ready": 0, "expedited": 1, "attempting": 2, "new": 3}
+    return sorted(result, key=lambda row: (
+        order.get(str(row.get("readiness")), 9),
+        str(row.get("subject") or ""), str(row.get("core_concept") or ""),
+    ))
 
 
 def dismiss_doubt(query: str, reason: str, *, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
@@ -650,6 +722,25 @@ def resolve_doubt(
     row = _title_match("doubts", query, db_path=db_path)
     if not row:
         raise DomainError(f"no doubt matches {query!r}")
+    return resolve_doubt_id(
+        str(row["notion_page_id"]), resolution, teacher_asked=teacher_asked,
+        db_path=db_path,
+    )
+
+
+def resolve_doubt_id(
+    doubt_id: str, resolution: str, *, teacher_asked: bool = False,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    """Resolve one exact doubt ID after recording real resolution evidence."""
+    if not resolution.strip():
+        raise DomainError("resolution evidence is required")
+    row = _row(
+        "doubts", "notion_page_id=? AND archived=0", (str(doubt_id),),
+        db_path=db_path,
+    )
+    if not row:
+        raise DomainError("that doubt no longer exists")
     valid_attempts = sum(
         1 for attempt in _attempt_rows(row["notion_page_id"], db_path=db_path)
         if attempt.get("valid")
@@ -698,9 +789,11 @@ def upcoming_teacher_windows(*, now: dt.datetime | None = None, days: int = 7, d
     windows: list[dict[str, Any]] = []
     for row in _rows(
         "timetable",
-        "archived=0 AND active=1 AND kind='Doubt Window'",
+        "archived=0 AND active=1",
         db_path=db_path,
     ):
+        if row.get("kind") != "Doubt Window" and not row.get("questions_allowed"):
+            continue
         try:
             weekday = notion_schema.WEEKDAY_OPTIONS.index(row.get("weekday"))
             hour, minute = _parse_hhmm(row.get("start_time"))

@@ -31,6 +31,7 @@ import datetime as dt
 import difflib
 import json
 import logging
+import math
 import re
 import sqlite3
 import uuid
@@ -352,7 +353,15 @@ def build_write_plan(
 
         elif t == "number":
             try:
+                if isinstance(value, bool):
+                    raise ValueError("boolean is not a number")
                 num = float(value)
+                if not math.isfinite(num):
+                    plan.needs_clarification = True
+                    plan.clarification_question = (
+                        f"{prop['notion_name']} must be a finite number. What is the correct value?"
+                    )
+                    return plan
                 props[human_name] = int(num) if num.is_integer() else num
             except (TypeError, ValueError):
                 plan.warnings.append(f"dropped non-numeric {human_name}={value!r}")
@@ -370,6 +379,17 @@ def build_write_plan(
         attempted = props.get("questions_attempted")
         correct = props.get("questions_correct")
         actual_time = props.get("actual_time_min")
+        fractional = next(
+            (name for name, value in (
+                ("Questions Attempted", attempted),
+                ("Questions Correct", correct),
+            ) if value is not None and not float(value).is_integer()),
+            None,
+        )
+        if fractional:
+            plan.needs_clarification = True
+            plan.clarification_question = f"{fractional} must be a whole number. What is the correct count?"
+            return plan
         invalid = next(
             (name for name, value in (
                 ("Questions Attempted", attempted),

@@ -61,9 +61,11 @@ def test_morning_nudge_kept_and_missed(db):
         conn.commit()
     nudge = advisor.morning_nudge("2026-07-15", db_path=db)
     assert nudge is not None
-    assert "✅ Daily PYQs — kept (1-day streak)" in nudge
-    assert "❌ Daily Physics revision — missed (0/1 done). 1-day streak broken." in nudge
-    assert "📊 Daily Physics revision: 1/2 day(s) kept (50%)" in nudge
+    assert "🟢" not in nudge and "🔴 Morning accountability" in nudge
+    assert "✅ Daily PYQs — kept · 1/1 · 1-day streak" in nudge
+    assert "❌ Daily Physics revision — missed · 0/1 logged · 1-day streak ended" in nudge
+    assert "Daily Physics revision — 1/2 verified days kept (50%)" in nudge
+    assert "Next\n→ Recover Daily Physics revision today" in nudge
 
 
 def test_morning_nudge_none_without_daily_goals(db):

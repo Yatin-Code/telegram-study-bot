@@ -33,6 +33,15 @@ import httpx
 from config import notion_schema
 from config import settings
 
+try:
+    from llm.errors import AllRoutesExhausted, RouterUnavailable
+except Exception:  # pragma: no cover - llm package absent/broken
+    class RouterUnavailable(Exception):  # type: ignore
+        """Fallback so router delegation always has an exception to catch."""
+
+    class AllRoutesExhausted(Exception):  # type: ignore
+        """Fallback mirror of llm.errors.AllRoutesExhausted."""
+
 # pydantic v2 is the canonical validator (spec Phase 5.2). We only take the
 # pydantic path when v2 is present, because the Intent API below (model_validate
 # / model_dump / model_dump_json) is v2-only. On pydantic v1 or when pydantic is
@@ -450,6 +459,28 @@ def _anthropic_call(
 
 
 def _call_model(model: str, system_prompt: str, user_message: str) -> str:
+    """Route a single-model call through the router, or the legacy gateway.
+
+    Kept module-level (domain_parser imports it; tests patch it). The router
+    treats ``model`` as a preferred pinned model, not a lock.
+    """
+    try:
+        from llm import router
+        resp = router.complete(router.LLMRequest(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            purpose="intent",
+            max_output_tokens=1024,
+            pinned_model=model,
+        ))
+        return resp.text
+    except RouterUnavailable:
+        return _legacy_call_model(model, system_prompt, user_message)
+
+
+def _legacy_call_model(model: str, system_prompt: str, user_message: str) -> str:
     provider = settings.llm_provider()
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
         if provider == "anthropic":
@@ -468,12 +499,39 @@ def parse_message(
 ) -> Intent:
     """Parse a raw Telegram message into a validated Intent.
 
-    Tries the primary model (LLM_MODEL); on any error (HTTP failure, missing
-    JSON, or schema-invalid JSON) retries once with LLM_FALLBACK_MODEL if set.
-    Raises IntentParseError if all attempts fail.
+    Prefers the multi-provider router: one call with a validator that turns the
+    raw text into an Intent, so any HTTP failure, missing JSON, or schema-invalid
+    output on one provider transparently advances to the next. Falls back to the
+    legacy single-gateway model loop when the router is unavailable. Raises
+    IntentParseError if every route (and the legacy tail) fails.
     """
     system_prompt = _build_system_prompt(session_context)
 
+    try:
+        from llm import router
+        resp = router.complete(router.LLMRequest(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            purpose="intent",
+            max_output_tokens=1024,
+            validator=lambda text: _validate_intent(_extract_json(text)),
+        ))
+        intent = resp.value
+        logger.info("intent parsed via %s: action=%s db=%s",
+                    resp.route_id, intent.action, intent.database)
+        return intent
+    except RouterUnavailable:
+        return _legacy_parse_message(user_message, system_prompt)
+    except AllRoutesExhausted as e:
+        raise IntentParseError(
+            f"All routes failed to parse message {user_message!r}: {e}"
+        )
+
+
+def _legacy_parse_message(user_message: str, system_prompt: str) -> Intent:
+    """Pre-router behaviour: try the primary model then LLM_FALLBACK_MODEL(s)."""
     models = [settings.llm_model()]
     for fallback in settings.llm_fallback_models():
         if fallback not in models:
@@ -482,7 +540,7 @@ def parse_message(
     last_error: Optional[Exception] = None
     for model in models:
         try:
-            raw = _call_model(model, system_prompt, user_message)
+            raw = _legacy_call_model(model, system_prompt, user_message)
             data = _extract_json(raw)
             intent = _validate_intent(data)
             logger.info("intent parsed via %s: action=%s db=%s", model, intent.action, intent.database)

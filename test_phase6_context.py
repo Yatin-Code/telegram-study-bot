@@ -18,6 +18,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import session_context as sc
 from intent_parser import IntentParseError, parse_message
 
@@ -106,9 +108,10 @@ def test_store_logic() -> bool:
 
     conn.close()
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
+@pytest.mark.live
 def test_dod_scenario() -> bool:
     """DoD: bare doubt inherits previously-set context via the parser prompt."""
     db = _fresh_db()
@@ -122,7 +125,7 @@ def test_dod_scenario() -> bool:
     except IntentParseError as e:
         print(f"[ERR] set_context parse failed: {e}")
         conn.close(); db.unlink(missing_ok=True)
-        return False
+        raise AssertionError(f"set_context parse failed: {e}") from e
     passed = intent.action == "set_context"
     ok &= passed
     print(f"[{'OK ' if passed else 'BAD'}] parse set_context -> {intent.action} "
@@ -142,7 +145,7 @@ def test_dod_scenario() -> bool:
     except IntentParseError as e:
         print(f"[ERR] doubt parse failed: {e}")
         conn.close(); db.unlink(missing_ok=True)
-        return False
+        raise AssertionError(f"doubt parse failed: {e}") from e
 
     passed = intent2.action == "log_doubt"
     ok &= passed
@@ -158,20 +161,17 @@ def test_dod_scenario() -> bool:
 
     conn.close()
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def main() -> int:
     print("=== Phase 6: store logic (offline) ===")
-    store_ok = test_store_logic()
+    test_store_logic()
     print("\n=== Phase 6: DoD scenario (live parser) ===")
-    dod_ok = test_dod_scenario()
+    test_dod_scenario()
     print()
-    if store_ok and dod_ok:
-        print("ALL PHASE 6 CHECKS PASSED")
-        return 0
-    print("SOME PHASE 6 CHECKS FAILED")
-    return 1
+    print("ALL PHASE 6 CHECKS PASSED")
+    return 0
 
 
 if __name__ == "__main__":

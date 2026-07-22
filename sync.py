@@ -22,6 +22,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -275,9 +276,21 @@ def sync_database(conn: sqlite3.Connection, db_key: str) -> int:
                 f"WHERE archived = 0 AND notion_page_id NOT IN ({placeholders})",
                 tuple(seen_page_ids),
             )
+        elif count == 0:
+            # Notion returned 200 with an empty result set. This can happen
+            # during partial regional outages. Refuse to archive-sweep — a
+            # genuinely empty database is indistinguishable from a silent API
+            # failure, and wiping the mirror is unrecoverable until next sync.
+            logger.warning(
+                "sync %s: Notion returned 0 pages — skipping archived sweep "
+                "to protect mirror data", db_key
+            )
         else:
-            conn.execute(
-                f'UPDATE {_quote_ident(table)} SET archived = 1 WHERE archived = 0'
+            # count > 0 but seen_page_ids is empty only if every page lacked
+            # an 'id' field — extremely unlikely, but safer to skip sweep.
+            logger.warning(
+                "sync %s: %d pages fetched but none had an id — skipping archived sweep",
+                db_key, count,
             )
         _record_sync_success(conn, db_key, count)
         return count
@@ -370,36 +383,35 @@ def _materialise_computed_columns(db_key: str, row: dict[str, Any]) -> None:
     # A missing source field is not an intentional zero-output block. Keep all
     # derived metrics NULL until the entry is complete, so reports can exclude
     # incomplete records instead of treating them as failed work.
-    source_values = (
-        row.get("actual_time_min"),
-        row.get("questions_attempted"),
-        row.get("questions_correct"),
-    )
+    source_values = tuple(_num(row.get(name)) for name in (
+        "actual_time_min", "questions_attempted", "questions_correct",
+    ))
     if any(value is None for value in source_values):
         for column in computed:
             row[column] = None
         return
+    actual_time, attempted, correct = source_values
     row["cognitive_yield"] = formulas.cognitive_yield(
         row.get("subject"),
         row.get("exercise_type"),
-        _num(row.get("actual_time_min")),
-        _num(row.get("questions_attempted")),
-        _num(row.get("questions_correct")),
+        actual_time,
+        attempted,
+        correct,
     )
     row["theory_yield"] = formulas.theory_yield(
         row.get("subject"),
         row.get("exercise_type"),
-        _num(row.get("actual_time_min")),
-        _num(row.get("questions_attempted")),
-        _num(row.get("questions_correct")),
+        actual_time,
+        attempted,
+        correct,
     )
     row["accuracy_ratio"] = formulas.accuracy_ratio(
-        _num(row.get("questions_attempted")),
-        _num(row.get("questions_correct")),
+        attempted,
+        correct,
     )
     row["mins_per_question"] = formulas.mins_per_question(
-        _num(row.get("actual_time_min")),
-        _num(row.get("questions_attempted")),
+        actual_time,
+        attempted,
     )
 
 
@@ -408,7 +420,8 @@ def _num(val: Any) -> float | None:
     if val is None or val == "":
         return None
     try:
-        return float(val)
+        number = float(val)
+        return number if math.isfinite(number) else None
     except (ValueError, TypeError):
         return None
 

@@ -18,6 +18,7 @@ Subject strings are "Chem"/"Physics"/"Maths" (live Notion select options).
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 
@@ -72,6 +73,8 @@ def accuracy_ratio(
         return 0.0
     A = questions_attempted
     C = questions_correct
+    if not math.isfinite(float(A)) or not math.isfinite(float(C)):
+        raise ValueError("question counts must be finite")
     if A < 0 or C < 0:
         raise ValueError("question counts cannot be negative")
     if A == 0:
@@ -90,6 +93,8 @@ def mins_per_question(
         return None
     T = actual_time_min
     A = questions_attempted
+    if not math.isfinite(float(T)) or not math.isfinite(float(A)):
+        raise ValueError("time and attempted count must be finite")
     if T < 0 or A < 0:
         raise ValueError("time and attempted count cannot be negative")
     if A == 0:
@@ -98,6 +103,8 @@ def mins_per_question(
 
 
 def _accuracy(questions_attempted: float, questions_correct: float) -> float:
+    if not math.isfinite(float(questions_attempted)) or not math.isfinite(float(questions_correct)):
+        raise ValueError("question counts must be finite")
     if questions_attempted < 0 or questions_correct < 0:
         raise ValueError("question counts cannot be negative")
     if questions_attempted == 0:
@@ -119,6 +126,10 @@ def cognitive_yield(
     T = float(actual_time_min or 0)
     A = float(questions_attempted or 0)
     C = float(questions_correct or 0)
+    if not math.isfinite(T) or not math.isfinite(A) or not math.isfinite(C):
+        raise ValueError("time and question counts must be finite")
+    if T < 0:
+        raise ValueError("time cannot be negative")
     T_target = A * t_q
     accuracy = _accuracy(A, C)
     if T == 0:
@@ -143,6 +154,10 @@ def theory_yield(
     T = float(actual_time_min or 0)
     A = float(questions_attempted or 0)
     C = float(questions_correct or 0)
+    if not math.isfinite(T) or not math.isfinite(A) or not math.isfinite(C):
+        raise ValueError("time and question counts must be finite")
+    if T < 0:
+        raise ValueError("time cannot be negative")
     T_target = A * t_q
     accuracy = _accuracy(A, C)
     velocity = 0.0 if T == 0 else T_target / T

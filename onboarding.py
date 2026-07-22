@@ -443,11 +443,16 @@ def apply_answer(
             if len(times) != 2:
                 return False, "⚠️ time must be HH:MM-HH:MM", False
             teacher = parts[3] if len(parts) > 3 else None
+            questions_allowed = (
+                len(parts) > 4 and parts[4].strip().lower()
+                in ("yes", "on", "true", "questions", "doubts", "allowed")
+            )
             study_domain.create_timetable_entry({
                 "title": f"{subject} {weekday} {times[0].strip()}",
                 "subject": subject, "weekday": weekday,
                 "start_time": times[0].strip(), "end_time": times[1].strip(),
                 "teacher": teacher, "kind": "Class",
+                "questions_allowed": questions_allowed,
             }, db_path=db_path)
             return True, f"✅ {subject} on {weekday} {parts[2]} added. Next class, or Done ✅.", False
 
@@ -592,7 +597,8 @@ def validate_ai_actions(actions: list[dict]) -> tuple[list[dict], list[str]]:
             valid.append({"type": kind, "subject": subject, "weekday": weekday,
                           "start": start, "end": end,
                           "teacher": (str(raw.get("teacher")).strip() or None)
-                          if raw.get("teacher") else None})
+                          if raw.get("teacher") else None,
+                          "questions_allowed": raw.get("questions_allowed") is True})
         elif kind == "set_setting":
             key = str(raw.get("key") or "").strip()
             ok, result = settings.validate_setting(key, str(raw.get("value") or ""))
@@ -627,6 +633,7 @@ def describe_ai_actions(actions: list[dict]) -> list[str]:
                 f"🏫 Class: {action['subject']} {action['weekday']} "
                 f"{action['start']}-{action['end']}"
                 + (f" with {action['teacher']}" if action.get("teacher") else "")
+                + (" · questions allowed" if action.get("questions_allowed") else "")
             )
         elif kind == "set_setting":
             entry = settings.setting_entry(action["key"])
@@ -694,6 +701,7 @@ def apply_ai_actions(
                     "subject": action["subject"], "weekday": action["weekday"],
                     "start_time": action["start"], "end_time": action["end"],
                     "teacher": action.get("teacher"), "kind": "Class",
+                    "questions_allowed": bool(action.get("questions_allowed")),
                 }, db_path=db_path)
                 results.append(f"🏫 class: {action['subject']} {action['weekday']}")
             elif kind == "set_setting":

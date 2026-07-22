@@ -838,10 +838,16 @@ async def run_telegram_smoke(
         await application.initialize()
         await bot_module.post_init(application)
         jobs = application.job_queue.jobs() if application.job_queue is not None else ()
+        expected_jobs = {
+            "periodic_sync", "expire_drafts", "planning_reminder",
+            "timetable_reminder", "weekly_report", "commitment_verify",
+            "commitment_nudge", "exam_reminders", "teacher_windows",
+            "schedule_watcher", "user_jobs",
+        }
         reporter.check(
-            "real bot initialization registers all eight scheduled jobs",
-            len(jobs) == 8,
-            f"registered {len(jobs)}",
+            "real bot initialization registers every production scheduled job",
+            {job.name for job in jobs} == expected_jobs,
+            f"registered {len(jobs)}: {sorted(job.name for job in jobs)}",
         )
     finally:
         await application.shutdown()
@@ -871,7 +877,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_notion:
         try:
-            run_notion_smoke(reporter, tag)
+            run_hybrid_notion_smoke(reporter, tag)
         except Exception as exc:
             if not isinstance(exc, SmokeFailure):
                 reporter.failed += 1

@@ -28,6 +28,7 @@ from typing import Any
 import commitments
 import session_context
 import study_domain
+import message_templates
 from config import settings
 
 DEFAULT_DB_PATH = commitments.DEFAULT_DB_PATH
@@ -108,30 +109,48 @@ def morning_nudge(
     if not verifiable:
         return None
     prev_day = (dt.date.fromisoformat(date) - dt.timedelta(days=1)).isoformat()
-    lines = [f"Commitment check — {date}:"]
+    commitment_lines: list[str] = []
+    evidence_lines: list[str] = []
+    missed_titles: list[str] = []
     for check in verifiable:
         if check["met"]:
             days = commitments.streak(check["goal_id"], as_of=date, db_path=db_path)
-            lines.append(f"✅ {check['title']} — kept ({days}-day streak)")
-        else:
-            prior = commitments.streak(check["goal_id"], as_of=prev_day, db_path=db_path)
-            line = (
-                f"❌ {check['title']} — missed "
-                f"({check['value']:g}/{check['target']:g} done)."
+            commitment_lines.append(
+                f"✅ {check['title']} — kept · {check['value']:g}/{check['target']:g} · "
+                f"{days}-day streak"
             )
+        else:
+            missed_titles.append(str(check["title"]))
+            prior = commitments.streak(check["goal_id"], as_of=prev_day, db_path=db_path)
+            line = f"❌ {check['title']} — missed · {check['value']:g}/{check['target']:g} logged"
             if prior:
-                line += f" {prior}-day streak broken."
-            lines.append(line)
+                line += f" · {prior}-day streak ended"
+            commitment_lines.append(line)
     for check in verifiable:
         if check["met"]:
             continue
         stats = commitments.adherence(check["goal_id"], as_of=date, db_path=db_path)
         if stats["total"] >= 2:
-            lines.append(
-                f"📊 {check['title']}: {stats['met']}/{stats['total']} "
-                f"day(s) kept ({stats['pct']}%) in the last week"
+            evidence_lines.append(
+                f"{check['title']} — {stats['met']}/{stats['total']} verified days kept "
+                f"({stats['pct']}%)"
             )
-    return "\n".join(lines)
+    missed = len(missed_titles)
+    conclusion = (
+        f"{missed} commitment{'s were' if missed != 1 else ' was'} missed yesterday."
+        if missed else "Every verifiable commitment was kept yesterday."
+    )
+    action = (
+        f"Recover {missed_titles[0]} today and log the evidence before day end."
+        if missed_titles else "Repeat the same targets today."
+    )
+    return message_templates.action_card(
+        "🔴" if missed else "🟢", "Morning accountability", context=date,
+        conclusion=conclusion,
+        sections=(("Commitments", commitment_lines), ("Recent evidence", evidence_lines)),
+        action=action,
+        footer=f"Evidence date: {date} · only synced ledger records count.",
+    )
 
 
 # ---------------------------------------------------------------------------

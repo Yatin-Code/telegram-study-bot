@@ -430,6 +430,22 @@ def update_page(page_id: str, properties: dict[str, Any]) -> dict:
     return _request("PATCH", f"{NOTION_API}/pages/{page_id}", json_body={"properties": notion_props})
 
 
+def archive_page(page_id: str) -> dict:
+    """Archive one page while leaving its parent database untouched.
+
+    This intentionally accepts only a page ID and only emits Notion's page
+    archive payload.  Reset code therefore has no path to archive/delete a
+    database container or alter its schema.
+    """
+    page_id = str(page_id or "").strip()
+    if not page_id:
+        raise ValueError("page_id is required")
+    return _request(
+        "PATCH", f"{NOTION_API}/pages/{page_id}",
+        json_body={"archived": True},
+    )
+
+
 def get_page(page_id: str) -> dict:
     """Fetch a single Notion page by ID."""
     return _request("GET", f"{NOTION_API}/pages/{page_id}")

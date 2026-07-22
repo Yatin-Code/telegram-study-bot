@@ -13,6 +13,7 @@ import sql_query_flow
 import sql_tool
 import logging_flow
 import operational_store
+import message_templates
 from intent_parser import _validate_intent
 import planner
 
@@ -286,6 +287,111 @@ def test_only_effective_doubt_windows_are_teacher_windows(db):
     assert [row["notion_page_id"] for row in windows] == ["valid"]
 
 
+def test_question_enabled_class_is_a_teacher_window(db):
+    now = dt.datetime(2026, 7, 20, 14, 30, tzinfo=dt.timezone.utc)
+    common = {
+        "weekday": "Monday", "start_time": "15:00", "end_time": "16:00",
+        "subject": "Physics", "active": 1, "kind": "Class",
+    }
+    insert(db, "timetable", notion_page_id="ordinary", title="Ordinary class", **common)
+    insert(
+        db, "timetable", notion_page_id="questions", title="Question-friendly class",
+        questions_allowed=1, **common,
+    )
+    windows = sd.upcoming_teacher_windows(now=now, days=0, db_path=db)
+    assert [row["notion_page_id"] for row in windows] == ["questions"]
+
+
+def test_timetable_question_access_is_explicit_and_editable(db):
+    ordinary = sd.create_timetable_entry({
+        "title": "Physics class", "weekday": "Monday", "start_time": "15:00",
+        "end_time": "16:00", "kind": "Class", "subject": "Physics",
+        "questions_allowed": "no",
+    }, db_path=db)
+    doubt_window = sd.create_timetable_entry({
+        "title": "Teacher doubts", "weekday": "Tuesday", "start_time": "15:00",
+        "end_time": "16:00", "kind": "Doubt Window", "subject": "Physics",
+    }, db_path=db)
+    rows = {row["title"]: row for row in sd._rows("timetable", db_path=db)}
+    assert rows["Physics class"]["questions_allowed"] == 0
+    assert rows["Teacher doubts"]["questions_allowed"] == 1
+    sd.set_timetable_questions_allowed("Physics class", True, db_path=db)
+    changed = sd._rows("timetable", "title='Physics class'", db_path=db)[0]
+    assert changed["questions_allowed"] == 1
+    assert ordinary["id"] and doubt_window["id"]
+
+
+def test_new_doubt_at_230_gets_preparation_card_for_3pm_class(db):
+    now = dt.datetime(2026, 7, 20, 14, 30, tzinfo=dt.timezone.utc)
+    insert(
+        db, "timetable", notion_page_id="class", title="Physics coaching",
+        weekday="Monday", start_time="15:00", end_time="16:00", subject="Physics",
+        teacher="Ramesh", kind="Class", questions_allowed=1, active=1,
+    )
+    insert(
+        db, "doubts", notion_page_id="d-new", core_concept="relative velocity sign",
+        subject="Physics", status="Unresolved", workflow_state="New",
+    )
+    opportunities = reminders.teacher_opportunities(now=now, db_path=db)
+    assert len(opportunities) == 1
+    item = opportunities[0]
+    assert item["decision"]["phase"] == "prepare"
+    assert item["decision"]["minutes_to_start"] == 30
+    assert item["doubts"][0]["readiness"] == "new"
+    card = message_templates.teacher_opportunity(item)
+    assert "Teacher window approaching" in card
+    assert "10–15 minutes" in card
+
+    # An unattempted doubt is preparation material, not an active escalation.
+    assert reminders.teacher_opportunities(
+        now=now + dt.timedelta(minutes=30), db_path=db,
+    ) == []
+
+
+def test_one_ten_minute_attempt_gets_imminent_window_exception(db):
+    now = dt.datetime(2026, 7, 20, 14, 30, tzinfo=dt.timezone.utc)
+    insert(
+        db, "timetable", notion_page_id="class", title="Physics coaching",
+        weekday="Monday", start_time="15:00", end_time="16:00", subject="Physics",
+        teacher="Ramesh", kind="Class", questions_allowed=1, active=1,
+    )
+    insert(
+        db, "doubts", notion_page_id="d1", core_concept="relative velocity sign",
+        subject="Physics", status="Unresolved", workflow_state="Attempting",
+    )
+    insert(
+        db, "doubt_attempts", notion_page_id="a1", doubt="d1", valid=1,
+        duration_min=10, attempted_at=(now - dt.timedelta(minutes=5)).isoformat(),
+        outcome="Unsolved",
+    )
+    prep = reminders.teacher_opportunities(now=now, db_path=db)
+    assert prep[0]["doubts"][0]["readiness"] == "expedited"
+    active = reminders.teacher_opportunities(
+        now=now + dt.timedelta(minutes=30), db_path=db,
+    )
+    assert len(active) == 1
+    assert active[0]["doubts"][0]["readiness"] == "expedited"
+
+
+def test_short_single_attempt_cannot_escalate_during_window(db):
+    now = dt.datetime(2026, 7, 20, 15, 5, tzinfo=dt.timezone.utc)
+    insert(
+        db, "timetable", notion_page_id="class", title="Physics coaching",
+        weekday="Monday", start_time="15:00", end_time="16:00", subject="Physics",
+        kind="Class", questions_allowed=1, active=1,
+    )
+    insert(
+        db, "doubts", notion_page_id="d1", core_concept="relative velocity sign",
+        subject="Physics", status="Unresolved", workflow_state="Attempting",
+    )
+    insert(
+        db, "doubt_attempts", notion_page_id="a1", doubt="d1", valid=1,
+        duration_min=8, attempted_at=(now - dt.timedelta(minutes=10)).isoformat(),
+        outcome="Unsolved",
+    )
+    assert reminders.teacher_opportunities(now=now, db_path=db) == []
+
+
 def test_teacher_open_and_interrupt_notices_have_distinct_keys():
     window = {
         "notion_page_id": "window-1",
@@ -295,6 +401,30 @@ def test_teacher_open_and_interrupt_notices_have_distinct_keys():
     interrupt_key = reminders.teacher_event_key(window, {"interrupt": True})
     assert open_key != interrupt_key
     assert ":open:" in open_key and ":interrupt:" in interrupt_key
+    prepare_key = reminders.teacher_event_key(
+        window, {"phase": "prepare", "interrupt": False},
+    )
+    assert ":prepare:" in prepare_key
+    assert len({open_key, interrupt_key, prepare_key}) == 3
+
+
+def test_teacher_key_changes_when_new_doubt_or_evidence_arrives():
+    window = {
+        "notion_page_id": "window-1",
+        "ends_at": dt.datetime(2026, 7, 20, 10, 0, tzinfo=dt.timezone.utc),
+    }
+    decision = {"phase": "prepare", "interrupt": False}
+    first = reminders.teacher_event_key(window, decision, [
+        {"notion_page_id": "d1", "readiness": "new", "valid_attempts": 0},
+    ])
+    new_doubt = reminders.teacher_event_key(window, decision, [
+        {"notion_page_id": "d1", "readiness": "new", "valid_attempts": 0},
+        {"notion_page_id": "d2", "readiness": "new", "valid_attempts": 0},
+    ])
+    attempted = reminders.teacher_event_key(window, decision, [
+        {"notion_page_id": "d1", "readiness": "expedited", "valid_attempts": 1},
+    ])
+    assert len({first, new_doubt, attempted}) == 3
 
 
 def test_activating_unlinked_plan_creates_and_tracks_work_item(db, monkeypatch):

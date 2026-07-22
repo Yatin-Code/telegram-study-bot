@@ -38,6 +38,7 @@ def _seed_temp_db() -> Path:
             notion_page_id TEXT PRIMARY KEY,
             notion_url TEXT,
             archived INTEGER DEFAULT 0,
+            last_edited_time TEXT,
             subject TEXT,
             exercise_type TEXT,
             date TEXT,
@@ -95,7 +96,7 @@ def test_extract_sql() -> bool:
     s = sql_query_flow._extract_sql("```sql\nSELECT a, b\nFROM t\nWHERE x = 1\n```")
     ok = _check(ok, "multiline fenced SQL", s is not None and "FROM t" in s)
 
-    return ok
+    assert ok
 
 
 def test_extract_answer() -> bool:
@@ -116,7 +117,7 @@ def test_extract_answer() -> bool:
     a = sql_query_flow._extract_answer("ANSWER:\nLine 1\nLine 2")
     ok = _check(ok, "multi-line answer", a is not None and "Line 1" in a)
 
-    return ok
+    assert ok
 
 
 def test_loop_single_query_then_answer() -> bool:
@@ -137,7 +138,7 @@ def test_loop_single_query_then_answer() -> bool:
     ok = _check(ok, "returns the answer text", "3 active ledger" in answer, answer)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_loop_multi_query() -> bool:
@@ -159,7 +160,7 @@ def test_loop_multi_query() -> bool:
                 "Physics" in answer and "Maths" in answer and "Chem" in answer, answer)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_loop_sql_error_recovery() -> bool:
@@ -180,7 +181,7 @@ def test_loop_sql_error_recovery() -> bool:
     ok = _check(ok, "recovered from SQL error", "3 entries" in answer, answer)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_loop_max_iterations() -> bool:
@@ -205,7 +206,7 @@ def test_loop_max_iterations() -> bool:
                 "query limit" in answer or "what I found" in answer, answer)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_loop_llm_failure() -> bool:
@@ -221,7 +222,7 @@ def test_loop_llm_failure() -> bool:
     ok = _check(ok, "graceful error message", "couldn't reach the LLM" in answer, answer)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_loop_cannot_write() -> bool:
@@ -246,7 +247,7 @@ def test_loop_cannot_write() -> bool:
     ok = _check(ok, "data intact after write attempt", r["rows"][0]["n"] == 3)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_loop_realistic_questions() -> bool:
@@ -282,23 +283,22 @@ def test_loop_realistic_questions() -> bool:
     ok = _check(ok, "comparison answered", "Maths" in answer and "0.9" in answer, answer)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def main() -> int:
-    ok = True
-    ok = test_extract_sql() and ok
-    ok = test_extract_answer() and ok
-    ok = test_loop_single_query_then_answer() and ok
-    ok = test_loop_multi_query() and ok
-    ok = test_loop_sql_error_recovery() and ok
-    ok = test_loop_max_iterations() and ok
-    ok = test_loop_llm_failure() and ok
-    ok = test_loop_cannot_write() and ok
-    ok = test_loop_realistic_questions() and ok
+    test_extract_sql()
+    test_extract_answer()
+    test_loop_single_query_then_answer()
+    test_loop_multi_query()
+    test_loop_sql_error_recovery()
+    test_loop_max_iterations()
+    test_loop_llm_failure()
+    test_loop_cannot_write()
+    test_loop_realistic_questions()
     print("\n" + "=" * 70)
-    print("ALL PASS" if ok else "SOME FAILURES")
-    return 0 if ok else 1
+    print("ALL PASS")
+    return 0
 
 
 if __name__ == "__main__":

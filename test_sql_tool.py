@@ -108,7 +108,7 @@ def test_valid_selects() -> bool:
     ok = _check(ok, "empty result has columns", len(r["columns"]) > 0)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_reject_writes() -> bool:
@@ -141,7 +141,7 @@ def test_reject_writes() -> bool:
             ok = _check(ok, f"rejected {stmt[:40]!r}", True, f"exec error: {e}")
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_multi_statement_injection() -> bool:
@@ -166,7 +166,7 @@ def test_multi_statement_injection() -> bool:
     ok = _check(ok, "ledger survived injection", r["rows"][0]["n"] == 4)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_read_only_connection() -> bool:
@@ -190,7 +190,7 @@ def test_read_only_connection() -> bool:
     ok = _check(ok, "rows intact after write attempt", r["rows"][0]["n"] == 4)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_allowed_pragmas() -> bool:
@@ -217,7 +217,7 @@ def test_allowed_pragmas() -> bool:
             ok = _check(ok, f"rejected {pragma}", True)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_row_limit_and_truncation() -> bool:
@@ -236,7 +236,7 @@ def test_row_limit_and_truncation() -> bool:
     ok = _check(ok, "not truncated", r["truncated"] is False)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def test_edge_cases() -> bool:
@@ -274,21 +274,20 @@ def test_edge_cases() -> bool:
         ok = _check(ok, "whitespace rejected", True)
 
     db.unlink(missing_ok=True)
-    return ok
+    assert ok
 
 
 def main() -> int:
-    ok = True
-    ok = test_valid_selects() and ok
-    ok = test_reject_writes() and ok
-    ok = test_multi_statement_injection() and ok
-    ok = test_read_only_connection() and ok
-    ok = test_allowed_pragmas() and ok
-    ok = test_row_limit_and_truncation() and ok
-    ok = test_edge_cases() and ok
+    test_valid_selects()
+    test_reject_writes()
+    test_multi_statement_injection()
+    test_read_only_connection()
+    test_allowed_pragmas()
+    test_row_limit_and_truncation()
+    test_edge_cases()
     print("\n" + "=" * 70)
-    print("ALL PASS" if ok else "SOME FAILURES")
-    return 0 if ok else 1
+    print("ALL PASS")
+    return 0
 
 
 if __name__ == "__main__":

@@ -34,12 +34,17 @@ Telegram then offers `Plan complete` or `Carry to backlog`.
 
 - `/goal 300 CY every day` or `/goal Physics PYQs for 2 hours daily`
 - `/exam JEE Main mock on 2026-08-15, maximum 300, target 220`
+- `/readiness [exam]` audits doubts, attempts, revision and the previous
+  seven days of matching key takeaways. `/readiness exam | syllabus` records
+  that mock's scope. It never creates Daily Plan rows.
 - `/today`, `/next`, `/backlog`, `/weekly`, `/weak`
 - `/attempt doubt title | minutes | approach | stuck point | outcome`
 - `/doubts`, `/resolvedoubt doubt | resolution | teacher`, `/reopendoubt doubt`
 - `/timetable`
 - `/finish_exam exam`, then `/exam_summary` and `/question_review`
 - `/complete_exam_analysis exam`
+- `/reset` opens guarded SQLite, Notion-pages, context, and everything scopes.
+  Execution requires an expiring exact sentence with a one-time token.
 
 An exam date is marked `Tentative` unless the user explicitly supplies an
 official source. Exam scores permit negative marking, but impossible counts and
@@ -58,6 +63,17 @@ before teacher escalation. A solution-viewed attempt does not count. The bot
 does not interrupt protected or high-priority work; a teacher-window reminder
 explains its evidence and can be declined.
 
+Before an exam, readiness reviews run in the T−7, T−3, T−1 and exam-day
+windows. Doubts can be marked still open, solved (only with typed resolution
+evidence), or not in that exam. An exam-specific exclusion never closes the
+underlying Doubts record globally.
+
+The Notion reset archives pages only. It never deletes or archives database
+containers, changes schemas, or changes database IDs. The SQLite reset erases
+rows while preserving the database file and its tables, indexes, triggers and
+views. Every destructive scope first creates a verified SQLite/settings backup;
+an incomplete Notion archive blocks the local-deletion half of `Everything`.
+
 ## Verification
 
 Offline tests are run with `pytest`. The live checks create temporary Notion
@@ -67,6 +83,9 @@ Telegram check verifies `getMe`, command registration, chat access and a
 temporary send/delete round trip. Automated inbound user-message testing needs
 Telethon API credentials; without those, handler tests use the real LLM and
 Notion with a fake Telegram transport.
+
+The adversarial gate, live commands, pass criteria and two-year restore/soak
+drills are documented in [HARDCORE_TESTING.md](HARDCORE_TESTING.md).
 
 For a Termux backup, run `bash backup_mirror.sh`. It uses Python's SQLite
 `iterdump`, so the external `sqlite3` executable is not required.

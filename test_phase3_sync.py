@@ -144,9 +144,10 @@ def run() -> bool:
         _seed_mirror(db_path, [
             {"notion_page_id": "p1", "task": "only row"},
         ])
-        # A genuinely empty DB in Notion (all pages archived). The diff should
-        # mark p1 archived, since a successful empty fetch means "nothing is
-        # active in Notion anymore."
+        # Notion returned 0 pages. This is indistinguishable from a silent
+        # partial-outage response. We now refuse to archive-sweep when count==0
+        # to prevent mass-wiping the mirror on transient API failures — the cost
+        # of a stale row vastly outweighs silently destroying all study data.
         orig_iter = sync.query_database_iter
         sync.query_database_iter = lambda db_key, page_size=100: iter([])
         try:
@@ -154,8 +155,8 @@ def run() -> bool:
         finally:
             sync.query_database_iter = orig_iter
         state = _archived_state(db_path)
-        ok = _check(ok, "p1 marked archived after empty successful fetch",
-                    state.get("p1") == 1, str(state))
+        ok = _check(ok, "p1 NOT archived on empty fetch (outage protection)",
+                    state.get("p1") == 0, str(state))
 
     print("\n=== Phase 3 sync: page_plain_text block flattening (offline) ===")
     import notion_client_wrapper as notion

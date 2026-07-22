@@ -71,7 +71,7 @@ def test_t_q_lookup() -> bool:
     ok = _check(ok, "t_q('', '') -> 4.0", formulas.t_q_for("", "") == 4.0)
     # Default per-type fallback for non-uniform types
     ok = _check(ok, "t_q(Chem, Ex 1A) default subject", formulas.t_q_for("Biology", "Ex 1A") == 3.0)
-    return ok
+    assert ok
 
 
 def test_accuracy_ratio() -> bool:
@@ -83,7 +83,7 @@ def test_accuracy_ratio() -> bool:
     ok = _check(ok, "15/10 = 1.0 (capped)", formulas.accuracy_ratio(10, 15) == 1.0)
     ok = _check(ok, "None/None = 0", formulas.accuracy_ratio(None, None) == 0.0)
     ok = _check(ok, "10/10 = 1.0", formulas.accuracy_ratio(10, 10) == 1.0)
-    return ok
+    assert ok
 
 
 def test_mins_per_question() -> bool:
@@ -93,7 +93,7 @@ def test_mins_per_question() -> bool:
     ok = _check(ok, "0/0 = None", formulas.mins_per_question(0, 0) is None)
     ok = _check(ok, "20/0 = None", formulas.mins_per_question(20, 0) is None)
     ok = _check(ok, "None/None = None", formulas.mins_per_question(None, None) is None)
-    return ok
+    assert ok
 
 
 def test_cognitive_yield() -> bool:
@@ -135,7 +135,7 @@ def test_cognitive_yield() -> bool:
     cy_overcap = formulas.cognitive_yield("Chem", "Ex 1A", 20, 10, 15)
     ok = _check(ok, "C>A capped to same as perfect", cy_overcap == cy_perfect, f"got {cy_overcap}")
 
-    return ok
+    assert ok
 
 
 def test_theory_yield() -> bool:
@@ -159,7 +159,7 @@ def test_theory_yield() -> bool:
     ok = _check(ok, "no time -> 0", formulas.theory_yield("Chem", "Ex 1A", 0, 10, 8) == 0)
     ok = _check(ok, "no questions -> 0", formulas.theory_yield("Chem", "Ex 1A", 20, 0, 0) == 0)
 
-    return ok
+    assert ok
 
 
 def test_none_inputs() -> bool:
@@ -169,20 +169,19 @@ def test_none_inputs() -> bool:
     ok = _check(ok, "theory all None -> 0", formulas.theory_yield(None, None, None, None, None) == 0)
     ok = _check(ok, "accuracy None -> 0", formulas.accuracy_ratio(None, None) == 0.0)
     ok = _check(ok, "mins None -> None", formulas.mins_per_question(None, None) is None)
-    return ok
+    assert ok
 
 
 def main() -> int:
-    ok = True
-    ok = test_t_q_lookup() and ok
-    ok = test_accuracy_ratio() and ok
-    ok = test_mins_per_question() and ok
-    ok = test_cognitive_yield() and ok
-    ok = test_theory_yield() and ok
-    ok = test_none_inputs() and ok
+    test_t_q_lookup()
+    test_accuracy_ratio()
+    test_mins_per_question()
+    test_cognitive_yield()
+    test_theory_yield()
+    test_none_inputs()
     print("\n" + "=" * 70)
-    print("ALL PASS" if ok else "SOME FAILURES")
-    return 0 if ok else 1
+    print("ALL PASS")
+    return 0
 
 
 if __name__ == "__main__":

@@ -7,21 +7,42 @@ values or impossible numbers are rejected.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from config import notion_schema
-from intent_parser import _call_model, _extract_json
+from intent_parser import _extract_json, _legacy_call_model
 from config import settings
+
+try:
+    from llm.errors import AllRoutesExhausted, RouterUnavailable
+except Exception:  # pragma: no cover - llm package absent/broken
+    class RouterUnavailable(Exception):  # type: ignore
+        """Fallback so router delegation always has an exception to catch."""
+
+    class AllRoutesExhausted(Exception):  # type: ignore
+        """Fallback mirror of llm.errors.AllRoutesExhausted."""
 
 
 class DomainParseError(ValueError):
     pass
 
 
-def _call(kind: str, text: str, contract: str) -> dict[str, Any]:
+def _require_object(data: Any) -> dict[str, Any]:
+    """Return ``data`` if it is a dict, else raise DomainParseError.
+
+    Used as the router validator so a non-object response counts as a model
+    failure and the router advances to the next provider.
+    """
+    if not isinstance(data, dict):
+        raise DomainParseError("model output is not an object")
+    return data
+
+
+def _build_domain_prompt(kind: str, contract: str) -> str:
     import session_context
     now = session_context.local_now()
-    prompt = f"""You extract one {kind} for a personal JEE study system.
+    return f"""You extract one {kind} for a personal JEE study system.
 Current local date/time: {now:%Y-%m-%d %H:%M} ({now:%A}). Use it to resolve
 relative dates the user states ("tomorrow", "next month", "10th august" ->
 the next 10 August from today). Return one JSON object only. Never invent a
@@ -33,14 +54,34 @@ Contract:
 
 If a required fact is missing, set needs_clarification=true and ask one short
 question in clarification_question. Do not add advice or markdown."""
+
+
+def _call(kind: str, text: str, contract: str) -> dict[str, Any]:
+    prompt = _build_domain_prompt(kind, contract)
+    try:
+        from llm import router
+        resp = router.complete(router.LLMRequest(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ],
+            purpose="domain",
+            max_output_tokens=1024,
+            validator=lambda t: _require_object(_extract_json(t)),
+        ))
+        return resp.value
+    except RouterUnavailable:
+        return _legacy_call(kind, text, prompt)
+    except AllRoutesExhausted as exc:
+        raise DomainParseError(str(exc))
+
+
+def _legacy_call(kind: str, text: str, prompt: str) -> dict[str, Any]:
     errors: list[str] = []
     for model in [settings.llm_model(), *settings.llm_fallback_models()]:
         try:
-            raw = _call_model(model, prompt, text)
-            data = _extract_json(raw)
-            if not isinstance(data, dict):
-                raise DomainParseError("model output is not an object")
-            return data
+            raw = _legacy_call_model(model, prompt, text)
+            return _require_object(_extract_json(raw))
         except Exception as exc:
             errors.append(f"{model}: {exc}")
     raise DomainParseError("; ".join(errors))
@@ -55,6 +96,8 @@ def _number(value: Any, name: str, *, minimum: float = 0) -> float | None:
         result = float(value)
     except (TypeError, ValueError) as exc:
         raise DomainParseError(f"{name} must be numeric") from exc
+    if not math.isfinite(result):
+        raise DomainParseError(f"{name} must be finite")
     if result < minimum:
         raise DomainParseError(f"{name} must be at least {minimum:g}")
     return int(result) if result.is_integer() else result
@@ -69,6 +112,8 @@ def _signed_number(value: Any, name: str) -> float | None:
         result = float(value)
     except (TypeError, ValueError) as exc:
         raise DomainParseError(f"{name} must be numeric") from exc
+    if not math.isfinite(result):
+        raise DomainParseError(f"{name} must be finite")
     return int(result) if result.is_integer() else result
 
 
@@ -229,7 +274,8 @@ def parse_setup_ai(section_title: str, section_prompt: str, text: str) -> dict[s
       "exam_date": "YYYY-MM-DD"}},
     {{"type": "create_timetable_entry", "subject": "Chem|Maths|Physics",
       "weekday": "Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday",
-      "start": "HH:MM", "end": "HH:MM", "teacher": string|null}},
+      "start": "HH:MM", "end": "HH:MM", "teacher": string|null,
+      "questions_allowed": boolean}},
     {{"type": "set_setting", "key": one of [{setting_keys}], "value": string}},
         // weekday-type settings (TIMETABLE_REMINDER_WEEKDAY) use "0"=Monday … "6"=Sunday
     {{"type": "skip_section"}}

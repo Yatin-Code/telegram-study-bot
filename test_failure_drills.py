@@ -17,6 +17,18 @@ import sql_query_flow
 import sync
 
 
+def force_legacy(monkeypatch):
+    """Make call sites bypass the router and exercise their legacy single-gateway
+    path (whose transport helpers these drills monkeypatch). The router's own
+    retry/fallback/validation is covered separately in llm/test_router.py."""
+    from llm import errors, router
+
+    def _unavailable(*a, **k):
+        raise errors.RouterUnavailable("forced legacy in test")
+
+    monkeypatch.setattr(router, "complete", _unavailable)
+
+
 @pytest.fixture()
 def db(tmp_path):
     path = tmp_path / "drill.db"
@@ -26,6 +38,7 @@ def db(tmp_path):
 
 
 def test_answer_loop_llm_dead_is_honest(db, monkeypatch):
+    force_legacy(monkeypatch)
     def boom(*a, **k):
         raise httpx.ConnectError("gateway unreachable")
     monkeypatch.setattr(sql_query_flow, "_openai_chat", boom)
@@ -37,6 +50,7 @@ def test_answer_loop_llm_dead_is_honest(db, monkeypatch):
 
 
 def test_llm_retries_transient_then_succeeds(db, monkeypatch):
+    force_legacy(monkeypatch)
     calls = {"n": 0}
     def flaky(client, model, messages):
         calls["n"] += 1
@@ -52,9 +66,10 @@ def test_llm_retries_transient_then_succeeds(db, monkeypatch):
 
 
 def test_intent_parse_llm_dead_raises_cleanly(monkeypatch):
+    force_legacy(monkeypatch)
     def boom(*a, **k):
         raise httpx.ConnectError("gateway unreachable")
-    monkeypatch.setattr(intent_parser, "_call_model", boom)
+    monkeypatch.setattr(intent_parser, "_legacy_call_model", boom)
     with pytest.raises(intent_parser.IntentParseError):
         intent_parser.parse_message("did 10 questions in physics")
 

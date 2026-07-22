@@ -39,6 +39,12 @@ import sql_tool
 import session_context
 from config import settings
 
+try:
+    from llm.errors import RouterUnavailable
+except Exception:  # pragma: no cover - llm package absent/broken
+    class RouterUnavailable(Exception):  # type: ignore
+        """Fallback so the router delegation always has an exception to catch."""
+
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "study-bot/1.0"
@@ -66,19 +72,37 @@ def _active_filter_error(sql: str, user_question: str) -> str | None:
     if any(word in question for word in ("archived", "deleted", "removed")):
         return None
     known = set(sql_tool.sync.NOTION_SOURCE_KEYS) | set(sql_tool.operational_store.OP_TABLES.values())
+    keywords = {"where", "join", "on", "group", "order", "limit", "left", "right", "inner", "outer", "cross", "union"}
+    ref_re = re.compile(
+        r'\b(?:FROM|JOIN)\s+("?[A-Za-z_][A-Za-z0-9_]*"?)'
+        r'(?:\s+(?:AS\s+)?("?[A-Za-z_][A-Za-z0-9_]*"?))?',
+        re.IGNORECASE,
+    )
     for branch in re.split(r"\bUNION(?:\s+ALL)?\b", sql, flags=re.IGNORECASE):
-        refs = [
-            match.group(1).strip('"').lower()
-            for match in re.finditer(r"\b(?:FROM|JOIN)\s+([\"A-Za-z_][\"A-Za-z0-9_]*)", branch, re.IGNORECASE)
-        ]
-        study_refs = [table for table in refs if table in known]
+        refs: list[tuple[str, str | None]] = []
+        for match in ref_re.finditer(branch):
+            table = match.group(1).strip('"').lower()
+            alias = match.group(2).strip('"').lower() if match.group(2) else None
+            if alias in keywords:
+                alias = None
+            if table in known:
+                refs.append((table, alias))
+        study_refs = refs
         if not study_refs:
             continue
-        active_checks = len(re.findall(r"\barchived\s*=\s*0\b", branch, re.IGNORECASE))
-        if active_checks < len(set(study_refs)):
+        missing: list[str] = []
+        for table, alias in study_refs:
+            qualifier = alias or (table if len(study_refs) > 1 else None)
+            pattern = (
+                rf'\b{re.escape(qualifier)}\s*\.\s*archived\s*=\s*0\b'
+                if qualifier else r'\barchived\s*=\s*0\b'
+            )
+            if not re.search(pattern, branch, re.IGNORECASE):
+                missing.append(alias or table)
+        if missing:
             return (
                 "every study-table branch must explicitly filter archived = 0; "
-                f"missing for: {', '.join(sorted(set(study_refs)))}"
+                f"missing for: {', '.join(sorted(set(missing)))}"
             )
     return None
 
@@ -159,24 +183,28 @@ SCHEMA
 """
 
 
-def _build_system_prompt(chat_id: int | None = None) -> str:
+def _build_system_prompt(
+    chat_id: int | None = None,
+    *,
+    db_path: str | Path = sql_tool.DEFAULT_DB_PATH,
+) -> str:
     try:
         import advisor
-        now_block = advisor.now_block(chat_id)
+        now_block = advisor.now_block(chat_id, db_path=db_path)
     except Exception:
         now_block = ""
     prompt = SYSTEM_PROMPT.format(
         max_iter=MAX_ITERATIONS,
         local_date=session_context.local_today_iso(),
         now_block=now_block,
-        schema=sql_tool.schema_digest(),
+        schema=sql_tool.schema_digest(db_path),
     )
     # Persistent memory: active commitments (with deterministic adherence
     # stats) and free-form preferences. Advisory context only — the model is
     # told figures still come from SQL. Failure here must never break answers.
     try:
         import advisor
-        block = advisor.memory_prompt_block(chat_id)
+        block = advisor.memory_prompt_block(chat_id, db_path=db_path)
         if block:
             prompt += "\n\n" + block
     except Exception:
@@ -185,6 +213,27 @@ def _build_system_prompt(chat_id: int | None = None) -> str:
 
 
 def _call_llm(messages: list[dict[str, str]], *, model: str | None = None) -> str:
+    """Route an LLM call through the multi-provider router, falling back to the
+    legacy single-gateway loop when the router is unavailable.
+
+    The router itself already tries independent providers and, as its final
+    step, the same legacy eaon gateway — so ``_legacy_call_llm`` only runs when
+    the router cannot start at all (no ai.env / no routes / import failure).
+    """
+    try:
+        from llm import router
+        resp = router.complete(router.LLMRequest(
+            messages=messages,
+            purpose="sql",
+            max_output_tokens=2048,
+            pinned_model=model,
+        ))
+        return resp.text
+    except RouterUnavailable:
+        return _legacy_call_llm(messages, model=model)
+
+
+def _legacy_call_llm(messages: list[dict[str, str]], *, model: str | None = None) -> str:
     """Call the LLM with retry + fallback models.
 
     Gateways throw transient 502/429s; a single-shot call turns every blip
@@ -371,7 +420,7 @@ def answer_question(
             logger.debug("on_step callback raised", exc_info=True)
 
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": _build_system_prompt(chat_id)},
+        {"role": "system", "content": _build_system_prompt(chat_id, db_path=db_path)},
     ]
     for turn in history or []:
         q = (turn.get("question") or "").strip()

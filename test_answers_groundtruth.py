@@ -78,6 +78,10 @@ G["yesterday_attempted"] = sum(r[3] for r in LEDGER if r[1] == 1)           # 30
 G["unresolved"] = sum(1 for _, s in DOUBTS if s == "Unresolved")
 G["phy_min_per_q"] = round(sum(r[5] for r in LEDGER if r[0] == "Physics")
                            / G["phy_attempted"], 1)                         # 3.0
+# "this week" is genuinely ambiguous: last-7-days vs calendar week (Mon-today).
+# Both readings are honest — accept either.
+_monday_ago = TODAY.weekday()
+G["calweek_cy"] = sum(r[6] for r in LEDGER if r[1] <= _monday_ago)
 
 
 def seed(db_path: Path) -> None:
@@ -108,6 +112,14 @@ def contains_number(answer: str, value) -> bool:
     return re.search(rf"(?<![\d.]){re.escape(v)}(?:\.0)?(?![\d])", answer) is not None
 
 
+def near(answer: str, value: float, tol: float = 1.0) -> bool:
+    """Any number in the answer within tol of value (74.62 ≈ 75)."""
+    for m in re.findall(r"\d+(?:\.\d+)?", answer):
+        if abs(float(m) - value) <= tol:
+            return True
+    return False
+
+
 def says_none(answer: str) -> bool:
     low = answer.lower()
     return any(w in low for w in ("no ", "none", "0", "not ", "haven't", "didn't", "zero"))
@@ -121,8 +133,7 @@ QUESTIONS = [
     ("clean", "how many questions did I attempt in the last 7 days?",
      lambda a: contains_number(a, G["week_attempted"]), f"= {G['week_attempted']}"),
     ("clean", "what's my overall accuracy percentage?",
-     lambda a: contains_number(a, G["overall_acc"]) or contains_number(a, 71.4),
-     f"≈ {G['overall_acc']}%"),
+     lambda a: near(a, G["overall_acc"], 1), f"≈ {G['overall_acc']}%"),
     ("clean", "how many physics questions have I attempted?",
      lambda a: contains_number(a, G["phy_attempted"]), f"= {G['phy_attempted']}"),
     ("clean", "what's my total cognitive yield for the last 7 days?",
@@ -143,7 +154,8 @@ QUESTIONS = [
     ("typo", "wats my acc in phy",
      lambda a: contains_number(a, G["phy_acc"]), f"= {G['phy_acc']}%"),
     ("typo", "totl cy ths week?",
-     lambda a: contains_number(a, G["week_cy"]), f"= {G['week_cy']}"),
+     lambda a: contains_number(a, G["week_cy"]) or contains_number(a, G["calweek_cy"]),
+     f"= {G['week_cy']} (7d) or {G['calweek_cy']} (cal-week)"),
     ("typo", "hw mny unresolvd douts i hv",
      lambda a: contains_number(a, G["unresolved"]), f"= {G['unresolved']}"),
     ("typo", "kitne questions kiye maine chem me",

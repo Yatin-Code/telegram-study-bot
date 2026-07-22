@@ -96,11 +96,11 @@ def test_full_week(db):
         assert nudge is not None
 
         if day == DAYS[2]:      # Wed morning-after: 3-day streak
-            assert "kept (3-day streak)" in nudge
+            assert "kept" in nudge and "3-day streak" in nudge
         if day == DAYS[3]:      # Thu was skipped AND offline — backfill still records the miss honestly
-            assert "missed" in nudge and "3-day streak broken" in nudge
+            assert "missed" in nudge and "3-day streak ended" in nudge
         if day == DAYS[5]:      # Sat morning-after: rebuilt to 2
-            assert "kept (2-day streak)" in nudge
+            assert "kept" in nudge and "2-day streak" in nudge
 
     # --- end-of-week truths ---
     assert commitments.streak(goal_id, as_of=DAYS[5].isoformat(), db_path=db) == 2

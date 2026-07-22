@@ -863,6 +863,7 @@ TIMETABLE_PROPERTIES = _with_human_names({
     "subject": _p("Subject", "select", options=SUBJECT_OPTIONS),
     "teacher": _p("Teacher", "rich_text"),
     "kind": _p("Kind", "select", options=TIMETABLE_KIND_OPTIONS),
+    "questions_allowed": _p("Questions Allowed", "checkbox"),
     "location": _p("Location", "rich_text"),
     "effective_from": _p("Effective From", "date"),
     "effective_to": _p("Effective To", "date"),

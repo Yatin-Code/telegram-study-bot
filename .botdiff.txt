@@ -1,0 +1,741 @@
+diff --git a/bot.py b/bot.py
+index 9b71b91..b8c6c70 100644
+--- a/bot.py
++++ b/bot.py
+@@ -50,6 +50,9 @@ import study_domain
+ import domain_parser
+ import planner
+ import reminders
++import message_templates
++import exam_readiness
++import reset_service
+ from config import settings as config_settings
+ from zoneinfo import ZoneInfo
+ from config import notion_schema
+@@ -61,6 +64,8 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+ LOG_DIR = Path(__file__).resolve().parent / "logs"
+ LOG_FILE = LOG_DIR / "bot.log"
+ logger = logging.getLogger(__name__)
++_MAINTENANCE_LOCK_KEY = "_study_bot_maintenance_lock"
++_fallback_maintenance_lock: asyncio.Lock | None = None
+ 
+ BOT_COMMANDS = [
+     BotCommand("start", "Start the bot"),
+@@ -76,6 +81,7 @@ BOT_COMMANDS = [
+     BotCommand("remember", "Remember a commitment or preference"),
+     BotCommand("forget", "Forget a remembered item"),
+     BotCommand("exam", "Create or list exams"),
++    BotCommand("readiness", "Audit evidence for an upcoming exam"),
+     BotCommand("today", "Analyze today's Notion plan"),
+     BotCommand("next", "Show the next sequence item"),
+     BotCommand("backlog", "Show prioritized backlog"),
+@@ -91,6 +97,7 @@ BOT_COMMANDS = [
+     BotCommand("exam_summary", "Record an exam result summary"),
+     BotCommand("question_review", "Record one exam mistake"),
+     BotCommand("complete_exam_analysis", "Close an exam analysis"),
++    BotCommand("reset", "Guarded reset of pages, data, or context"),
+ ]
+ 
+ 
+@@ -106,6 +113,31 @@ def _is_allowed(update: Update) -> bool:
+     return bool(user and user.id == telegram_allowed_user_id())
+ 
+ 
++def _maintenance_lock(context) -> asyncio.Lock:
++    """One per Application: scheduled jobs and destructive reset exclude each other."""
++    application = getattr(context, "application", None)
++    bot_data = getattr(application, "bot_data", None)
++    if bot_data is not None:
++        lock = bot_data.get(_MAINTENANCE_LOCK_KEY)
++        if lock is None:
++            lock = asyncio.Lock()
++            bot_data[_MAINTENANCE_LOCK_KEY] = lock
++        return lock
++    global _fallback_maintenance_lock
++    if _fallback_maintenance_lock is None:
++        _fallback_maintenance_lock = asyncio.Lock()
++    return _fallback_maintenance_lock
++
++
++def _guard_scheduled(callback):
++    async def guarded(context):
++        async with _maintenance_lock(context):
++            await callback(context)
++
++    guarded.__name__ = getattr(callback, "__name__", "guarded_job")
++    return guarded
++
++
+ async def _reject_if_unauthorized(update: Update) -> bool:
+     if _is_allowed(update):
+         return False
+@@ -151,14 +183,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
+         "/remember from now on I'll do PYQs every day\n"
+         "/forget <commitment title or preference text>\n"
+         "/exam JEE Main mock on 2026-08-15\n"
++        "/readiness [exam] — audit doubts, revision and last-7-day key points\n"
++        "/readiness exam | syllabus — save scope and rerun the audit\n"
+         "/today /next /backlog /weak /weekly\n"
+         "/backlog add title | kind | subject | due date | priority | minutes\n"
+-        "/timetable add title | weekday | start | end | kind | subject | teacher\n"
++        "/timetable add title | weekday | start | end | kind | subject | teacher | location | questions yes/no\n"
++        "/timetable doubts on <class title>\n"
+         "/attempt doubt title | minutes | approach | stuck point | outcome\n"
+         "/resolvedoubt doubt title | resolution | teacher(optional)\n"
+         "/finish_exam exam name\n"
+         "/exam_summary exam | marks | attempted | correct | incorrect | unattempted\n"
+-        "/question_review exam | qno | subject | chapter | failure type | root cause"
++        "/question_review exam | qno | subject | chapter | failure type | root cause\n"
++        "/reset — guarded page/data/context reset with typed confirmation"
+     )
+ 
+ 
+@@ -450,6 +486,36 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         f"• Pending writes: {logging_flow.pending_count()}",
+         f"• Errors last 24h: {_errors_last_24h()}",
+     ]
++    try:
++        from llm import quota as llm_quota
++        llm_state = llm_quota.health(db)
++        active = llm_state.get("active")
++        if active:
++            lines.append(
++                f"• LLM route: {active['route_id']} ({active['status']})"
++            )
++        else:
++            lines.append("• LLM route: legacy/unobserved")
++        windows = llm_state.get("windows") or []
++        if windows:
++            compact = []
++            for window in windows[:6]:
++                compact.append(
++                    f"{window['route_id']} {window['scope']} "
++                    f"{window['remaining']}/{window['limit_value']} "
++                    f"({window['confidence']}, reset {window['reset_at']})"
++                )
++            lines.append("• LLM quota: " + " | ".join(compact))
++        unavailable = [
++            rid for rid, state in llm_state.get("states", {}).items()
++            if not state.get("available", True)
++        ]
++        lines.append(
++            "• LLM fallback: " + ("active — " + ", ".join(unavailable) if unavailable else "ready")
++        )
++    except Exception as exc:
++        logger.warning("LLM health unavailable: %s", type(exc).__name__)
++        lines.append("• LLM routing: health unavailable")
+     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+ 
+ 
+@@ -586,6 +652,237 @@ async def exam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
+         await update.effective_message.reply_text(f"I could not create that exam safely: {exc}")
+ 
+ 
++def _readiness_markup(snapshot: dict) -> InlineKeyboardMarkup:
++    rows = []
++    doubts = list(snapshot.get("doubts") or [])
++    phase = snapshot.get("phase")
++    if phase == "day":
++        doubts = [row for row in doubts if row.get("readiness") == "ready"][:5]
++    elif phase == "t1":
++        doubts = doubts[:6]
++    else:
++        doubts = doubts[:10]
++    for doubt in doubts:
++        token = doubt.get("readiness_token")
++        if not token:
++            continue
++        title = str(doubt.get("core_concept") or "doubt")[:18]
++        rows.append([
++            InlineKeyboardButton(
++                f"Open · {title}", callback_data=f"ready:open:{token}"
++            ),
++            InlineKeyboardButton(
++                f"Solved · {title}", callback_data=f"ready:solve:{token}"
++            ),
++            InlineKeyboardButton(
++                f"Not here · {title}", callback_data=f"ready:exclude:{token}"
++            ),
++        ])
++    for doubt in (snapshot.get("excluded_doubts") or [])[:5]:
++        token = doubt.get("readiness_token")
++        if token:
++            title = str(doubt.get("core_concept") or "doubt")[:24]
++            rows.append([InlineKeyboardButton(
++                f"↩ Include: {title}", callback_data=f"ready:open:{token}"
++            )])
++    exam_id = str(snapshot.get("exam_id") or "")
++    if exam_id:
++        rows.append([InlineKeyboardButton(
++            "↻ Refresh evidence", callback_data=f"ready:refresh:{exam_id}"
++        )])
++    return InlineKeyboardMarkup(rows)
++
++
++async def _send_readiness_snapshot(
++    bot, chat_id: int, snapshot: dict, *, claim_event: bool = False,
++) -> bool:
++    event = None
++    if claim_event:
++        event = exam_readiness.event_key(snapshot["exam"], snapshot["phase"])
++        if not reminders.claim(event):
++            return False
++    try:
++        await bot.send_message(
++            chat_id=chat_id, text=message_templates.exam_readiness(snapshot),
++            reply_markup=_readiness_markup(snapshot),
++        )
++    except Exception:
++        if event is not None:
++            await asyncio.to_thread(reminders.release, event)
++        raise
++    return True
++
++
++async def _send_current_readiness_reviews(
++    bot, chat_id: int, *, sync_first: bool = True,
++) -> int:
++    """Send every currently due readiness window, deduplicated durably."""
++    if sync_first:
++        await _sync_domain()
++    sent = 0
++    for exam, phase in await asyncio.to_thread(exam_readiness.scheduled_reviews):
++        snapshot = await asyncio.to_thread(
++            exam_readiness.collect, exam, phase=phase
++        )
++        if await _send_readiness_snapshot(
++            bot, chat_id, snapshot, claim_event=True
++        ):
++            sent += 1
++    return sent
++
++
++async def readiness_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    if await _reject_if_unauthorized(update):
++        return
++    try:
++        await _sync_domain()
++        raw = _command_args(update)
++        query, separator, syllabus = raw.partition("|")
++        exam = await asyncio.to_thread(exam_readiness.select_exam, query.strip())
++        if separator:
++            syllabus = syllabus.strip()
++            if not syllabus:
++                raise study_domain.DomainError(
++                    "after |, list the chapters or subjects in this exam"
++                )
++            exam = await asyncio.to_thread(
++                operational_store.update, "exams", exam["notion_page_id"],
++                {"syllabus": syllabus},
++            )
++        snapshot = await asyncio.to_thread(exam_readiness.collect, exam)
++        await update.effective_message.reply_text(
++            message_templates.exam_readiness(snapshot),
++            reply_markup=_readiness_markup(snapshot),
++        )
++    except Exception as exc:
++        logger.exception("readiness command failed")
++        await update.effective_message.reply_text(f"Readiness audit unavailable: {exc}")
++
++
++async def on_readiness_callback(
++    update: Update, context: ContextTypes.DEFAULT_TYPE,
++) -> None:
++    query = update.callback_query
++    await query.answer()
++    if not _is_allowed(update):
++        return
++    try:
++        _, action, value = query.data.split(":", 2)
++        if action == "refresh":
++            await _sync_domain()
++            exam = await asyncio.to_thread(exam_readiness.exam_by_id, value)
++        else:
++            item = await asyncio.to_thread(exam_readiness.item_for_token, value)
++            exam = await asyncio.to_thread(
++                exam_readiness.exam_by_id, str(item["exam_id"])
++            )
++            if action == "open":
++                await asyncio.to_thread(exam_readiness.set_decision, value, "open")
++            elif action == "exclude":
++                await asyncio.to_thread(
++                    exam_readiness.set_decision, value, "not_in_exam"
++                )
++            elif action == "solve":
++                await asyncio.to_thread(
++                    exam_readiness.start_resolution, update.effective_chat.id, value
++                )
++                doubt = study_domain._row(
++                    "doubts", "notion_page_id=?", (str(item["doubt_id"]),)
++                ) or {}
++                await update.effective_message.reply_text(
++                    f"To mark ‘{doubt.get('core_concept') or 'this doubt'}’ solved, "
++                    "send the corrected idea or method you now understand. "
++                    "A status-only answer such as ‘done’ will be rejected. "
++                    "Send ‘cancel’ to leave it open.",
++                    reply_markup=ForceReply(selective=True),
++                )
++                return
++            else:
++                return
++        snapshot = await asyncio.to_thread(exam_readiness.collect, exam)
++        await query.edit_message_text(
++            message_templates.exam_readiness(snapshot),
++            reply_markup=_readiness_markup(snapshot),
++        )
++    except Exception as exc:
++        logger.exception("readiness callback failed")
++        try:
++            await query.edit_message_text(f"Readiness action was not applied: {exc}")
++        except Exception:
++            pass
++
++
++def _reset_menu() -> tuple[str, InlineKeyboardMarkup]:
++    text = (
++        "🧨 Guarded reset\n\n"
++        "Choose a scope. The next screen gives an exact full sentence with a "
++        "one-time token; a button alone can never delete anything. A verified "
++        "backup is created before mutation.\n\n"
++        "• SQLite data — erase rows; preserve the file, tables, indexes and schemas.\n"
++        "  Notion-mirror rows can return on sync because this scope preserves Notion pages.\n"
++        "• Notion pages — archive every page; preserve every database, schema and ID.\n"
++        "• Context — erase active session/conversation drafts only; keep study records.\n"
++        "• Everything — archive Notion pages, then erase local data and restart onboarding. "
++        "It stops before local deletion if any Notion page fails."
++    )
++    markup = InlineKeyboardMarkup([
++        [
++            InlineKeyboardButton("SQLite data", callback_data="reset:select:sqlite"),
++            InlineKeyboardButton("Notion pages", callback_data="reset:select:notion"),
++        ],
++        [
++            InlineKeyboardButton("Context", callback_data="reset:select:context"),
++            InlineKeyboardButton("Everything", callback_data="reset:select:everything"),
++        ],
++        [InlineKeyboardButton("Cancel", callback_data="reset:cancel:none")],
++    ])
++    return text, markup
++
++
++async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    if await _reject_if_unauthorized(update):
++        return
++    reset_service.cancel_confirmation(update.effective_chat.id)
++    text, markup = _reset_menu()
++    await update.effective_message.reply_text(text, reply_markup=markup)
++
++
++async def on_reset_callback(
++    update: Update, context: ContextTypes.DEFAULT_TYPE,
++) -> None:
++    query = update.callback_query
++    await query.answer()
++    if not _is_allowed(update):
++        return
++    try:
++        _, action, scope = query.data.split(":", 2)
++        if action == "cancel":
++            reset_service.cancel_confirmation(update.effective_chat.id)
++            await query.edit_message_text("Reset cancelled. Nothing was changed.")
++            return
++        if action != "select" or scope not in reset_service.SCOPES:
++            return
++        pending = await asyncio.to_thread(
++            reset_service.create_confirmation, update.effective_chat.id, scope
++        )
++        await query.edit_message_text(
++            f"⚠️ Final confirmation · {reset_service.SCOPE_LABELS[scope]}\n\n"
++            "Copy and send the following sentence exactly, including punctuation "
++            f"and token, within {reset_service.CONFIRM_TTL_MINUTES} minutes:\n\n"
++            f"{pending['sentence']}\n\n"
++            "Nothing has been deleted yet.",
++            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
++                "Cancel reset", callback_data="reset:cancel:none"
++            )]]),
++        )
++    except Exception as exc:
++        logger.exception("reset callback failed")
++        try:
++            await query.edit_message_text(f"Reset was not armed: {exc}")
++        except Exception:
++            pass
++
++
+ def _relevance_warning(parsed: dict) -> list[str]:
+     """One honest line when a capture doesn't look study-related. Never blocks."""
+     if parsed.get("study_related", True):
+@@ -850,11 +1147,8 @@ async def doubts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
+     if await _reject_if_unauthorized(update):
+         return
+     await _sync_domain()
+-    rows = study_domain.eligible_doubts()
+-    await update.effective_message.reply_text("\n".join(
+-        f"{i}. {r.get('core_concept')} — {r.get('valid_attempts')} attempts"
+-        for i, r in enumerate(rows, 1)
+-    ) or "No doubts are teacher-ready. Every unresolved doubt needs two valid attempts first.")
++    rows = study_domain.doubt_queue()
++    await update.effective_message.reply_text(message_templates.doubt_dashboard(rows))
+ 
+ 
+ async def attempt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@@ -873,8 +1167,7 @@ async def attempt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
+             outcome=parts[4] if len(parts) > 4 and parts[4] else "Unsolved",
+         )
+         await update.effective_message.reply_text(
+-            f"Attempt {result['attempt_no']} recorded. Valid attempts: {result['valid_attempts']}.\n"
+-            f"State: {result['workflow_state']}"
++            message_templates.attempt_result(result, parts[0])
+         )
+     except Exception as exc:
+         await update.effective_message.reply_text(f"Attempt not recorded: {exc}")
+@@ -927,6 +1220,20 @@ async def timetable_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
+     if await _reject_if_unauthorized(update):
+         return
+     text = _command_args(update)
++    doubt_access = re.match(r"^doubts\s+(on|off)\s+(.+)$", text, re.IGNORECASE)
++    if doubt_access:
++        value, title = doubt_access.groups()
++        try:
++            await asyncio.to_thread(
++                study_domain.set_timetable_questions_allowed,
++                title, value.lower() == "on",
++            )
++            await update.effective_message.reply_text(
++                f"Question access {'enabled' if value.lower() == 'on' else 'disabled'} for {title}."
++            )
++        except Exception as exc:
++            await update.effective_message.reply_text(f"Timetable entry was not changed: {exc}")
++        return
+     action_match = re.match(r"^(enable|disable)\s+(.+)$", text, re.IGNORECASE)
+     if action_match:
+         action, title = action_match.groups()
+@@ -945,10 +1252,13 @@ async def timetable_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
+         parts = [part.strip() for part in text[4:].split("|")]
+         if len(parts) < 5:
+             await update.effective_message.reply_text(
+-                "Format: /timetable add title | weekday | start | end | kind | subject | teacher | location"
++                "Format: /timetable add title | weekday | start | end | kind | subject | teacher | location | questions yes/no"
+             )
+             return
+-        fields = ("title", "weekday", "start_time", "end_time", "kind", "subject", "teacher", "location")
++        fields = (
++            "title", "weekday", "start_time", "end_time", "kind", "subject",
++            "teacher", "location", "questions_allowed",
++        )
+         data = {name: parts[index] for index, name in enumerate(fields) if index < len(parts) and parts[index]}
+         data["operation_id"] = uuid.uuid4().hex
+         try:
+@@ -960,7 +1270,9 @@ async def timetable_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
+     rows = study_domain._rows("timetable", "archived=0 AND active=1")
+     rows.sort(key=lambda r: (str(r.get("weekday")), str(r.get("start_time"))))
+     await update.effective_message.reply_text("\n".join(
+-        f"{r.get('weekday')} {r.get('start_time')}-{r.get('end_time')} — {r.get('kind')} {r.get('subject') or ''} {r.get('teacher') or ''}"
++        f"{r.get('weekday')} {r.get('start_time')}-{r.get('end_time')} — "
++        f"{r.get('kind')} {r.get('subject') or ''} {r.get('teacher') or ''}"
++        f"{' · questions allowed' if r.get('questions_allowed') else ''}"
+         for r in rows
+     ) or "No active timetable entries found in SQLite.")
+ 
+@@ -1083,13 +1395,15 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
+     if action not in ("confirm", "replace"):
+         return
+     try:
++        created_exam = None
++        setup_created_exam = False
+         kind = draft["payload"].get("kind")
+         data = draft["payload"].get("data") or {}
+         if kind == "goal":
+             await asyncio.to_thread(study_domain.create_goal, data)
+             message = "Goal saved to SQLite."
+         elif kind == "exam":
+-            await asyncio.to_thread(study_domain.create_exam, data)
++            created_exam = await asyncio.to_thread(study_domain.create_exam, data)
+             message = "Exam saved to SQLite."
+         elif kind == "commitment":
+             replaced = draft["payload"].get("replace_goal_id")
+@@ -1108,6 +1422,11 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
+             )
+             message = "Preference remembered."
+         elif kind == "setup_ai":
++            setup_created_exam = any(
++                action.get("type") == "create_exam"
++                for action in (data.get("actions") or [])
++                if isinstance(action, dict)
++            )
+             results, skip = await asyncio.to_thread(
+                 onboarding.apply_ai_actions, draft["chat_id"], data.get("actions") or []
+             )
+@@ -1146,6 +1465,29 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
+                 logger.debug("budget warning failed", exc_info=True)
+         draft_store.delete_draft(draft_id)
+         await query.edit_message_text(message)
++        if created_exam is not None:
++            phase = exam_readiness.immediate_phase(created_exam)
++            if phase:
++                try:
++                    await _sync_domain()
++                    snapshot = await asyncio.to_thread(
++                        exam_readiness.collect, created_exam, phase=phase
++                    )
++                    await _send_readiness_snapshot(
++                        context.bot, draft["chat_id"], snapshot, claim_event=True
++                    )
++                except Exception:
++                    # The confirmed exam remains saved.  A readiness rendering
++                    # problem must never turn that successful write into a
++                    # misleading retry prompt.
++                    logger.exception("immediate exam readiness audit failed")
++        elif setup_created_exam:
++            try:
++                await _send_current_readiness_reviews(
++                    context.bot, draft["chat_id"], sync_first=True
++                )
++            except Exception:
++                logger.exception("setup AI readiness audit failed")
+     except Exception as exc:
+         logger.exception("domain draft commit failed")
+         await query.edit_message_text(
+@@ -1704,6 +2046,60 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         await message.reply_text("received")
+         return
+ 
++    # A destructive reset confirmation has the highest routing priority.
++    # While armed, no text can fall through to an LLM or ordinary command
++    # parser.  Only exact, case-sensitive full-sentence equality executes it.
++    pending_reset = reset_service.pending_confirmation(chat_id)
++    if pending_reset:
++        if text.strip().lower() == "cancel":
++            reset_service.cancel_confirmation(chat_id)
++            await message.reply_text("Reset cancelled. Nothing was changed.")
++            return
++        consumed = reset_service.consume_confirmation(chat_id, text)
++        if consumed is None:
++            await message.reply_text(
++                "That did not exactly match, so nothing was changed. Send this "
++                "full sentence exactly, or send ‘cancel’:\n\n"
++                f"{pending_reset['sentence']}"
++            )
++            return
++        await message.reply_text(
++            "Confirmation matched. Creating and verifying the backup before any mutation…"
++        )
++        try:
++            async with _maintenance_lock(context):
++                result = await asyncio.to_thread(
++                    reset_service.execute, consumed["scope"], chat_id=chat_id
++                )
++            await message.reply_text(reset_service.format_result(result))
++        except Exception as exc:
++            logger.exception("confirmed reset failed")
++            await message.reply_text(
++                f"⚠️ Reset stopped with an error: {exc}. Check the backup/report before retrying."
++            )
++        return
++
++    pending_resolution = exam_readiness.pending_resolution(chat_id)
++    if pending_resolution:
++        if text.strip().lower() == "cancel":
++            exam_readiness.cancel_resolution(chat_id)
++            await message.reply_text("Resolution cancelled. The doubt remains open.")
++            return
++        try:
++            result = await asyncio.to_thread(
++                exam_readiness.complete_resolution, chat_id, text
++            )
++            await message.reply_text(
++                "✅ Resolution evidence saved and the doubt is now solved. "
++                "Run /readiness to refresh the exam audit."
++            )
++        except Exception as exc:
++            await message.reply_text(
++                f"The doubt remains open: {exc}. Send stronger resolution evidence, "
++                "or send ‘cancel’."
++            )
++        return
++
+     # /settings edit in progress: the next text message is the new value.
+     pending_setting = draft_store.get_pending_setting_edit(chat_id)
+     if pending_setting:
+@@ -1756,6 +2152,15 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+             await message.reply_text(reply_text, reply_markup=markup)
+         else:
+             await message.reply_text(reply)
++        if _ok and section_id == "next_mock":
++            try:
++                await _send_current_readiness_reviews(
++                    context.bot, chat_id, sync_first=True
++                )
++            except Exception:
++                # The mock was saved successfully; a notification problem must
++                # not misreport or roll back that onboarding answer.
++                logger.exception("onboarding mock readiness audit failed")
+         return
+ 
+     # One-time nudge toward /setup for a fresh install.
+@@ -2278,7 +2683,9 @@ async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+ 
+ async def _exam_reminder_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+     try:
+-        await sync.sync_once_locked(db_keys=("exams",))
++        await _send_current_readiness_reviews(
++            context.bot, telegram_allowed_user_id(), sync_first=True
++        )
+         for exam in await asyncio.to_thread(reminders.due_exams):
+             event = f"exam-finished:{exam['notion_page_id']}:{session_context.local_today_iso()}"
+             if reminders.claim(event):
+@@ -2296,38 +2703,35 @@ async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+         await sync.sync_once_locked(db_keys=("doubts", "doubt_attempts", "timetable", "daily_plan"))
+         for item in await asyncio.to_thread(reminders.teacher_opportunities):
+             window, decision = item["window"], item["decision"]
+-            key = reminders.teacher_event_key(window, decision)
++            key = reminders.teacher_event_key(window, decision, item.get("doubts"))
+             if not reminders.claim(key):
+                 continue
+-            titles = ", ".join(str(d.get("core_concept")) for d in item["doubts"][:3])
+-            prefix = "Interrupt available" if decision["interrupt"] else "Teacher opportunity"
+             await context.bot.send_message(
+                 chat_id=telegram_allowed_user_id(),
+-                text=(f"{prefix}: {window.get('teacher') or 'teacher'} is available for "
+-                      f"{decision['minutes_left']:g} more minutes. Eligible: {titles}. "
+-                      f"{decision['reason']}"),
++                text=message_templates.teacher_opportunity(item),
+             )
+     except Exception:
+         logger.exception("teacher opportunity scan failed")
+ 
+ 
+-def _nightly_backup() -> None:
+-    """Copy the SQLite store + settings.json into backups/, keep last 7 days.
++def _backup_state(
++    db_path: Path, settings_path: Path, backup_root: Path, day: str,
++) -> Path:
++    """Create an atomic, WAL-consistent backup and retain seven daily copies."""
++    return reset_service.backup_state(
++        db_path, settings_path, backup_root, day, retain=7
++    )
+ 
+-    Notion re-syncs the mirror tables, but op_* rows, commitments, prefs and
+-    jobs exist ONLY in this file — losing it loses the operational brain.
+-    """
+-    import shutil
++
++def _nightly_backup() -> None:
++    """Back up the SQLite operational brain and settings, keeping seven days."""
+     root = Path(__file__).resolve().parent
+-    day_dir = root / "backups" / session_context.local_today_iso()
+-    day_dir.mkdir(parents=True, exist_ok=True)
+-    for name in ("sqlite_mirror.db", "settings.json"):
+-        src = root / name
+-        if src.exists():
+-            shutil.copy2(src, day_dir / name)
+-    kept = sorted(p for p in (root / "backups").iterdir() if p.is_dir())
+-    for old in kept[:-7]:
+-        shutil.rmtree(old, ignore_errors=True)
++    _backup_state(
++        root / "sqlite_mirror.db",
++        root / "settings.json",
++        root / "backups",
++        session_context.local_today_iso(),
++    )
+ 
+ 
+ async def _commitment_verify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+@@ -2360,7 +2764,7 @@ async def _commitment_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+             return
+         drift = await asyncio.to_thread(advisor.trajectory_warnings)
+         if drift:
+-            nudge += "\n\n📉 Watch:\n" + "\n".join(f"- {w}" for w in drift)
++            nudge = message_templates.insert_section(nudge, "Risks", drift)
+         await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=nudge)
+     except Exception:
+         logger.exception("commitment nudge job failed")
+@@ -2381,6 +2785,7 @@ async def _user_jobs_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+ 
+ 
+ async def post_init(application: Application) -> None:
++    application.bot_data.setdefault(_MAINTENANCE_LOCK_KEY, asyncio.Lock())
+     await application.bot.set_my_commands(BOT_COMMANDS)
+     logger.info("Registered %d bot commands", len(BOT_COMMANDS))
+     await asyncio.to_thread(study_domain.ensure_system_goals)
+@@ -2398,13 +2803,13 @@ async def post_init(application: Application) -> None:
+     if application.job_queue is not None:
+         sync_secs = config_settings.sync_interval_seconds()
+         application.job_queue.run_repeating(
+-            _periodic_sync,
++            _guard_scheduled(_periodic_sync),
+             interval=sync_secs,
+             first=sync_secs,
+             name="periodic_sync",
+         )
+         application.job_queue.run_repeating(
+-            _expire_drafts, interval=60, first=60, name="expire_drafts"
++            _guard_scheduled(_expire_drafts), interval=60, first=60, name="expire_drafts"
+         )
+         def _clock(raw: str) -> dt.time:
+             try:
+@@ -2414,36 +2819,36 @@ async def post_init(application: Application) -> None:
+                 raise ValueError(f"invalid reminder time {raw!r}") from exc
+ 
+         application.job_queue.run_daily(
+-            _planning_reminder, time=_clock(config_settings.planning_reminder_time()),
++            _guard_scheduled(_planning_reminder), time=_clock(config_settings.planning_reminder_time()),
+             days=tuple(range(7)), name="planning_reminder",
+         )
+         application.job_queue.run_daily(
+-            _weekly_timetable_reminder, time=_clock("09:00"),
++            _guard_scheduled(_weekly_timetable_reminder), time=_clock("09:00"),
+             days=tuple(range(7)), name="timetable_reminder",
+         )
+         application.job_queue.run_daily(
+-            _weekly_report_job, time=_clock(config_settings.weekly_report_time()),
++            _guard_scheduled(_weekly_report_job), time=_clock(config_settings.weekly_report_time()),
+             days=tuple(range(7)), name="weekly_report",
+         )
+         application.job_queue.run_daily(
+-            _commitment_verify_job, time=_clock(config_settings.commitment_check_time()),
++            _guard_scheduled(_commitment_verify_job), time=_clock(config_settings.commitment_check_time()),
+             days=tuple(range(7)), name="commitment_verify",
+         )
+         application.job_queue.run_daily(
+-            _commitment_nudge_job, time=_clock(config_settings.commitment_nudge_time()),
++            _guard_scheduled(_commitment_nudge_job), time=_clock(config_settings.commitment_nudge_time()),
+             days=tuple(range(7)), name="commitment_nudge",
+         )
+         application.job_queue.run_repeating(
+-            _exam_reminder_scan, interval=600, first=120, name="exam_reminders"
++            _guard_scheduled(_exam_reminder_scan), interval=600, first=120, name="exam_reminders"
+         )
+         application.job_queue.run_repeating(
+-            _teacher_opportunity_scan, interval=300, first=180, name="teacher_windows"
++            _guard_scheduled(_teacher_opportunity_scan), interval=300, first=180, name="teacher_windows"
+         )
+         application.job_queue.run_repeating(
+-            _schedule_watch_scan, interval=300, first=90, name="schedule_watcher"
++            _guard_scheduled(_schedule_watch_scan), interval=300, first=90, name="schedule_watcher"
+         )
+         application.job_queue.run_repeating(
+-            _user_jobs_scan, interval=60, first=75, name="user_jobs"
++            _guard_scheduled(_user_jobs_scan), interval=60, first=75, name="user_jobs"
+         )
+         logger.info("Scheduled periodic sync every %ds", sync_secs)
+     else:
+@@ -2495,6 +2900,7 @@ def main() -> None:
+     app.add_handler(CommandHandler("remember", remember_command))
+     app.add_handler(CommandHandler("forget", forget_command))
+     app.add_handler(CommandHandler("exam", exam_command))
++    app.add_handler(CommandHandler("readiness", readiness_command))
+     app.add_handler(CommandHandler("today", today_command))
+     app.add_handler(CommandHandler("next", next_command))
+     app.add_handler(CommandHandler("backlog", backlog_command))
+@@ -2510,7 +2916,10 @@ def main() -> None:
+     app.add_handler(CommandHandler("exam_summary", exam_summary_command))
+     app.add_handler(CommandHandler("question_review", question_review_command))
+     app.add_handler(CommandHandler("complete_exam_analysis", complete_exam_analysis_command))
++    app.add_handler(CommandHandler("reset", reset_command))
+     app.add_handler(CallbackQueryHandler(on_domain_callback, pattern=r"^domain:"))
++    app.add_handler(CallbackQueryHandler(on_readiness_callback, pattern=r"^ready:"))
++    app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=r"^reset:"))
+     app.add_handler(CallbackQueryHandler(on_memory_callback, pattern=r"^memory:"))
+     app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^settings:"))
+     app.add_handler(CallbackQueryHandler(on_onboarding_callback, pattern=r"^onb:"))

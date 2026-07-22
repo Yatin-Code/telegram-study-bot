@@ -106,6 +106,23 @@ def _table_sql(db_key: str) -> str:
     )
 
 
+def _ensure_property_columns(conn: sqlite3.Connection, db_key: str) -> None:
+    """Apply additive schema changes to databases created by older releases."""
+    table = table_for(db_key)
+    existing = {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({_quote(table)})").fetchall()
+    }
+    for name, definition in notion_schema.PROPERTIES_BY_DB[db_key].items():
+        if name in _RESERVED or name in existing:
+            continue
+        sql_type = _SQL_TYPES.get(definition["type"], "TEXT")
+        conn.execute(
+            f"ALTER TABLE {_quote(table)} ADD COLUMN {_quote(name)} {sql_type}"
+        )
+        existing.add(name)
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS operational_schema_meta (
@@ -117,6 +134,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     for db_key in OPERATIONAL_KEYS:
         table = table_for(db_key)
         conn.execute(_table_sql(db_key))
+        _ensure_property_columns(conn, db_key)
         conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{table}_active ON {_quote(table)}(archived)"
         )
@@ -290,14 +308,15 @@ def update(
         assignments = ", ".join(f"{_quote(name)}=?" for name in clean)
         cur = conn.execute(
             f"UPDATE {_quote(table)} SET {assignments} "
-            "WHERE id=? OR notion_page_id=?",
+            "WHERE (id=? OR notion_page_id=?) AND archived=0",
             (*clean.values(), str(record_id), str(record_id)),
         )
         if cur.rowcount != 1:
             raise OperationalStoreError(f"no active {db_key} record matches {record_id!r}")
         conn.commit()
         row = conn.execute(
-            f"SELECT * FROM {_quote(table)} WHERE id=? OR notion_page_id=?",
+            f"SELECT * FROM {_quote(table)} "
+            "WHERE (id=? OR notion_page_id=?) AND archived=0",
             (str(record_id), str(record_id)),
         ).fetchone()
     return _result(dict(row))

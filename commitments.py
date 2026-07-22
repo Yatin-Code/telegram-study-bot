@@ -255,7 +255,7 @@ def streak(
     with _connect(db_path) as conn:
         rows = conn.execute(
             f"SELECT check_date, met FROM {CHECKS_TABLE} "
-            "WHERE goal_id = ? ORDER BY check_date DESC LIMIT 400",
+            "WHERE goal_id = ? ORDER BY check_date DESC",
             (goal_id,),
         ).fetchall()
     count = 0

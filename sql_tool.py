@@ -141,7 +141,7 @@ def _truncate_sample(row: dict) -> dict:
     return out
 
 
-def schema_digest() -> str:
+def schema_digest(db_path: str | Path = DEFAULT_DB_PATH) -> str:
     """A compact, model-friendly description of the mirror schema.
 
     Lists each table, its columns, types, and a few sample rows so the LLM
@@ -149,15 +149,24 @@ def schema_digest() -> str:
     computed columns and their meaning, so the model knows it can filter
     and aggregate on cognitive_yield etc. directly.
     """
-    with sync.connect() as conn:
-        sync.init_db(conn)
-        operational_store.init_db(conn)
+    # Introspection must use the same database as query execution and must not
+    # migrate or populate it as a side effect (especially for isolated tests).
+    with sqlite3.connect(_read_only_uri(db_path), uri=True) as conn:
+        conn.row_factory = sqlite3.Row
         lines: list[str] = []
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
         tables = {
             key: sync.DB_TABLES[key] for key in sync.NOTION_SOURCE_KEYS
         }
         tables.update(operational_store.OP_TABLES)
         for db_key, table in tables.items():
+            if table not in existing_tables:
+                continue
             info = conn.execute(
                 f'PRAGMA table_info("{table}")'
             ).fetchall()
@@ -174,12 +183,13 @@ def schema_digest() -> str:
             else:
                 lines.append("  (no active rows)")
         link_table = operational_store.EXECUTION_LINKS_TABLE
-        link_info = conn.execute(f'PRAGMA table_info("{link_table}")').fetchall()
-        link_cols = [f"{r['name']}:{r['type'] or 'TEXT'}" for r in link_info]
-        lines.append(
-            f"TABLE {link_table} (local Work Item to Notion Ledger links): "
-            + ", ".join(link_cols)
-        )
+        if link_table in existing_tables:
+            link_info = conn.execute(f'PRAGMA table_info("{link_table}")').fetchall()
+            link_cols = [f"{r['name']}:{r['type'] or 'TEXT'}" for r in link_info]
+            lines.append(
+                f"TABLE {link_table} (local Work Item to Notion Ledger links): "
+                + ", ".join(link_cols)
+            )
         # Computed-column explanation.
         lines.append("")
         lines.append(

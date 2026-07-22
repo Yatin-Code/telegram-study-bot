@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ import planner
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "sqlite_mirror.db"
 EVENT_TABLE = "reminder_events"
+TEACHER_PREP_MINUTES = 45
 
 
 def _connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -38,6 +40,15 @@ def claim(event_key: str, *, db_path: str | Path = DEFAULT_DB_PATH) -> bool:
         )
         conn.commit()
         return cur.rowcount == 1
+
+
+def release(event_key: str, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """Release a claim when delivery failed, so a later scan can retry."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            f"DELETE FROM {EVENT_TABLE} WHERE event_key = ?", (event_key,)
+        )
+        conn.commit()
 
 
 def planning_message(*, now: dt.datetime | None = None, db_path: str | Path = DEFAULT_DB_PATH) -> str:
@@ -105,7 +116,9 @@ def due_exams(*, now: dt.datetime | None = None, db_path: str | Path = DEFAULT_D
             due = stamp <= now
         except ValueError:
             try:
-                due = dt.date.fromisoformat(str(raw)[:10]) <= now.date()
+                # A date-only exam has no finish time.  Do not ask whether it
+                # has finished at midnight before the paper has even started.
+                due = dt.date.fromisoformat(str(raw)[:10]) < now.date()
             except ValueError:
                 continue
         if due:
@@ -115,31 +128,75 @@ def due_exams(*, now: dt.datetime | None = None, db_path: str | Path = DEFAULT_D
 
 def teacher_opportunities(*, now: dt.datetime | None = None, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
     now = now or session_context.local_now()
-    doubts = study_domain.eligible_doubts(db_path=db_path)
+    doubts = study_domain.doubt_queue(db_path=db_path)
     if not doubts:
         return []
     current = study_domain.next_plan_item(now.date().isoformat(), db_path=db_path)
     opportunities: list[dict[str, Any]] = []
     for window in study_domain.upcoming_teacher_windows(now=now, days=0, db_path=db_path):
-        if window["starts_at"] > now or window["ends_at"] <= now:
+        if window["ends_at"] <= now:
+            continue
+        minutes_to_start = max(0.0, (window["starts_at"] - now).total_seconds() / 60)
+        active = minutes_to_start <= 0
+        if not active and minutes_to_start > TEACHER_PREP_MINUTES:
             continue
         subject = str(window.get("subject") or "").lower()
         matching = [
             doubt for doubt in doubts
             if not subject or subject in str(doubt.get("subject") or "").lower()
         ]
+        # The one-attempt exception exists only in the immediate teacher-window
+        # context; the general dashboard must not call it teacher-ready.
+        matching = [
+            {**doubt, "readiness": "expedited"}
+            if doubt.get("readiness") == "attempting" and doubt.get("serious_attempt")
+            else doubt
+            for doubt in matching
+        ]
         if not matching:
+            continue
+        if not active:
+            decision = {
+                "phase": "prepare",
+                "interrupt": False,
+                "minutes_to_start": round(minutes_to_start, 1),
+                "minutes_left": round((window["ends_at"] - now).total_seconds() / 60, 1),
+                "reason": "prepare evidence before the teacher window opens",
+            }
+            opportunities.append({
+                "window": window, "doubts": matching, "decision": decision,
+                "current": current,
+            })
+            continue
+        # During the window, strict two-attempt doubts and one-attempt serious
+        # doubts are actionable. Brand-new/short-attempt doubts remain visible
+        # only in the advance preparation card.
+        actionable = [
+            doubt for doubt in matching if doubt.get("readiness") in ("ready", "expedited")
+        ]
+        if not actionable:
             continue
         decision = study_domain.interruption_decision(
             current_priority=int((current or {}).get("priority") or 0),
             current_interruptible=bool((current or {}).get("interruptible", True)),
             window=window, now=now,
         )
-        opportunities.append({"window": window, "doubts": matching, "decision": decision, "current": current})
+        decision["phase"] = "interrupt" if decision["interrupt"] else "open"
+        opportunities.append({"window": window, "doubts": actionable, "decision": decision, "current": current})
     return opportunities
 
 
-def teacher_event_key(window: dict[str, Any], decision: dict[str, Any]) -> str:
-    """Deduplicate opening notices separately from urgent interruptions."""
-    phase = "interrupt" if decision.get("interrupt") else "open"
-    return f"teacher:{phase}:{window['notion_page_id']}:{window['ends_at'].isoformat()}"
+def teacher_event_key(
+    window: dict[str, Any], decision: dict[str, Any],
+    doubts: list[dict[str, Any]] | None = None,
+) -> str:
+    """Deduplicate by phase and evidence set, so a newly logged doubt is seen."""
+    phase = decision.get("phase") or ("interrupt" if decision.get("interrupt") else "open")
+    evidence = ""
+    if doubts:
+        raw = "|".join(sorted(
+            f"{row.get('notion_page_id')}:{row.get('readiness')}:{row.get('valid_attempts', 0)}"
+            for row in doubts
+        ))
+        evidence = ":" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"teacher:{phase}:{window['notion_page_id']}:{window['ends_at'].isoformat()}{evidence}"
