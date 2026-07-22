@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+
+from telegram.constants import ParseMode
+
+import bot
 import message_templates
 
 
@@ -36,3 +41,23 @@ def test_insert_section_preserves_next_as_final_instruction():
     )
     result = message_templates.insert_section(card, "Risks", ["4 revisions overdue"])
     assert result.index("Risks") < result.index("Next") < result.index("Evidence date")
+
+
+def test_reply_markdown_falls_back_to_plain_text_when_parse_fails():
+    class Message:
+        def __init__(self):
+            self.calls = []
+
+        async def reply_text(self, text: str, **kwargs):
+            self.calls.append((text, kwargs))
+            if kwargs.get("parse_mode") == ParseMode.MARKDOWN:
+                raise RuntimeError("bad markdown")
+            return text
+
+    message = Message()
+    result = asyncio.run(bot._reply_markdown(message, "*broken"))
+    assert result == "*broken"
+    assert message.calls == [
+        ("*broken", {"parse_mode": ParseMode.MARKDOWN}),
+        ("*broken", {}),
+    ]

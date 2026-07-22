@@ -139,6 +139,30 @@ def _guard_scheduled(callback):
     return guarded
 
 
+async def _reply_markdown(message, text: str, **kwargs):
+    try:
+        return await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+    except Exception:
+        return await message.reply_text(text, **kwargs)
+
+
+async def _edit_markdown(message, text: str, **kwargs):
+    edit = getattr(message, "edit_text", None) or message.edit_message_text
+    try:
+        return await edit(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+    except Exception:
+        return await edit(text, **kwargs)
+
+
+async def _send_markdown(bot, chat_id: int, text: str, **kwargs):
+    try:
+        return await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, **kwargs
+        )
+    except Exception:
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+
 async def _reject_if_unauthorized(update: Update) -> bool:
     if _is_allowed(update):
         return False
@@ -1095,8 +1119,8 @@ async def _send_readiness_snapshot(
         if not reminders.claim(event):
             return False
     try:
-        await bot.send_message(
-            chat_id=chat_id, text=message_templates.exam_readiness(snapshot),
+        await _send_markdown(
+            bot, chat_id, message_templates.exam_readiness(snapshot),
             reply_markup=_readiness_markup(snapshot),
         )
     except Exception:
@@ -1143,7 +1167,8 @@ async def readiness_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 {"syllabus": syllabus},
             )
         snapshot = await asyncio.to_thread(exam_readiness.collect, exam)
-        await update.effective_message.reply_text(
+        await _reply_markdown(
+            update.effective_message,
             message_templates.exam_readiness(snapshot),
             reply_markup=_readiness_markup(snapshot),
         )
@@ -1193,7 +1218,8 @@ async def on_readiness_callback(
             else:
                 return
         snapshot = await asyncio.to_thread(exam_readiness.collect, exam)
-        await query.edit_message_text(
+        await _edit_markdown(
+            query,
             message_templates.exam_readiness(snapshot),
             reply_markup=_readiness_markup(snapshot),
         )
@@ -1541,7 +1567,7 @@ async def doubts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await _sync_domain()
     rows = study_domain.doubt_queue()
-    await update.effective_message.reply_text(message_templates.doubt_dashboard(rows))
+    await _reply_markdown(update.effective_message, message_templates.doubt_dashboard(rows))
 
 
 async def attempt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1559,7 +1585,8 @@ async def attempt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parts[0], duration_min=parts[1], approach=parts[2], stuck_point=parts[3],
             outcome=parts[4] if len(parts) > 4 and parts[4] else "Unsolved",
         )
-        await update.effective_message.reply_text(
+        await _reply_markdown(
+            update.effective_message,
             message_templates.attempt_result(result, parts[0])
         )
     except Exception as exc:
@@ -2727,9 +2754,9 @@ async def _handle_question(
         if not answer.startswith("⚠️"):
             await asyncio.to_thread(draft_store.record_qa, chat_id, question, answer)
         try:
-            await status_msg.edit_text(answer, disable_web_page_preview=True)
+            await _edit_markdown(status_msg, answer, disable_web_page_preview=True)
         except Exception:
-            await message.reply_text(answer, disable_web_page_preview=True)
+            await _reply_markdown(message, answer, disable_web_page_preview=True)
     except Exception:
         logger.exception("SQL query loop failed for question=%r", question)
         await message.reply_text(
@@ -3116,9 +3143,10 @@ async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             key = reminders.teacher_event_key(window, decision, item.get("doubts"))
             if not reminders.claim(key):
                 continue
-            await context.bot.send_message(
-                chat_id=telegram_allowed_user_id(),
-                text=message_templates.teacher_opportunity(item),
+            await _send_markdown(
+                context.bot,
+                telegram_allowed_user_id(),
+                message_templates.teacher_opportunity(item),
             )
     except Exception:
         logger.exception("teacher opportunity scan failed")
@@ -3175,7 +3203,7 @@ async def _commitment_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         drift = await asyncio.to_thread(advisor.trajectory_warnings)
         if drift:
             nudge = message_templates.insert_section(nudge, "Risks", drift)
-        await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=nudge)
+        await _send_markdown(context.bot, telegram_allowed_user_id(), nudge)
     except Exception:
         logger.exception("commitment nudge job failed")
 
