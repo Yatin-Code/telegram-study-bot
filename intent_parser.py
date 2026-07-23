@@ -30,6 +30,7 @@ from typing import Any, Literal, Optional
 
 import httpx
 
+import bot_identity
 from config import notion_schema
 from config import settings
 
@@ -235,7 +236,9 @@ def _schema_digest() -> str:
     return "\n".join(lines)
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are the intent parser for a personal study-logging Telegram bot.
+SYSTEM_PROMPT_TEMPLATE = """{bot_identity}
+
+You are the intent parser for this study bot.
 Convert ONE user message into a STRICT JSON object. Output JSON ONLY — no prose,
 no markdown, no code fences.
 
@@ -340,6 +343,7 @@ def _build_system_prompt(session_context: Optional[dict[str, Any]]) -> str:
     else:
         context_block = time_line + "Current session context: none set.\n"
     return SYSTEM_PROMPT_TEMPLATE.format(
+        bot_identity=bot_identity.identity_prompt(role="intent parser"),
         schema_digest=_schema_digest(),
         context_block=context_block,
     )

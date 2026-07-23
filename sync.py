@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -40,10 +41,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
 SYNC_META_TABLE = "sync_meta"
 
-# Gap 7: prevents concurrent sync_once() calls (scheduled loop vs write-triggered)
-# from racing on the same SQLite file. WAL mode handles reader/writer concurrency
-# at the DB level; this lock serialises the sync operations themselves.
-_sync_lock = asyncio.Lock()
+# One process-wide, thread-safe lock serialises every mirror sync.  Sync is
+# initiated by async handlers, synchronous write helpers, and the background
+# scheduler, so an asyncio.Lock would leave two of those paths unprotected.
+# RLock keeps the public sync_once() safe even when a locked wrapper calls it.
+_sync_lock = threading.RLock()
 
 DB_TABLES = {key: key for key in notion_schema.PROPERTIES_BY_DB}
 NOTION_SOURCE_KEYS = ("ledger", "doubts", "revision", "daily_plan")
@@ -210,8 +212,7 @@ def sync_once(
     db_keys: Sequence[str] | None = None,
 ) -> dict[str, int]:
     """Sync selected Notion DBs into SQLite. Returns {db_key: upserted_count}."""
-    with connect(db_path) as conn:
-        init_db(conn)
+    with _sync_lock:
         if db_keys is None:
             db_keys = tuple(
                 key for key in NOTION_SOURCE_KEYS
@@ -221,9 +222,32 @@ def sync_once(
             db_keys = tuple(key for key in db_keys if key in NOTION_SOURCE_KEYS)
         counts: dict[str, int] = {}
         for db_key in db_keys:
-            counts[db_key] = sync_database(conn, db_key)
-        conn.commit()
+            try:
+                # Keep each source database in an independent transaction.  If
+                # a fetch or upsert fails, rollback its partial mirror changes
+                # before recording the error through a brand-new connection.
+                with connect(db_path) as conn:
+                    init_db(conn)
+                    counts[db_key] = sync_database(conn, db_key)
+                    conn.commit()
+            except Exception as exc:
+                _persist_sync_error(db_path, db_key, exc)
+                raise
         return counts
+
+
+def sync_once_locked_sync(
+    *,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    db_keys: Sequence[str] | None = None,
+) -> dict[str, int]:
+    """Synchronous counterpart for write hooks and the scheduler.
+
+    sync_once() already owns the re-entrant lock; this explicit entry point
+    makes it clear that callers running outside an event loop are protected.
+    """
+    with _sync_lock:
+        return sync_once(db_path=db_path, db_keys=db_keys)
 
 
 async def sync_once_locked(
@@ -231,13 +255,11 @@ async def sync_once_locked(
     db_path: str | Path = DEFAULT_DB_PATH,
     db_keys: Sequence[str] | None = None,
 ) -> dict[str, int]:
-    """Async wrapper: acquires _sync_lock then runs sync_once in a thread."""
-    import asyncio
-    async with _sync_lock:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, lambda: sync_once(db_path=db_path, db_keys=db_keys)
-        )
+    """Run one lock-protected sync without blocking the Telegram event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: sync_once_locked_sync(db_path=db_path, db_keys=db_keys)
+    )
 
 
 def sync_database(conn: sqlite3.Connection, db_key: str) -> int:
@@ -294,8 +316,9 @@ def sync_database(conn: sqlite3.Connection, db_key: str) -> int:
             )
         _record_sync_success(conn, db_key, count)
         return count
-    except Exception as exc:
-        _record_sync_error(conn, db_key, exc)
+    except Exception:
+        # sync_once() rolls this transaction back, then persists the failure
+        # independently so the diagnostic cannot disappear with the rollback.
         raise
 
 
@@ -470,8 +493,13 @@ def scheduled_loop(
     """Simple forever loop for scheduled sync every 3-5 minutes."""
     while True:
         started = time.monotonic()
-        counts = sync_once(db_path=db_path)
-        print(f"[{_utc_now_iso()}] synced: {counts}", flush=True)
+        try:
+            counts = sync_once_locked_sync(db_path=db_path)
+            print(f"[{_utc_now_iso()}] synced: {counts}", flush=True)
+        except Exception:
+            # A transient Notion/SQLite fault must not kill the only scheduled
+            # sync worker.  sync_once has already persisted per-DB diagnostics.
+            logger.exception("scheduled sync failed")
         elapsed = time.monotonic() - started
         time.sleep(max(1, interval_seconds - int(elapsed)))
 
@@ -503,12 +531,29 @@ def _record_sync_success(conn: sqlite3.Connection, db_key: str, count: int) -> N
 def _record_sync_error(conn: sqlite3.Connection, db_key: str, exc: Exception) -> None:
     conn.execute(
         f"""
-        UPDATE {SYNC_META_TABLE}
-        SET last_error = ?
-        WHERE db_key = ?
+        INSERT INTO {SYNC_META_TABLE} (db_key, last_started_at, last_error)
+        VALUES (?, ?, ?)
+        ON CONFLICT(db_key) DO UPDATE SET
+            last_started_at = excluded.last_started_at,
+            last_error = excluded.last_error
         """,
-        (repr(exc), db_key),
+        (db_key, _utc_now_iso(), repr(exc)),
     )
+
+
+def _persist_sync_error(
+    db_path: str | Path, db_key: str, exc: Exception
+) -> None:
+    """Persist a sync failure outside the rolled-back work transaction."""
+    try:
+        with connect(db_path) as error_conn:
+            init_db(error_conn)
+            _record_sync_error(error_conn, db_key, exc)
+            error_conn.commit()
+    except Exception:
+        # Never mask the original sync failure.  The logger still gives the
+        # operator a clear signal if the mirror is too unhealthy to log it.
+        logger.exception("could not persist sync error for %s", db_key)
 
 
 def _utc_now_iso() -> str:

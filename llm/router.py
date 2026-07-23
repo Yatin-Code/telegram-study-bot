@@ -248,9 +248,13 @@ def complete(req: LLMRequest, *, _certify_route: Optional[registry.Route] = None
             quota.record_unmetered_request(
                 "eaon:legacy", req.purpose, estimated, success=True,
             )
+            try:
+                model_name = settings.llm_model()
+            except Exception:
+                model_name = "eaon-legacy"
             return LLMResponse(
                 text=text, value=value, route_id="eaon:legacy", provider="legacy",
-                model=settings.llm_model(), latency_ms=latency_ms, attempts=1,
+                model=model_name, latency_ms=latency_ms, attempts=1,
                 fallback_reason=None,
             )
         except Exception as exc:  # noqa: BLE001

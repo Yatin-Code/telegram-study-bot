@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -252,6 +253,169 @@ def _decisions(
     return {str(row["doubt_id"]): dict(row) for row in rows}
 
 
+_REVISION_RISK_POINTS = {
+    "scheduled_after_exam": 12,
+    "overdue": 9,
+    "unscheduled": 7,
+    "due_before_exam": 3,
+}
+
+
+def _chapter_label(value: Any) -> str:
+    text = str(value or "").strip()
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, list):
+            text = ", ".join(str(item) for item in decoded if item)
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", text).strip() or "(uncategorised)"
+
+
+def _chapter_key(value: Any) -> str:
+    return _chapter_label(value).lower()
+
+
+def _time_mode(days: int | None) -> tuple[str, float]:
+    if days is None:
+        return "unknown_date", 1.0
+    if days <= 1:
+        return "protect_known_marks", 1.45
+    if days <= 3:
+        return "close_open_loops", 1.3
+    if days <= 7:
+        return "prioritize_and_rehearse", 1.15
+    return "build_and_verify", 1.0
+
+
+def _strategy_priorities(
+    *,
+    exam: dict[str, Any],
+    syllabus: str,
+    doubts: list[dict[str, Any]],
+    revision: list[dict[str, Any]],
+    days: int | None,
+    db_path: str | Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+
+    def bucket(label: Any) -> dict[str, Any]:
+        shown = _chapter_label(label)
+        key = shown.lower()
+        return merged.setdefault(key, {
+            "chapter": shown,
+            "unresolved_doubts": 0,
+            "zero_attempt_doubts": 0,
+            "teacher_ready_doubts": 0,
+            "scope_uncertain": 0,
+            "revision_risks": [],
+            "mistakes": 0,
+            "marks_lost": 0.0,
+            "historical_exams": 0,
+            "blocks": 0,
+            "avg_accuracy": None,
+        })
+
+    for row in doubts:
+        label = row.get("chapter") or row.get("subject") or "(uncategorised)"
+        item = bucket(label)
+        item["unresolved_doubts"] += 1
+        if int(row.get("valid_attempts") or 0) == 0:
+            item["zero_attempt_doubts"] += 1
+        if row.get("readiness") == "ready":
+            item["teacher_ready_doubts"] += 1
+        if row.get("scope_uncertain"):
+            item["scope_uncertain"] += 1
+
+    for row in revision:
+        item = bucket(row.get("chapter_module"))
+        item["revision_risks"].append(str(row.get("exam_schedule_risk") or "unknown"))
+
+    for row in study_domain.weak_points(db_path=db_path):
+        key = _chapter_key(row.get("chapter"))
+        include = key in merged
+        if not include and syllabus:
+            include = _matches_syllabus(row, syllabus, ("chapter",))
+        if not include and not syllabus:
+            include = True
+        if not include:
+            continue
+        item = bucket(row.get("chapter"))
+        item["mistakes"] = int(row.get("mistakes") or 0)
+        item["marks_lost"] = float(row.get("marks_lost") or 0)
+        item["historical_exams"] = int(row.get("exams") or 0)
+        item["blocks"] = int(row.get("blocks") or 0)
+        item["avg_accuracy"] = (
+            round(float(row["avg_accuracy"]) * 100)
+            if row.get("avg_accuracy") is not None else None
+        )
+
+    mode, urgency = _time_mode(days)
+    priorities: list[dict[str, Any]] = []
+    for item in merged.values():
+        doubt_points = (
+            item["zero_attempt_doubts"] * 10
+            + (item["unresolved_doubts"] - item["zero_attempt_doubts"]) * 6
+            + item["teacher_ready_doubts"] * 2
+            + item["scope_uncertain"] * 2
+        )
+        revision_points = sum(
+            _REVISION_RISK_POINTS.get(risk, 1) for risk in item["revision_risks"]
+        )
+        history_points = min(
+            35.0, item["marks_lost"] * 2 + item["mistakes"] * 3
+        )
+        accuracy_points = 0.0
+        if item["blocks"] >= 2 and item["avg_accuracy"] is not None:
+            accuracy_points = max(0.0, 75 - item["avg_accuracy"]) * 0.5
+        raw_score = doubt_points + revision_points + history_points + accuracy_points
+        if raw_score <= 0:
+            continue
+        risks = set(item["revision_risks"])
+        if "scheduled_after_exam" in risks:
+            action = "Move this revision before the exam and execute the highest-loss subtopic first."
+        elif item["zero_attempt_doubts"]:
+            action = "Attempt the unresolved doubt now; escalate only with a precise stuck point."
+        elif item["teacher_ready_doubts"]:
+            action = "Use the next matching teacher window for the prepared doubt."
+        elif item["marks_lost"] or item["mistakes"]:
+            action = "Reattempt the past mistake pattern under exam timing and verify the correction."
+        elif revision_points:
+            action = "Complete the due revision and record one retrieval check."
+        else:
+            action = "Run a short timed diagnostic before allocating more revision time."
+        evidence_count = (
+            item["unresolved_doubts"] + len(item["revision_risks"])
+            + item["mistakes"] + item["blocks"]
+        )
+        confidence = "high" if evidence_count >= 6 else (
+            "medium" if evidence_count >= 3 else "low"
+        )
+        priorities.append({
+            **item,
+            "priority_score": round(raw_score * urgency, 1),
+            "urgency_multiplier": urgency,
+            "confidence": confidence,
+            "action": action,
+            "weightage_proxy": {
+                "historical_question_count": item["mistakes"],
+                "historical_marks_lost": item["marks_lost"],
+                "historical_exam_count": item["historical_exams"],
+                "basis": "recorded past-paper evidence, not official chapter weightage",
+            },
+        })
+    priorities.sort(key=lambda item: (-item["priority_score"], item["chapter"]))
+    summary = {
+        "mode": mode,
+        "days_until": days,
+        "ranked_chapters": len(priorities),
+        "top_chapter": priorities[0]["chapter"] if priorities else None,
+        "top_action": priorities[0]["action"] if priorities else None,
+        "weightage_basis": "historical exam mistakes and marks lost; official weightage is not stored",
+    }
+    return priorities, summary
+
+
 def collect(
     exam: dict[str, Any], *, now: dt.datetime | None = None,
     db_path: str | Path = DEFAULT_DB_PATH, phase: str | None = None,
@@ -348,9 +512,14 @@ def collect(
     ))
     zero_attempt = sum(1 for row in relevant if int(row.get("valid_attempts") or 0) == 0)
     teacher_ready = sum(1 for row in relevant if row.get("readiness") == "ready")
+    days = days_until(exam, now=now)
+    strategy_priorities, strategy = _strategy_priorities(
+        exam=exam, syllabus=syllabus, doubts=relevant, revision=revision,
+        days=days, db_path=db_path,
+    )
     return {
         "exam": exam, "exam_id": exam_id, "exam_day": exam_day,
-        "days_until": days_until(exam, now=now), "phase": phase or "manual",
+        "days_until": days, "phase": phase or "manual",
         "syllabus": syllabus, "syllabus_known": bool(syllabus),
         "doubts": relevant, "excluded_doubts": excluded,
         "key_points": key_points, "revision": revision,
@@ -358,6 +527,8 @@ def collect(
         "scope_uncertain_count": sum(
             1 for row in relevant if row.get("scope_uncertain")
         ),
+        "strategy_priorities": strategy_priorities,
+        "strategy": strategy,
         "collected_at": now.isoformat(), "created_plan_rows": 0,
     }
 

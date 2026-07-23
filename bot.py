@@ -34,6 +34,7 @@ from telegram.ext import (
 )
 
 import briefing
+import bot_identity
 import commitments
 import advisor
 import memory_map
@@ -68,38 +69,51 @@ _MAINTENANCE_LOCK_KEY = "_study_bot_maintenance_lock"
 _fallback_maintenance_lock: asyncio.Lock | None = None
 
 BOT_COMMANDS = [
-    BotCommand("start", "Start the bot"),
-    BotCommand("setup", "First-run setup / fill data gaps"),
-    BotCommand("help", "Get help menu"),
-    BotCommand("newsession", "Clear current study context"),
-    BotCommand("settings", "View & edit bot settings"),
-    BotCommand("memory", "See & edit what the bot remembers"),
-    BotCommand("inspect", "Inspect SQLite/Notion/context state"),
-    BotCommand("jobs", "Create & manage scheduled jobs"),
-    BotCommand("bug", "Note something that went wrong"),
-    BotCommand("health", "Show bot & mirror health status"),
-    BotCommand("goal", "Create or list measurable goals"),
-    BotCommand("remember", "Remember a commitment or preference"),
-    BotCommand("forget", "Forget a remembered item"),
-    BotCommand("exam", "Create or list exams"),
-    BotCommand("readiness", "Audit evidence for an upcoming exam"),
-    BotCommand("today", "Analyze today's Notion plan"),
-    BotCommand("next", "Show the next sequence item"),
-    BotCommand("backlog", "Show prioritized backlog"),
-    BotCommand("attempt", "Record a doubt attempt"),
-    BotCommand("doubts", "Show teacher-ready doubts"),
-    BotCommand("dismissdoubt", "Dismiss a doubt with a reason"),
-    BotCommand("resolvedoubt", "Record a doubt resolution"),
-    BotCommand("reopendoubt", "Reopen a resolved doubt"),
-    BotCommand("timetable", "Show teacher timetable"),
-    BotCommand("weak", "Show evidence-backed weak points"),
-    BotCommand("weekly", "Show weekly growth report"),
-    BotCommand("finish_exam", "Start post-exam full-paper review"),
-    BotCommand("exam_summary", "Record an exam result summary"),
-    BotCommand("question_review", "Record one exam mistake"),
-    BotCommand("complete_exam_analysis", "Close an exam analysis"),
-    BotCommand("reset", "Guarded reset of pages, data, or context"),
+    BotCommand(item.command, item.description) for item in bot_identity.COMMANDS
 ]
+
+
+def _assistant_system_prompt(chat_id: int) -> str:
+    context = session_context.context_for_parser(chat_id) or {}
+    context_text = _format_context(context)
+    return bot_identity.assistant_prompt(context_text=context_text)
+
+
+def _general_assistant_answer(text: str, chat_id: int) -> str:
+    """Answer a message that does not map to a structured bot intent."""
+    from llm import router
+
+    response = router.complete(router.LLMRequest(
+        messages=[
+            {"role": "system", "content": _assistant_system_prompt(chat_id)},
+            {"role": "user", "content": text},
+        ],
+        # Reuse the certified general-domain route pool.  The router currently
+        # certifies intent/domain/sql capabilities rather than free-form labels.
+        purpose="domain",
+        max_output_tokens=700,
+        temperature=0.2,
+    ))
+    answer = response.text.strip()
+    if answer.upper().startswith("ANSWER:"):
+        answer = answer[7:].strip()
+    if not answer:
+        raise RuntimeError("assistant returned an empty response")
+    return answer
+
+
+async def _handle_general_assistant(update: Update, text: str, chat_id: int) -> None:
+    message = update.effective_message
+    try:
+        answer = await asyncio.to_thread(_general_assistant_answer, text, chat_id)
+    except Exception:
+        logger.exception("general assistant fallback failed chat_id=%s", chat_id)
+        answer = (
+            "I can still help you log study sessions, track doubts and revision, "
+            "plan today, and review progress. Try /help for the full command list, "
+            "or ask a specific study question."
+        )
+    await _reply_markdown(message, answer, disable_web_page_preview=True)
 
 
 def _format_context(ctx: dict | None) -> str:
@@ -303,14 +317,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.effective_message.reply_text(
         "Commands:\n"
-        "/start - Start the bot\n"
-        "/help - Get help menu\n"
-        "/newsession - Clear current study context\n"
-        "/sync - Force-refresh data from Notion now\n"
-        "/settings - View & edit bot settings (times, targets, model…)\n"
-        "/memory - See & edit what I remember + what's in my context\n"
-        "/setup - Guided setup: exam dates, timetable, commitments…\n"
-        "/jobs - Scheduled jobs, e.g. /jobs every weekday at 21:00 tell me my week CY\n\n"
+        + bot_identity.command_catalog_text()
+        + "\n\n"
         "Tell me what you're studying (e.g. \"starting EB-1 physics kinematics\") "
         "and I'll remember it for logging until midnight.\n\n"
         "/goal 300 CY daily\n"
@@ -900,7 +908,8 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• SQLite: {operations['integrity']}, schema v{operations['schema_version']}, goals={operations['counts']['goals']}, backlog={operations['counts']['work_items']}",
         f"• Last sync: {last_sync}",
         f"• Context: {_format_context(ctx)}",
-        f"• Pending writes: {logging_flow.pending_count()}",
+        f"• Pending writes: {logging_flow.pending_count()} "
+        f"({logging_flow.exhausted_pending_count()} exhausted)",
         f"• Errors last 24h: {_errors_last_24h()}",
     ]
     try:
@@ -1940,8 +1949,11 @@ async def on_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def _setup_hub_view() -> tuple[str, InlineKeyboardMarkup]:
     stats = onboarding.status()
+    completed = sum(1 for s in onboarding.SECTIONS if stats.get(s["id"], {}).get("ok"))
+    total = len(onboarding.SECTIONS)
     lines = [
         "🚀 Setup — what I need to run every engine",
+        f"Progress: {completed}/{total} complete",
         "(Ledger, doubts & revision sync from Notion automatically — these "
         "are the things I can't discover myself.)",
         "",
@@ -1964,12 +1976,20 @@ def _setup_hub_view() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-def _setup_section_view(section_id: str) -> tuple[str, InlineKeyboardMarkup]:
+def _setup_section_view(section_id: str, *, mode: str = "single") -> tuple[str, InlineKeyboardMarkup]:
     section = onboarding.section_by_id(section_id)
     prompt = section["prompt"]
     if section_id == "chapters":
         prompt = onboarding.chapters_prompt()
-    lines = [section["title"], "", prompt]
+    lines = []
+    if mode == "run_all":
+        idx = onboarding.SECTION_IDS.index(section_id) + 1
+        total = len(onboarding.SECTIONS)
+        lines.append(f"Step {idx}/{total}")
+        lines.append("")
+    lines.append(section["title"])
+    lines.append("")
+    lines.append(prompt)
     if section.get("hint"):
         lines.append(section["hint"])
     lines.append("💡 Free-form? Start with `ai ` and describe — I'll work out what to do.")
@@ -1983,6 +2003,8 @@ def _setup_section_view(section_id: str) -> tuple[str, InlineKeyboardMarkup]:
     if section_id == "rhythm":
         rows.append([InlineKeyboardButton("⏰ Open reminder settings", callback_data="settings:cat:0")])
     last = []
+    if mode == "run_all" and onboarding.SECTION_IDS.index(section_id) > 0:
+        last.append(InlineKeyboardButton("◀ Back", callback_data=f"onb:back:{section_id}"))
     if section["kind"] == "loop":
         last.append(InlineKeyboardButton("Done ✅", callback_data="onb:done"))
     last.append(InlineKeyboardButton("Skip ▸", callback_data="onb:skip"))
@@ -2007,7 +2029,7 @@ async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     onboarding.clear(update.effective_chat.id)
     text, markup = await asyncio.to_thread(_setup_hub_view)
-    await update.effective_message.reply_text(text, reply_markup=markup)
+    await _reply_markdown(update.effective_message, text, reply_markup=markup)
 
 
 async def _setup_after_answer(chat_id: int, reply: str, advance_now: bool):
@@ -2016,8 +2038,12 @@ async def _setup_after_answer(chat_id: int, reply: str, advance_now: bool):
     else:
         state = onboarding.active_section(chat_id)
         nxt = state[0] if state else None
+    mode = "single"
     if nxt:
-        text, markup = await asyncio.to_thread(_setup_section_view, nxt)
+        state = onboarding.active_section(chat_id)
+        if state and state[1] == "run_all":
+            mode = "run_all"
+        text, markup = await asyncio.to_thread(_setup_section_view, nxt, mode=mode)
     else:
         text, markup = await asyncio.to_thread(_setup_hub_view)
     return reply + "\n\n" + text, markup
@@ -2037,7 +2063,7 @@ async def on_onboarding_callback(update: Update, context: ContextTypes.DEFAULT_T
             text, markup = await asyncio.to_thread(_setup_hub_view)
         elif action == "sec" and len(parts) > 2:
             onboarding.start(chat_id, parts[2], "single")
-            text, markup = await asyncio.to_thread(_setup_section_view, parts[2])
+            text, markup = await asyncio.to_thread(_setup_section_view, parts[2], mode="single")
         elif action == "runall":
             stats = await asyncio.to_thread(onboarding.status)
             first = next(
@@ -2049,16 +2075,25 @@ async def on_onboarding_callback(update: Update, context: ContextTypes.DEFAULT_T
                 text = "🎉 Everything is already set!\n\n" + text
             else:
                 onboarding.start(chat_id, first, "run_all")
-                text, markup = await asyncio.to_thread(_setup_section_view, first)
+                text, markup = await asyncio.to_thread(_setup_section_view, first, mode="run_all")
         elif action == "pick" and len(parts) > 3:
             _ok, reply, adv = await asyncio.to_thread(
                 onboarding.apply_answer, chat_id, parts[2], parts[3]
             )
             text, markup = await _setup_after_answer(chat_id, reply, adv)
+        elif action == "back" and len(parts) > 2:
+            section_id = parts[2]
+            idx = onboarding.SECTION_IDS.index(section_id) if section_id in onboarding.SECTION_IDS else 0
+            prev_idx = max(0, idx - 1)
+            prev_id = onboarding.SECTION_IDS[prev_idx]
+            onboarding.start(chat_id, prev_id, "run_all")
+            text, markup = await asyncio.to_thread(_setup_section_view, prev_id, mode="run_all")
         elif action in ("skip", "done"):
             nxt = await asyncio.to_thread(onboarding.advance, chat_id)
             if nxt:
-                text, markup = await asyncio.to_thread(_setup_section_view, nxt)
+                state = onboarding.active_section(chat_id)
+                mode = "run_all" if state and state[1] == "run_all" else "single"
+                text, markup = await asyncio.to_thread(_setup_section_view, nxt, mode=mode)
             else:
                 text, markup = await asyncio.to_thread(_setup_hub_view)
         elif action == "finish":
@@ -2072,7 +2107,7 @@ async def on_onboarding_callback(update: Update, context: ContextTypes.DEFAULT_T
         else:
             return
         try:
-            await query.edit_message_text(text, reply_markup=markup)
+            await _edit_markdown(query, text, reply_markup=markup)
         except Exception:
             pass  # "message is not modified" and similar cosmetic failures
     except Exception as exc:
@@ -2463,7 +2498,9 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text,
     )
     if not text:
-        await message.reply_text("received")
+        await message.reply_text(
+            "I currently understand text messages. Send a study question or use /help."
+        )
         return
 
     # A destructive reset confirmation has the highest routing priority.
@@ -2632,6 +2669,10 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
+    if intent.action == "unknown":
+        await _handle_general_assistant(update, text, chat_id)
+        return
+
     if intent.needs_clarification:
         q = intent.clarification_question or "Could you clarify that?"
         draft_store.set_pending_clarification(
@@ -2685,7 +2726,9 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _handle_question(update, question, intent=intent, chat_id=chat_id)
         return
 
-    await message.reply_text("received")
+    # A future parser action should degrade into a useful conversation instead
+    # of exposing an implementation acknowledgement to the user.
+    await _handle_general_assistant(update, text, chat_id)
 
 
 async def _handle_question(

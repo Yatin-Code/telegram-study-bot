@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import bot_identity
 from config import notion_schema
 from intent_parser import _extract_json, _legacy_call_model
 from config import settings
@@ -42,7 +43,10 @@ def _require_object(data: Any) -> dict[str, Any]:
 def _build_domain_prompt(kind: str, contract: str) -> str:
     import session_context
     now = session_context.local_now()
-    return f"""You extract one {kind} for a personal JEE study system.
+    identity = bot_identity.identity_prompt(role=f"{kind} parser")
+    return f"""{identity}
+
+You extract one {kind} for this JEE study system.
 Current local date/time: {now:%Y-%m-%d %H:%M} ({now:%A}). Use it to resolve
 relative dates the user states ("tomorrow", "next month", "10th august" ->
 the next 10 August from today). Return one JSON object only. Never invent a

@@ -233,6 +233,52 @@ def test_revision_after_exam_and_without_date_are_reported_as_risks(db):
     assert "after exam" in card and "no date" in card
 
 
+def test_strategy_ranks_chapters_by_mistakes_doubts_revision_and_time(db):
+    exam = create_exam(db, day="2026-07-29", syllabus="Physics: Rotation")
+    insert_mirror(
+        db, "doubts", notion_page_id="d-rotation",
+        core_concept="rolling torque sign", subject="Physics", chapter="Rotation",
+        status="Unresolved", workflow_state="New",
+    )
+    insert_mirror(
+        db, "revision", notion_page_id="r-rotation", chapter_module="Rotation",
+        subject="Physics", status="Pending", next_execution_date="2026-08-02",
+    )
+    for index in range(2):
+        operational_store.create("exam_questions", {
+            "title": f"Old mock Q{index + 1}", "exam": "old-mock",
+            "question_no": str(index + 1), "subject": "Physics",
+            "chapter": "Rotation", "failure_type": "Concept",
+            "marks_lost": 8, "operation_id": f"strategy-q-{index}",
+        }, db_path=db)
+        insert_mirror(
+            db, "ledger", notion_page_id=f"rotation-block-{index}",
+            task="Rotation timed drill", date=f"2026-07-{20 + index}",
+            subject="Physics", chapter_text="Rotation", questions_attempted=20,
+            questions_correct=10, accuracy_ratio=0.5, cognitive_yield=30,
+        )
+
+    t7 = exam_readiness.collect(
+        exam, now=dt.datetime(2026, 7, 22, 12, tzinfo=dt.timezone.utc),
+        db_path=db, phase="t7",
+    )
+    top = t7["strategy_priorities"][0]
+    assert top["chapter"] == "Rotation"
+    assert top["zero_attempt_doubts"] == 1
+    assert top["marks_lost"] == 16
+    assert "scheduled_after_exam" in top["revision_risks"]
+    assert top["avg_accuracy"] == 50
+    assert top["weightage_proxy"]["basis"].startswith("recorded past-paper")
+    assert t7["strategy"]["mode"] == "prioritize_and_rehearse"
+
+    t1 = exam_readiness.collect(
+        exam, now=dt.datetime(2026, 7, 28, 12, tzinfo=dt.timezone.utc),
+        db_path=db, phase="t1",
+    )
+    assert t1["strategy"]["mode"] == "protect_known_marks"
+    assert t1["strategy_priorities"][0]["priority_score"] > top["priority_score"]
+
+
 def test_readiness_card_stays_below_telegram_limit():
     very_long = "x" * 1000
     snapshot = {

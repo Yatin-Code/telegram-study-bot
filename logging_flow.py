@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
 WRITE_QUEUE_TABLE = "pending_writes"
+MAX_PENDING_ATTEMPTS = 5
 
 # action -> target DB key
 ACTION_DB = {
@@ -600,7 +601,9 @@ def commit_write(
             if cross_url:
                 keys.append("doubts")
             try:
-                sync.sync_once(db_path=db_path, db_keys=tuple(dict.fromkeys(keys)))
+                sync.sync_once_locked_sync(
+                    db_path=db_path, db_keys=tuple(dict.fromkeys(keys))
+                )
             except Exception:  # sync is best-effort; the write already succeeded
                 logger.exception("post-write sync failed (write already saved)")
 
@@ -628,7 +631,9 @@ def add_session_debrief_doubt(
     )
     if doubt_id:
         try:
-            sync.sync_once(db_path=db_path, db_keys=("doubts", "ledger"))
+            sync.sync_once_locked_sync(
+                db_path=db_path, db_keys=("doubts", "ledger")
+            )
         except Exception:
             logger.exception("debrief doubt sync failed (doubt already saved)")
     return doubt_id, url
@@ -640,7 +645,7 @@ def append_session_notes(
     """Block-close debrief: save key takeaways onto the ledger entry."""
     notion.update_page(ledger_page_id, {"key_points_notes": text})
     try:
-        sync.sync_once(db_path=db_path, db_keys=("ledger",))
+        sync.sync_once_locked_sync(db_path=db_path, db_keys=("ledger",))
     except Exception:
         logger.exception("debrief notes sync failed (notes already saved)")
 
@@ -694,13 +699,19 @@ def _init_queue(conn: sqlite3.Connection) -> None:
             payload_json TEXT NOT NULL,
             queued_at TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT
+            last_error TEXT,
+            exhausted INTEGER NOT NULL DEFAULT 0
         )
         """
     )
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({WRITE_QUEUE_TABLE})")}
     if "operation_id" not in cols:
         conn.execute(f"ALTER TABLE {WRITE_QUEUE_TABLE} ADD COLUMN operation_id TEXT")
+    if "exhausted" not in cols:
+        conn.execute(
+            f"ALTER TABLE {WRITE_QUEUE_TABLE} "
+            "ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{WRITE_QUEUE_TABLE}_operation_id "
         f"ON {WRITE_QUEUE_TABLE}(operation_id) WHERE operation_id IS NOT NULL"
@@ -722,7 +733,18 @@ def enqueue_pending(payload: dict[str, Any], *, db_path: str | Path = DEFAULT_DB
 def pending_count(*, db_path: str | Path = DEFAULT_DB_PATH) -> int:
     with _connect(db_path) as conn:
         _init_queue(conn)
-        return conn.execute(f"SELECT COUNT(*) AS n FROM {WRITE_QUEUE_TABLE}").fetchone()["n"]
+        return conn.execute(
+            f"SELECT COUNT(*) AS n FROM {WRITE_QUEUE_TABLE}"
+        ).fetchone()["n"]
+
+
+def exhausted_pending_count(*, db_path: str | Path = DEFAULT_DB_PATH) -> int:
+    """Queued writes retained for inspection after exhausting automatic retry."""
+    with _connect(db_path) as conn:
+        _init_queue(conn)
+        return conn.execute(
+            f"SELECT COUNT(*) AS n FROM {WRITE_QUEUE_TABLE} WHERE exhausted=1"
+        ).fetchone()["n"]
 
 
 def flush_pending(
@@ -733,12 +755,17 @@ def flush_pending(
     with _connect(db_path) as conn:
         _init_queue(conn)
         rows = conn.execute(
-            f"SELECT id, payload_json, attempts, operation_id FROM {WRITE_QUEUE_TABLE} ORDER BY id"
+            f"SELECT id, payload_json, attempts, operation_id "
+            f"FROM {WRITE_QUEUE_TABLE} "
+            "WHERE exhausted=0 AND attempts < ? ORDER BY id",
+            (MAX_PENDING_ATTEMPTS,),
         ).fetchall()
 
     for row in rows:
-        payload = json.loads(row["payload_json"])
         try:
+            payload = json.loads(row["payload_json"])
+            if not isinstance(payload, dict):
+                raise ValueError("queued payload must be a JSON object")
             operation_id = payload.get("operation_id") or row["operation_id"]
             existing = []
             if operation_id:
@@ -768,17 +795,29 @@ def flush_pending(
                 conn.commit()
             flushed += 1
         except Exception as exc:
+            next_attempt = int(row["attempts"] or 0) + 1
+            exhausted = 1 if next_attempt >= MAX_PENDING_ATTEMPTS else 0
             with _connect(db_path) as conn:
                 conn.execute(
-                    f"UPDATE {WRITE_QUEUE_TABLE} SET attempts = attempts + 1, last_error = ? WHERE id = ?",
-                    (str(exc), row["id"]),
+                    f"UPDATE {WRITE_QUEUE_TABLE} "
+                    "SET attempts = ?, last_error = ?, exhausted = ? WHERE id = ?",
+                    (next_attempt, str(exc), exhausted, row["id"]),
                 )
                 conn.commit()
-            logger.warning("flush_pending: write %s still failing: %r", row["id"], exc)
+            if exhausted:
+                logger.error(
+                    "flush_pending: write %s exhausted after %d attempts: %r",
+                    row["id"], next_attempt, exc,
+                )
+            else:
+                logger.warning(
+                    "flush_pending: write %s still failing (attempt %d/%d): %r",
+                    row["id"], next_attempt, MAX_PENDING_ATTEMPTS, exc,
+                )
 
     if flushed and sync_after:
         try:
-            sync.sync_once(db_path=db_path)
+            sync.sync_once_locked_sync(db_path=db_path)
         except Exception:
             logger.exception("post-flush sync failed")
     return {"flushed": flushed, "remaining": pending_count(db_path=db_path)}

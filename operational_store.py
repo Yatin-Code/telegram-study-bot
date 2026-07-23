@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -65,6 +66,90 @@ _RESERVED = {
 
 class OperationalStoreError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# SQL safety
+# ---------------------------------------------------------------------------
+# The `rows()` and `_rows()` helpers interpolate the WHERE clause directly.
+# Callers currently pass static strings, but a future developer could paste
+# user input. This validator rejects obviously dangerous SQL while allowing
+# the simple predicates used by the study-domain queries.
+
+_SQL_DANGEROUS_WORDS = re.compile(
+    r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|DENY|UNION|JOIN|EXEC|EXECUTE|ATTACH|DETACH|PRAGMA|VACUUM|ANALYZE|REINDEX|EXPLAIN|REPLACE|WITH)\b",
+    re.IGNORECASE,
+)
+
+# ``where`` is an internal query expression, not a user-facing SQL API.  Keep
+# the small expression language used by the domain services, and reject every
+# other character/token before it is interpolated into a SELECT statement.
+_WHERE_TOKEN_RE = re.compile(
+    r"(?:\s+|\?|'(?:''|[^'])*'|\b\d+(?:\.\d+)?\b|"
+    r"[A-Za-z_][A-Za-z0-9_]*|<=|>=|<>|!=|=|<|>|\(|\)|,|\+|-|/|%|\|\|)",
+)
+_WHERE_FUNCTIONS = {"LOWER", "UPPER", "COALESCE", "SUBSTR", "TRIM", "CAST", "DATE"}
+_WHERE_KEYWORDS = {
+    "AND", "OR", "NOT", "IN", "LIKE", "GLOB", "IS", "NULL", "BETWEEN",
+    "AS", "ESCAPE",
+}
+
+
+def _validate_where(where: str) -> str:
+    """Reject a WHERE clause that looks like it could contain injected SQL.
+
+    Allows: column names, =, !=, <, >, <=, >=, IN, NOT IN, LIKE, NOT LIKE,
+    IS, IS NOT, AND, OR, NOT, ?, quoted strings, numbers, parentheses.
+    Rejects: SQL keywords that could mutate or expand the query, comments,
+    statement terminators, and system procedures.
+    """
+    if not isinstance(where, str):
+        raise OperationalStoreError("WHERE clause must be text")
+    if not where or where.strip() == "1=1":
+        return "1=1"
+    if _SQL_DANGEROUS_WORDS.search(where) or "--" in where or "/*" in where or "*/" in where or ";" in where:
+        raise OperationalStoreError(
+            f"unsafe WHERE clause rejected: {where!r}"
+        )
+    # Tokenise the complete expression.  A failed full match catches comments,
+    # quoted identifiers, dots, NULs, and other syntax that could escape the
+    # intended expression grammar.
+    pos = 0
+    tokens: list[str] = []
+    while pos < len(where):
+        match = _WHERE_TOKEN_RE.match(where, pos)
+        if match is None:
+            raise OperationalStoreError(f"unsafe WHERE clause rejected: {where!r}")
+        token = match.group(0)
+        pos = match.end()
+        if token.isspace():
+            continue
+        tokens.append(token)
+    if not tokens:
+        raise OperationalStoreError("WHERE clause cannot be empty")
+    # Function calls are limited to deterministic scalar functions used by the
+    # mirror queries; arbitrary SQL functions/extensions are not accepted.
+    for index, token in enumerate(tokens):
+        if token.upper() in _WHERE_KEYWORDS:
+            continue
+        elif token[0].isalpha() or token[0] == "_":
+            # Bare identifiers are column names.  When followed by `(` they
+            # become a function call and must be on the small allow-list.  This
+            # still permits a column literally named `date`.
+            if (
+                index + 1 < len(tokens)
+                and tokens[index + 1] == "("
+                and token.upper() not in _WHERE_FUNCTIONS
+            ):
+                raise OperationalStoreError(f"unsafe WHERE clause rejected: {where!r}")
+            continue
+        elif token.startswith("'") or token == "?" or token[0].isdigit() or token in {
+            "(", ")", ",", "<=", ">=", "<>", "!=", "=", "<", ">", "+", "-", "/", "%", "||",
+        }:
+            continue
+        else:
+            raise OperationalStoreError(f"unsafe WHERE clause rejected: {where!r}")
+    return where
 
 
 def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -332,10 +417,41 @@ def rows(
     table = table_for(db_key)
     with connect(db_path) as conn:
         init_db(conn)
-        result = conn.execute(
-            f"SELECT * FROM {_quote(table)} WHERE {where}", tuple(params)
-        ).fetchall()
+        result = _safe_select_rows(conn, table, where, params)
     return [dict(row) for row in result]
+
+
+def _safe_select_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    where: str,
+    params: Iterable[Any] = (),
+) -> list[sqlite3.Row]:
+    """Execute a validated read against exactly one mirror table.
+
+    The WHERE expression is necessarily interpolated because this helper is
+    intentionally a small internal query DSL.  SQLite's authorizer provides a
+    second boundary: even if a future expression slips past the lexer, it
+    cannot read another table or perform a write/attach/pragma operation.
+    """
+    validated = _validate_where(where)
+    table = str(table)
+
+    def _authorizer(action: int, arg1: str | None, arg2: str | None,
+                    _db_name: str | None, _trigger: str | None) -> int:
+        if action == sqlite3.SQLITE_READ:
+            return sqlite3.SQLITE_OK if arg1 == table else sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    conn.set_authorizer(_authorizer)
+    try:
+        return conn.execute(
+            f"SELECT * FROM {_quote(table)} WHERE {validated}", tuple(params)
+        ).fetchall()
+    finally:
+        conn.set_authorizer(None)
 
 
 def _result(row: dict[str, Any]) -> dict[str, Any]:

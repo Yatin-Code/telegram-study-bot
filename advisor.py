@@ -95,7 +95,8 @@ def log_warnings(
 # ---------------------------------------------------------------------------
 
 def morning_nudge(
-    date: str | None = None, *, db_path: str | Path = DEFAULT_DB_PATH
+    date: str | None = None, *, chat_id: int | str | None = None,
+    db_path: str | Path = DEFAULT_DB_PATH,
 ) -> str | None:
     """Render the adherence report for `date`. None when nothing is trackable."""
     if date is None:
@@ -144,13 +145,28 @@ def morning_nudge(
         f"Recover {missed_titles[0]} today and log the evidence before day end."
         if missed_titles else "Repeat the same targets today."
     )
-    return message_templates.action_card(
+    card = message_templates.action_card(
         "🔴" if missed else "🟢", "Morning accountability", context=date,
         conclusion=conclusion,
         sections=(("Commitments", commitment_lines), ("Recent evidence", evidence_lines)),
         action=action,
         footer=f"Evidence date: {date} · only synced ledger records count.",
     )
+    if chat_id is not None:
+        try:
+            import learner_profile
+            profile = learner_profile.latest(chat_id, db_path=db_path) or learner_profile.refresh(
+                chat_id, as_of=date, db_path=db_path
+            )
+            hints = [
+                str(item.get("reason") or "").strip()
+                for item in (profile.get("coaching_focus") or [])[:2]
+                if str(item.get("reason") or "").strip()
+            ]
+            card = message_templates.insert_section(card, "Learner profile", hints)
+        except Exception:
+            pass
+    return card
 
 
 # ---------------------------------------------------------------------------
@@ -337,4 +353,12 @@ def memory_prompt_block(
         if prefs:
             lines.append("USER PREFERENCES (frame advice around these; they are not data):")
             lines.extend(f"- {p['text']}" for p in prefs)
+        try:
+            import learner_profile
+            profile_block = learner_profile.prompt_block(chat_id, db_path=db_path)
+            if profile_block:
+                lines.append(profile_block)
+        except Exception:
+            # Personalisation is advisory; it must never break a data answer.
+            pass
     return "\n".join(lines)

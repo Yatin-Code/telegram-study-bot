@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+import bot_identity
 import sql_tool
 import session_context
 from config import settings
@@ -54,6 +55,11 @@ REQUEST_TIMEOUT = 45.0
 # answer_question is called without an explicit max_iterations.
 MAX_ITERATIONS = 12
 MAX_ROWS_FEEDBACK = 40
+
+# Prefix for error responses from answer_question.  Callers should check
+# startswith(ANSWER_ERROR_PREFIX) rather than matching the emoji prefix,
+# so that valid answers containing ⚠️ are not misclassified as errors.
+ANSWER_ERROR_PREFIX = "⚠️ Answer unavailable: "
 
 # Regex to pull a fenced ```sql ... ``` block (or plain SQL) out of the
 # model's response, so we tolerate a bit of prose around it.
@@ -107,7 +113,9 @@ def _active_filter_error(sql: str, user_question: str) -> str | None:
     return None
 
 
-SYSTEM_PROMPT = """You are the data analyst for a personal study-logging Telegram bot.
+SYSTEM_PROMPT = """{bot_identity}
+
+You are the data analyst for this study bot.
 
 The user's study data lives in a local SQLite mirror with the tables listed below. You
 write SQL to answer their questions, and the system executes it read-only
@@ -194,6 +202,7 @@ def _build_system_prompt(
     except Exception:
         now_block = ""
     prompt = SYSTEM_PROMPT.format(
+        bot_identity=bot_identity.identity_prompt(role="study-data SQL analyst"),
         max_iter=MAX_ITERATIONS,
         local_date=session_context.local_today_iso(),
         now_block=now_block,
@@ -401,7 +410,9 @@ def answer_question(
     for live progress display. `kind` is one of "sql", "result", "retry",
     "answer"; `detail` is a short human string. Callback errors are swallowed.
 
-    On any LLM failure, falls back to a short message noting the issue.
+    On any LLM failure, returns a string starting with ANSWER_ERROR_PREFIX.
+    Callers should check startswith(ANSWER_ERROR_PREFIX) rather than matching
+    the emoji prefix, so that valid answers containing ⚠️ are not misclassified.
     """
     if db_path is None:
         db_path = sql_tool.DEFAULT_DB_PATH
@@ -435,7 +446,7 @@ def answer_question(
             raw = _call_llm(messages)
         except Exception as e:
             logger.exception("SQL loop LLM call failed on iteration %d", iteration)
-            return f"⚠️ I couldn't reach the LLM to answer that: {e}"
+            return f"{ANSWER_ERROR_PREFIX}{e}"
 
         messages.append({"role": "assistant", "content": raw})
 

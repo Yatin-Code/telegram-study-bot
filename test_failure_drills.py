@@ -51,6 +51,9 @@ def test_answer_loop_llm_dead_is_honest(db, monkeypatch):
 
 def test_llm_retries_transient_then_succeeds(db, monkeypatch):
     force_legacy(monkeypatch)
+    # Legacy path needs LLM_PROVIDER / LLM_MODEL; set dummies so CI passes.
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
     calls = {"n": 0}
     def flaky(client, model, messages):
         calls["n"] += 1
@@ -67,6 +70,8 @@ def test_llm_retries_transient_then_succeeds(db, monkeypatch):
 
 def test_intent_parse_llm_dead_raises_cleanly(monkeypatch):
     force_legacy(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
     def boom(*a, **k):
         raise httpx.ConnectError("gateway unreachable")
     monkeypatch.setattr(intent_parser, "_legacy_call_model", boom)
@@ -93,6 +98,9 @@ def test_notion_down_queues_then_flushes(db, monkeypatch):
         created.append((db_key, props))
         return {"id": "page-1", "url": "https://notion/x"}
     monkeypatch.setattr(logging_flow.notion, "create_page", notion_up)
+    # flush_pending dedups by operation_id via query_database BEFORE calling
+    # create_page — patch that too so CI (no Notion DB IDs) doesn't fail here.
+    monkeypatch.setattr(logging_flow.notion, "query_database", lambda *a, **k: [])
     monkeypatch.setattr(logging_flow.sync, "sync_once", lambda *a, **k: {})
     flushed = logging_flow.flush_pending(db_path=db, sync_after=False)
     assert flushed  # non-empty flush result

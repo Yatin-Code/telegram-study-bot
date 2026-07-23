@@ -62,9 +62,9 @@ def _rows(db_key: str, where: str = "1=1", params: Iterable[Any] = (), *, db_pat
     if operational_store.is_operational(db_key):
         return operational_store.rows(db_key, where, params, db_path=db_path)
     with _connect(db_path) as conn:
-        return [dict(r) for r in conn.execute(
-            f'SELECT * FROM "{db_key}" WHERE {where}', tuple(params)
-        ).fetchall()]
+        return [dict(r) for r in operational_store._safe_select_rows(
+            conn, db_key, where, params
+        )]
 
 
 def _row(db_key: str, where: str, params: Iterable[Any] = (), *, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any] | None:
@@ -80,7 +80,7 @@ def _sync(keys: Iterable[str], db_path: str | Path = DEFAULT_DB_PATH) -> None:
     if not notion_keys:
         return
     try:
-        sync.sync_once(db_path=db_path, db_keys=notion_keys)
+        sync.sync_once_locked_sync(db_path=db_path, db_keys=notion_keys)
     except Exception:
         # A successful Notion write remains durable; the normal mirror job will
         # catch up. Callers surface the write result, not a misleading failure.
@@ -966,6 +966,51 @@ def _goal_planned_value(goal: dict[str, Any], items: list[dict[str, Any]]) -> fl
     return None
 
 
+_ACTIVE_PLAN_STATUSES = {"", "planned", "active"}
+
+
+def _plan_item_is_active(row: dict[str, Any]) -> bool:
+    return str(row.get("status") or "").strip().lower() in _ACTIVE_PLAN_STATUSES
+
+
+def _chapter_key(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _linked_plan_work_item(
+    item: dict[str, Any], *, db_path: str | Path
+) -> dict[str, Any] | None:
+    work_id = _relation_id(item.get("work_item"))
+    if not work_id:
+        marker = re.search(
+            r"SQLite work item:\s*([A-Za-z0-9-]+)",
+            str(item.get("planner_note") or ""),
+            re.IGNORECASE,
+        )
+        work_id = marker.group(1) if marker else None
+    if not work_id:
+        return None
+    return _row("work_items", "notion_page_id=?", (work_id,), db_path=db_path)
+
+
+def _planned_revision_keys(
+    items: list[dict[str, Any]], *, db_path: str | Path
+) -> set[str]:
+    """Exact chapter evidence represented by active plan items."""
+    keys: set[str] = set()
+    for item in items:
+        title = _chapter_key(item.get("title"))
+        if title:
+            keys.add(title)
+        linked = _linked_plan_work_item(item, db_path=db_path)
+        if linked:
+            for field in ("chapter", "title"):
+                key = _chapter_key(linked.get(field))
+                if key:
+                    keys.add(key)
+    return keys
+
+
 def plan_facts(plan_date: str | None = None, *, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
     plan_date = (plan_date or session_context.local_today_iso())[:10]
     items = sorted(
@@ -985,40 +1030,86 @@ def plan_facts(plan_date: str | None = None, *, db_path: str | Path = DEFAULT_DB
         "archived=0 AND next_execution_date IS NOT NULL AND substr(next_execution_date,1,10) <= ?",
         (plan_date,), db_path=db_path,
     )
-    expected_cy = sum(float(row.get("expected_cy") or 0) for row in items)
-    planned_minutes = sum(float(row.get("estimated_min") or 0) for row in items)
+    active_items = [row for row in items if _plan_item_is_active(row)]
+    expected_cy = sum(float(row.get("expected_cy") or 0) for row in active_items)
+    planned_minutes = sum(float(row.get("estimated_min") or 0) for row in active_items)
     warnings: list[str] = []
     errors: list[str] = []
-    if any(row.get("sequence") is None for row in items):
-        errors.append("one or more plan items have no sequence number")
+    signals: list[dict[str, Any]] = []
+
+    def add_signal(
+        code: str, severity: str, message: str, **evidence: Any
+    ) -> None:
+        signals.append({
+            "code": code,
+            "severity": severity,
+            "message": message,
+            "evidence": evidence,
+        })
+        (errors if severity == "error" else warnings).append(message)
+
+    missing_sequence = [row for row in active_items if row.get("sequence") is None]
+    if missing_sequence:
+        add_signal(
+            "missing_sequence", "error",
+            "one or more plan items have no sequence number",
+            count=len(missing_sequence),
+            items=[row.get("title") for row in missing_sequence],
+        )
     seen: set[int] = set()
-    for row in items:
+    duplicate_sequences: set[int] = set()
+    for row in active_items:
         seq = row.get("sequence")
         if seq is not None and int(seq) in seen:
-            errors.append(f"duplicate sequence {int(seq)}")
+            duplicate_sequences.add(int(seq))
         if seq is not None:
             seen.add(int(seq))
+    for seq in sorted(duplicate_sequences):
+        add_signal(
+            "duplicate_sequence", "error", f"duplicate sequence {seq}",
+            sequence=seq,
+        )
     pace = adaptive_target(today=plan_date, db_path=db_path)
     if expected_cy > pace["ceiling"]:
-        errors.append(f"expected CY {expected_cy:g} exceeds ceiling {pace['ceiling']}")
+        add_signal(
+            "capacity_exceeded", "error",
+            f"expected CY {expected_cy:g} exceeds ceiling {pace['ceiling']}",
+            expected_cy=expected_cy, ceiling=pace["ceiling"],
+        )
     elif expected_cy < pace["target"]:
-        warnings.append(f"expected CY {expected_cy:g} is below adaptive target {pace['target']}")
+        add_signal(
+            "below_adaptive_target", "warning",
+            f"expected CY {expected_cy:g} is below adaptive target {pace['target']}",
+            expected_cy=expected_cy, target=pace["target"],
+        )
+    missing_revision: list[dict[str, Any]] = []
     if due_revision:
-        planned_chapters = " ".join(str(row.get("title") or "") for row in items).lower()
-        missing = [row.get("chapter_module") for row in due_revision if str(row.get("chapter_module") or "").lower() not in planned_chapters]
-        if missing:
-            warnings.append(f"{len(missing)} overdue revision item(s) are not in the plan")
+        planned_chapters = _planned_revision_keys(active_items, db_path=db_path)
+        missing_revision = [
+            row for row in due_revision
+            if _chapter_key(row.get("chapter_module")) not in planned_chapters
+        ]
+        if missing_revision:
+            add_signal(
+                "overdue_revision_unplanned", "warning",
+                f"{len(missing_revision)} overdue revision item(s) are not in the plan",
+                count=len(missing_revision),
+                chapters=[row.get("chapter_module") for row in missing_revision],
+            )
     planned_work_ids = {
-        relation_id for relation_id in (_relation_id(row.get("work_item")) for row in items)
+        relation_id for relation_id in (_relation_id(row.get("work_item")) for row in active_items)
         if relation_id
     }
     unplanned_backlog = [
         row for row in backlog if row.get("notion_page_id") not in planned_work_ids
     ]
-    has_backlog_block = any(row.get("kind") == "Backlog" for row in items)
+    has_backlog_block = any(row.get("kind") == "Backlog" for row in active_items)
     if unplanned_backlog and not has_backlog_block:
-        warnings.append(
-            f"{len(unplanned_backlog)} backlog item(s) exist but no backlog work is linked to the plan"
+        add_signal(
+            "backlog_unplanned", "warning",
+            f"{len(unplanned_backlog)} backlog item(s) exist but no backlog work is linked to the plan",
+            count=len(unplanned_backlog),
+            items=[row.get("title") for row in unplanned_backlog],
         )
 
     def homework_is_current(row: dict[str, Any]) -> bool:
@@ -1033,8 +1124,11 @@ def plan_facts(plan_date: str | None = None, *, db_path: str | Path = DEFAULT_DB
         if row.get("notion_page_id") not in planned_work_ids
     ]
     if unplanned_homework:
-        warnings.append(
-            f"{len(unplanned_homework)} current coaching homework item(s) are not linked to the plan"
+        add_signal(
+            "homework_unplanned", "warning",
+            f"{len(unplanned_homework)} current coaching homework item(s) are not linked to the plan",
+            count=len(unplanned_homework),
+            items=[row.get("title") for row in unplanned_homework],
         )
     active_goal_gaps: list[dict[str, Any]] = []
     unverifiable_goals: list[str] = []
@@ -1043,27 +1137,38 @@ def plan_facts(plan_date: str | None = None, *, db_path: str | Path = DEFAULT_DB
         if period != "Daily":
             continue
         target = float(goal.get("target") or 0)
-        planned = _goal_planned_value(goal, items)
+        planned = _goal_planned_value(goal, active_items)
         if planned is None:
             unverifiable_goals.append(str(goal.get("title") or "Untitled goal"))
         elif planned < target:
             active_goal_gaps.append({"goal": goal.get("title"), "target": target, "planned": planned})
     if active_goal_gaps:
-        warnings.append(f"{len(active_goal_gaps)} active daily goal(s) are not covered")
+        add_signal(
+            "active_goal_gap", "warning",
+            f"{len(active_goal_gaps)} active daily goal(s) are not covered",
+            count=len(active_goal_gaps), gaps=active_goal_gaps,
+        )
     if unverifiable_goals:
-        warnings.append(
-            f"{len(unverifiable_goals)} daily goal(s) need a measurable CY, duration, or block metric"
+        add_signal(
+            "goal_unverifiable", "warning",
+            f"{len(unverifiable_goals)} daily goal(s) need a measurable CY, duration, or block metric",
+            count=len(unverifiable_goals), goals=unverifiable_goals,
         )
     return {
-        "plan_date": plan_date, "items": items, "expected_cy": expected_cy,
+        "plan_date": plan_date, "items": items, "active_items": active_items,
+        "expected_cy": expected_cy,
         "planned_minutes": planned_minutes, "backlog_count": len(backlog),
         "unplanned_backlog_count": len(unplanned_backlog),
         "homework_pending_count": len(current_homework),
         "homework_planned_count": len(current_homework) - len(unplanned_homework),
         "capacity_headroom_cy": max(0, pace["ceiling"] - expected_cy),
-        "due_revision_count": len(due_revision), "active_goal_gaps": active_goal_gaps,
+        "due_revision_count": len(due_revision),
+        "missing_revision_count": len(missing_revision),
+        "active_goal_gaps": active_goal_gaps,
         "unverifiable_goals": unverifiable_goals,
-        "warnings": warnings, "errors": errors,
+        "warnings": warnings, "errors": errors, "signals": signals,
+        "structured_warnings": [s for s in signals if s["severity"] == "warning"],
+        "structured_errors": [s for s in signals if s["severity"] == "error"],
         "pace": pace,
         "outcome": "blocked" if errors else ("needs_adjustment" if warnings else "ready"),
         "iterations": min(3, 1 + len(errors)),
