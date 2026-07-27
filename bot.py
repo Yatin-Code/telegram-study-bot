@@ -752,7 +752,7 @@ def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboard
         "daily_plan": ("title", ["plan_date", "sequence", "title", "status"]),
         "goals": ("title", ["title", "target", "metric", "period", "status"]),
         "work_items": ("title", ["title", "kind", "priority", "status"]),
-        "exams": ("exam_name", ["exam_date", "exam_name", "maximum_marks", "target_marks"]),
+        "exams": ("title", ["exam_date", "title", "kind", "status", "max_marks", "actual_marks"]),
         "timetable": ("title", ["weekday", "start_time", "end_time", "title", "subject"]),
     }
     
@@ -767,7 +767,8 @@ def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboard
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f'SELECT * FROM "{table}" WHERE archived=0 ORDER BY last_edited_time DESC LIMIT ?',
+            f'SELECT * FROM "{table}" WHERE archived=0 '
+            f'ORDER BY COALESCE(last_edited_time, created_time, last_synced_at) DESC LIMIT ?',
             (limit,)
         ).fetchall()
         conn.close()
