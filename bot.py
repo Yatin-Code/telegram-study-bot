@@ -33,6 +33,8 @@ from telegram.ext import (
     filters,
 )
 
+import agent
+import agent_renderer
 import briefing
 import bot_identity
 import commitments
@@ -76,7 +78,16 @@ BOT_COMMANDS = [
 def _assistant_system_prompt(chat_id: int) -> str:
     context = session_context.context_for_parser(chat_id) or {}
     context_text = _format_context(context)
-    return bot_identity.assistant_prompt(context_text=context_text)
+    import actions
+    identity = actions.identity_with_actions(role="conversational fallback", context="any")
+    return f"""{identity}
+
+Current study context: {context_text}
+
+Answer normal study questions, explain strategy, explain what the bot can do,
+and guide the user to the right command. Keep the response concise and suitable
+for Telegram. Do not emit a fake success acknowledgement for an action that was
+not actually executed."""
 
 
 def _general_assistant_answer(text: str, chat_id: int) -> str:
@@ -153,7 +164,52 @@ def _guard_scheduled(callback):
     return guarded
 
 
+def _bot_token_from(message_or_bot) -> str | None:
+    """Extract a bot token from a Message, Bot, or env. None if unavailable."""
+    get_bot = getattr(message_or_bot, "get_bot", None)
+    if callable(get_bot):
+        try:
+            bot = get_bot()
+            token = getattr(bot, "token", None)
+            if token:
+                return token
+        except Exception:
+            pass
+    token = getattr(message_or_bot, "token", None)
+    if token:
+        return token
+    try:
+        return telegram_bot_token()
+    except Exception:
+        return None
+
+
+def _chat_id_from(message) -> int | None:
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is not None:
+        return chat_id
+    chat = getattr(message, "chat", None)
+    if chat is not None:
+        return getattr(chat, "id", None)
+    return None
+
+
 async def _reply_markdown(message, text: str, **kwargs):
+    import rich_message
+
+    token = _bot_token_from(message)
+    chat_id = _chat_id_from(message)
+    if token and chat_id is not None:
+        try:
+            return await rich_message.send_rich(
+                token, chat_id, text,
+                parse_mode="markdown",
+                reply_to_message_id=getattr(message, "message_id", None),
+                reply_markup=kwargs.get("reply_markup"),
+                disable_web_page_preview=kwargs.get("disable_web_page_preview"),
+            )
+        except Exception:
+            logger.exception("rich reply failed; falling back to plain reply_text")
     try:
         return await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
     except Exception:
@@ -161,6 +217,21 @@ async def _reply_markdown(message, text: str, **kwargs):
 
 
 async def _edit_markdown(message, text: str, **kwargs):
+    import rich_message
+
+    token = _bot_token_from(message)
+    chat_id = _chat_id_from(message)
+    message_id = getattr(message, "message_id", None)
+    if token and chat_id is not None and message_id is not None:
+        try:
+            return await rich_message.edit_rich(
+                token, chat_id, message_id, text,
+                parse_mode="markdown",
+                reply_markup=kwargs.get("reply_markup"),
+                disable_web_page_preview=kwargs.get("disable_web_page_preview"),
+            )
+        except Exception:
+            logger.exception("rich edit failed; falling back to plain edit_text")
     edit = getattr(message, "edit_text", None) or message.edit_message_text
     try:
         return await edit(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
@@ -169,6 +240,19 @@ async def _edit_markdown(message, text: str, **kwargs):
 
 
 async def _send_markdown(bot, chat_id: int, text: str, **kwargs):
+    import rich_message
+
+    token = _bot_token_from(bot)
+    if token:
+        try:
+            return await rich_message.send_rich(
+                token, chat_id, text,
+                parse_mode="markdown",
+                reply_markup=kwargs.get("reply_markup"),
+                disable_web_page_preview=kwargs.get("disable_web_page_preview"),
+            )
+        except Exception:
+            logger.exception("rich send failed; falling back to plain send_message")
     try:
         return await bot.send_message(
             chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, **kwargs
@@ -316,27 +400,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if await _reject_if_unauthorized(update):
         return
     await update.effective_message.reply_text(
-        "Commands:\n"
-        + bot_identity.command_catalog_text()
-        + "\n\n"
-        "Tell me what you're studying (e.g. \"starting EB-1 physics kinematics\") "
-        "and I'll remember it for logging until midnight.\n\n"
-        "/goal 300 CY daily\n"
-        "/remember from now on I'll do PYQs every day\n"
-        "/forget <commitment title or preference text>\n"
-        "/exam JEE Main mock on 2026-08-15\n"
-        "/readiness [exam] — audit doubts, revision and last-7-day key points\n"
-        "/readiness exam | syllabus — save scope and rerun the audit\n"
-        "/today /next /backlog /weak /weekly\n"
-        "/backlog add title | kind | subject | due date | priority | minutes\n"
-        "/timetable add title | weekday | start | end | kind | subject | teacher | location | questions yes/no\n"
-        "/timetable doubts on <class title>\n"
-        "/attempt doubt title | minutes | approach | stuck point | outcome\n"
-        "/resolvedoubt doubt title | resolution | teacher(optional)\n"
-        "/finish_exam exam name\n"
-        "/exam_summary exam | marks | attempted | correct | incorrect | unattempted\n"
-        "/question_review exam | qno | subject | chapter | failure type | root cause\n"
-        "/reset — guarded page/data/context reset with typed confirmation"
+        "Commands (slash optional — you can also just say it in plain English):\n\n"
+        "NL-friendly — just say it naturally:\n"
+        "/newsession  /sync  /goal  /remember  /forget\n"
+        "/exam  /readiness  /today  /next  /backlog  /weak  /weekly\n"
+        "/attempt  /doubts  /dismissdoubt  /resolvedoubt  /reopendoubt\n"
+        "/timetable  /jobs  /exam_summary  /question_review\n"
+        "/finish_exam  /complete_exam_analysis\n"
+        "/memory  /inspect  /health\n\n"
+        "Interactive UI (use slash for full wizard):\n"
+        "/start  /help  /setup  /settings  /bug  /bugs  /reset\n"
     )
 
 
@@ -1485,32 +1558,49 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await _sync_domain()
         facts = await asyncio.to_thread(planner.analyze)
-        lines = [f"Plan {facts['plan_date']}: {facts['outcome']}",
-                 f"Expected CY: {facts['expected_cy']:g}",
-                 f"Adaptive target: {facts['pace']['target']} ({facts['pace']['phase']})",
-                 f"Planned minutes: {facts['planned_minutes']:g}",
-                 f"CY headroom: {facts['capacity_headroom_cy']:g}",
-                 f"Coaching homework: {facts['homework_planned_count']}/{facts['homework_pending_count']} planned",
-                 f"Backlog: {facts['backlog_count']} tracked, {facts['unplanned_backlog_count']} unplanned"]
+        lines = [
+            f"*Plan {facts['plan_date']}: {facts['outcome']}*",
+            f"Expected CY: `{facts['expected_cy']:g}`",
+            f"Adaptive target: `{facts['pace']['target']}` ({facts['pace']['phase']})",
+            f"Planned minutes: `{facts['planned_minutes']:g}`",
+            f"CY headroom: `{facts['capacity_headroom_cy']:g}`",
+            f"Coaching homework: `{facts['homework_planned_count']}/{facts['homework_pending_count']}` planned",
+            f"Backlog: `{facts['backlog_count']}` tracked, `{facts['unplanned_backlog_count']}` unplanned",
+            "",
+        ]
         for row in facts["items"]:
-            lines.append(f"{int(row.get('sequence') or 0)}. {row.get('title')} [{row.get('status') or 'Planned'}]")
-        lines.extend(f"Warning: {w}" for w in facts["warnings"])
-        lines.extend(f"Blocked: {e}" for e in facts["errors"])
-        for s in facts.get("suggestions", []):
-            line = f"Suggestion: {s.get('action')} — {s.get('reason')}"
-            if s.get("kind") == "goal" and s.get("goal"):
-                try:
-                    row = next(
-                        (g for g in commitments.active_daily_goals()
-                         if str(g.get("title")) == str(s["goal"])), None,
-                    )
-                    days = commitments.streak(row["notion_page_id"]) if row and row.get("notion_page_id") else 0
-                    if days:
-                        line += f" ({days}-day streak at risk)"
-                except Exception:
-                    pass
-            lines.append(line)
-        await update.effective_message.reply_text("\n".join(lines) or "No Notion plan items found for today.")
+            lines.append(
+                f"{int(row.get('sequence') or 0)}. {row.get('title')} "
+                f"[{row.get('status') or 'Planned'}]"
+            )
+        if facts["warnings"]:
+            lines.append("")
+            lines.extend(f"⚠️ {w}" for w in facts["warnings"])
+        if facts["errors"]:
+            lines.append("")
+            lines.extend(f"🚫 {e}" for e in facts["errors"])
+        suggestions = facts.get("suggestions", [])
+        if suggestions:
+            lines.append("")
+            lines.append("*Suggestions:*")
+            for s in suggestions:
+                line = f"• {s.get('action')} — {s.get('reason')}"
+                if s.get("kind") == "goal" and s.get("goal"):
+                    try:
+                        row = next(
+                            (g for g in commitments.active_daily_goals()
+                             if str(g.get("title")) == str(s["goal"])), None,
+                        )
+                        days = commitments.streak(row["notion_page_id"]) if row and row.get("notion_page_id") else 0
+                        if days:
+                            line += f" ({days}-day streak at risk)"
+                    except Exception:
+                        pass
+                lines.append(line)
+        await _reply_markdown(
+            update.effective_message,
+            "\n".join(lines) or "No Notion plan items found for today.",
+        )
     except Exception as exc:
         await update.effective_message.reply_text(f"Plan analysis unavailable: {exc}")
 
@@ -1627,12 +1717,58 @@ async def resolve_doubt_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     try:
         teacher = len(parts) > 2 and parts[2].lower() in ("teacher", "yes", "true")
-        result = await asyncio.to_thread(
-            study_domain.resolve_doubt, parts[0], parts[1], teacher_asked=teacher
+        doubt_title = parts[0]
+        resolution = parts[1]
+        doubt = await asyncio.to_thread(study_domain._title_match, "doubts", doubt_title)
+        if not doubt:
+            await update.effective_message.reply_text(f"No doubt matches {doubt_title!r}")
+            return
+        doubt_id = str(doubt["notion_page_id"])
+        attempts = await asyncio.to_thread(study_domain._attempt_rows, doubt_id)
+        valid_attempts = sum(1 for a in attempts if a.get("valid"))
+        if teacher and valid_attempts < 2:
+            await update.effective_message.reply_text(
+                "Teacher escalation requires two valid attempts first."
+            )
+            return
+        verification = await asyncio.to_thread(
+            _generate_verification_question, doubt_title, resolution, doubt
         )
-        await update.effective_message.reply_text(f"Doubt closed as {result['workflow_state']}.")
+        draft_store.set_pending_doubt_resolution(
+            update.effective_chat.id, doubt_id, doubt_title,
+            resolution, teacher, verification,
+        )
+        await update.effective_message.reply_text(
+            f"Before I mark this as solved, verify you really understand:\n\n"
+            f"{verification}\n\n"
+            f"_Reply with your answer, or type 'skip' to resolve without verification._"
+        )
     except Exception as exc:
         await update.effective_message.reply_text(f"Doubt was not closed: {exc}")
+
+
+def _generate_verification_question(
+    doubt_title: str, resolution: str, doubt: dict
+) -> str:
+    try:
+        from llm import router
+        prompt = (
+            f"The user claims to have resolved this doubt: '{doubt_title}'.\n"
+            f"Their resolution: '{resolution}'.\n"
+            f"Generate ONE short verification question that tests whether they "
+            f"truly understand the concept. The question should be answerable in "
+            f"one sentence. Return only the question, no preamble."
+        )
+        response = router.complete(router.LLMRequest(
+            messages=[{"role": "user", "content": prompt}],
+            purpose="domain", max_output_tokens=200, temperature=0.3,
+        ))
+        return response.text.strip()
+    except Exception:
+        return (
+            f"In your own words, explain the key insight that resolved "
+            f"'{doubt_title}'. What was the core misunderstanding?"
+        )
 
 
 async def reopen_doubt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1729,27 +1865,28 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     correct = ledger.get("correct") or 0
     accuracy = (100 * correct / attempted) if attempted else None
     lines = [
-        f"Weekly growth ({report['start']} to {report['end']})",
-        f"CY: {ledger.get('cy', 0):g} | blocks: {ledger.get('blocks', 0)}",
-        f"CY change vs previous week: {report['cy_delta']:+g}",
-        f"Accuracy: {accuracy:.1f}%" if accuracy is not None else "Accuracy: no complete data",
-        f"Completed work: {report['completed_work']}",
-        f"Backlog: {report['backlog']}",
-        f"Valid doubt attempts: {report['valid_doubt_attempts']}",
-        f"Exam mistakes reviewed: {report['exam_mistakes']['n']}",
+        f"*Weekly growth ({report['start']} → {report['end']})*",
+        f"CY: `{ledger.get('cy', 0):g}` | blocks: `{ledger.get('blocks', 0)}`",
+        f"CY change vs previous week: `{report['cy_delta']:+g}`",
+        f"Accuracy: `{accuracy:.1f}%`" if accuracy is not None else "Accuracy: no complete data",
+        f"Completed work: `{report['completed_work']}`",
+        f"Backlog: `{report['backlog']}`",
+        f"Valid doubt attempts: `{report['valid_doubt_attempts']}`",
+        f"Exam mistakes reviewed: `{report['exam_mistakes']['n']}`",
     ]
     if report.get("top_failure"):
         lines.append(
-            f"Main repair target: {report['top_failure']['failure_type']} "
+            f"Main repair target: `{report['top_failure']['failure_type']}` "
             f"({report['top_failure']['n']} reviewed mistake(s))"
         )
+    lines.append("")
     if report["cy_delta"] > 0:
-        lines.append("Growth signal: output increased. Protect the accuracy that produced it.")
+        lines.append("📈 Growth signal: output increased. Protect the accuracy that produced it.")
     elif ledger.get("blocks", 0):
-        lines.append("Growth signal: keep the next week focused on completion and repeated-error removal.")
+        lines.append("📊 Growth signal: keep the next week focused on completion and repeated-error removal.")
     else:
-        lines.append("Growth signal: complete data from the next block will establish the baseline.")
-    await update.effective_message.reply_text("\n".join(lines))
+        lines.append("📊 Growth signal: complete data from the next block will establish the baseline.")
+    await _reply_markdown(update.effective_message, "\n".join(lines))
 
 
 async def finish_exam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1952,16 +2089,16 @@ def _setup_hub_view() -> tuple[str, InlineKeyboardMarkup]:
     completed = sum(1 for s in onboarding.SECTIONS if stats.get(s["id"], {}).get("ok"))
     total = len(onboarding.SECTIONS)
     lines = [
-        "🚀 Setup — what I need to run every engine",
-        f"Progress: {completed}/{total} complete",
-        "(Ledger, doubts & revision sync from Notion automatically — these "
-        "are the things I can't discover myself.)",
+        "*🚀 Setup — what I need to run every engine*",
+        f"Progress: `{completed}/{total}` complete",
+        "_Ledger, doubts & revision sync from Notion automatically — these "
+        "are the things I can't discover myself._",
         "",
     ]
     for section in onboarding.SECTIONS:
         st = stats.get(section["id"], {"ok": False, "detail": ""})
         mark = "✅" if st["ok"] else "⚠️"
-        lines.append(f"{mark} {section['title']} — {st['detail']}")
+        lines.append(f"{mark} *{section['title']}* — {st['detail']}")
     lines.append("")
     lines.append("Tap a section to fill it, or run everything in order.")
     sec_buttons = [
@@ -1981,17 +2118,23 @@ def _setup_section_view(section_id: str, *, mode: str = "single") -> tuple[str, 
     prompt = section["prompt"]
     if section_id == "chapters":
         prompt = onboarding.chapters_prompt()
+    try:
+        personalized = onboarding.personalized_prompt(section_id)
+        if personalized and personalized != prompt:
+            prompt = personalized
+    except Exception:
+        pass
     lines = []
     if mode == "run_all":
         idx = onboarding.SECTION_IDS.index(section_id) + 1
         total = len(onboarding.SECTIONS)
-        lines.append(f"Step {idx}/{total}")
+        lines.append(f"*Step {idx}/{total}*")
         lines.append("")
-    lines.append(section["title"])
+    lines.append(f"*{section['title']}*")
     lines.append("")
     lines.append(prompt)
     if section.get("hint"):
-        lines.append(section["hint"])
+        lines.append(f"_{section['hint']}_")
     lines.append("💡 Free-form? Start with `ai ` and describe — I'll work out what to do.")
     rows: list[list[InlineKeyboardButton]] = []
     if section["kind"] == "buttons":
@@ -2015,10 +2158,10 @@ def _setup_section_view(section_id: str, *, mode: str = "single") -> tuple[str, 
 
 def _setup_finish_summary() -> str:
     stats = onboarding.status()
-    lines = ["🎉 Setup done — here's where you stand:", ""]
+    lines = ["*🎉 Setup done — here's where you stand:*", ""]
     for section in onboarding.SECTIONS:
         st = stats.get(section["id"], {"ok": False, "detail": ""})
-        lines.append(f"{'✅' if st['ok'] else '⚠️'} {section['title']} — {st['detail']}")
+        lines.append(f"{'✅' if st['ok'] else '⚠️'} *{section['title']}* — {st['detail']}")
     lines.append("")
     lines.append("Edit anytime: /setup · /settings · /memory. Now just study and talk to me normally.")
     return "\n".join(lines)
@@ -2100,7 +2243,7 @@ async def on_onboarding_callback(update: Update, context: ContextTypes.DEFAULT_T
             onboarding.mark_complete(chat_id)
             summary = await asyncio.to_thread(_setup_finish_summary)
             try:
-                await query.edit_message_text(summary)
+                await _edit_markdown(query, summary)
             except Exception:
                 pass
             return
@@ -2466,6 +2609,117 @@ async def bugs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text("\n".join(lines))
 
 
+async def _legacy_catch_all_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    clarification: dict | None,
+) -> None:
+    """Fallback legacy intent-parser / handler flow."""
+    message = update.effective_message
+    parse_text = text
+    if clarification:
+        parse_text = (
+            f"[Original message: {clarification['original_message']}]\n"
+            f"[Bot asked: {clarification['question']}]\n"
+            f"[User replied: {text}]"
+        )
+    stored = session_context.context_for_parser(chat_id)
+    intent = None
+    if not clarification:
+        intent = _try_pattern_match(text)
+    if intent is None:
+        try:
+            intent = await asyncio.to_thread(parse_message, parse_text, session_context=stored)
+        except IntentParseError:
+            logger.exception("intent parse failed chat_id=%s", chat_id)
+            await message.reply_text("Sorry, I couldn't understand that. Try rephrasing?")
+            return
+    if intent.action == "unknown":
+        await _handle_general_assistant(update, text, chat_id)
+        return
+    if intent.needs_clarification:
+        q = intent.clarification_question or "Could you clarify that?"
+        draft_store.set_pending_clarification(
+            chat_id,
+            original_message=clarification["original_message"] if clarification else text,
+            question=q,
+        )
+        await message.reply_text(q, reply_markup=ForceReply(selective=True))
+        return
+    if intent.action == "set_context":
+        f = intent.filters
+        exercise = getattr(f, "exercise", None)
+        if exercise:
+            options = notion_schema.PROPERTIES_BY_DB["ledger"]["exercise_type"]["options"]
+            exercise = logging_flow.normalise_option(exercise, options) or exercise
+        ctx = session_context.set_context(
+            chat_id, subject=f.subject, chapter=f.chapter, block=f.block, exercise=exercise
+        )
+        await message.reply_text("Context set.\n\n" + briefing.build_briefing(ctx), parse_mode=ParseMode.MARKDOWN)
+        return
+    if intent.action.startswith("log_"):
+        original = clarification["original_message"] if clarification else text
+        await _handle_log(
+            update, context, intent, chat_id,
+            original_message=original, first_round=clarification is None,
+        )
+        return
+    if intent.action == "remember":
+        statement = str(intent.fields.get("statement") or "").strip() or text
+        await _handle_remember(update, statement, chat_id)
+        return
+    if intent.action in ("query", "ask"):
+        question = text
+        if intent.action == "ask":
+            question = intent.fields.get("question") or text
+        await _handle_question(update, question, intent=intent, chat_id=chat_id)
+        return
+    await _handle_general_assistant(update, text, chat_id)
+
+
+async def _handle_agent_text(update: Update, chat_id: int, text: str) -> None:
+    """Route a free-form user message through the agentic loop."""
+    message = update.effective_message
+    status_msg = None
+
+    async def on_status(status_text: str) -> None:
+        nonlocal status_msg
+        try:
+            if status_msg is None:
+                status_msg = await message.reply_text(status_text)
+            else:
+                await status_msg.edit_text(status_text)
+        except Exception:
+            pass
+
+    result = await agent.run(chat_id, text, on_status=on_status)
+
+    if result["type"] == "preview":
+        preview = result["preview"]
+        state_id = result["state_id"]
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=f"agent:confirm:{state_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"agent:cancel:{state_id}"),
+        ]])
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        await message.reply_text(f"{preview}\n\nProceed?", reply_markup=keyboard)
+        return
+
+    # Final response
+    if status_msg is not None:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    await agent_renderer.render(update, result["response"])
+
+
 def _errors_last_24h() -> int:
     cutoff = dt.datetime.now() - dt.timedelta(hours=24)
     count = 0
@@ -2483,6 +2737,54 @@ def _errors_last_24h() -> int:
     except OSError:
         return 0
     return count
+
+
+async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Confirm/Cancel on agent write previews."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, action, state_id = parts
+    confirmed = action == "confirm"
+
+    status_msg = None
+
+    async def on_status(text: str) -> None:
+        nonlocal status_msg
+        try:
+            if status_msg is None:
+                status_msg = await query.edit_message_text(text)
+            else:
+                await status_msg.edit_text(text)
+        except Exception:
+            pass
+
+    result = await agent.continue_run(state_id, confirmed=confirmed, on_status=on_status)
+
+    if result["type"] == "preview":
+        preview = result["preview"]
+        new_state_id = result["state_id"]
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=f"agent:confirm:{new_state_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"agent:cancel:{new_state_id}"),
+        ]])
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        await query.message.reply_text(f"{preview}\n\nProceed?", reply_markup=keyboard)
+        return
+
+    if status_msg is not None:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    await agent_renderer.render(query, result["response"])
 
 
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2557,6 +2859,40 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         return
 
+    # Pending doubt resolution verification: user must answer the verification
+    # question before the doubt is marked as solved.
+    pending_resolve = draft_store.get_pending_doubt_resolution(chat_id)
+    if pending_resolve:
+        if text.strip().lower() in ("skip", "cancel"):
+            draft_store.clear_pending_doubt_resolution(chat_id)
+            try:
+                result = await asyncio.to_thread(
+                    study_domain.resolve_doubt_id,
+                    pending_resolve["doubt_id"], pending_resolve["resolution"],
+                    teacher_asked=bool(pending_resolve["teacher_asked"]),
+                )
+                await message.reply_text(
+                    f"Doubt closed as {result['workflow_state']} (skipped verification)."
+                )
+            except Exception as exc:
+                await message.reply_text(f"Doubt was not closed: {exc}")
+            return
+        try:
+            result = await asyncio.to_thread(
+                study_domain.resolve_doubt_id,
+                pending_resolve["doubt_id"],
+                f"{pending_resolve['resolution']}\n\n[Verification answer: {text}]",
+                teacher_asked=bool(pending_resolve["teacher_asked"]),
+            )
+            draft_store.clear_pending_doubt_resolution(chat_id)
+            await message.reply_text(
+                f"✅ Doubt closed as {result['workflow_state']}. "
+                f"Your verification answer was saved with the resolution."
+            )
+        except Exception as exc:
+            await message.reply_text(f"Doubt was not closed: {exc}")
+        return
+
     # /settings edit in progress: the next text message is the new value.
     pending_setting = draft_store.get_pending_setting_edit(chat_id)
     if pending_setting:
@@ -2606,9 +2942,9 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply += "\n💡 Or start your message with `ai ` and describe it — I'll figure out what to do."
         if adv:
             reply_text, markup = await _setup_after_answer(chat_id, reply, True)
-            await message.reply_text(reply_text, reply_markup=markup)
+            await _reply_markdown(message, reply_text, reply_markup=markup)
         else:
-            await message.reply_text(reply)
+            await _reply_markdown(message, reply)
         if _ok and section_id == "next_mock":
             try:
                 await _send_current_readiness_reviews(
@@ -2648,87 +2984,12 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         parse_text = text
 
-    stored = session_context.context_for_parser(chat_id)
-    
-    # Fast path: pattern matching for common logs (no LLM needed, instant, bulletproof)
-    # Handles 90% of daily "solved X questions, Y correct, Z mins" logs without network calls
-    intent = None
-    if not clarification:  # Only use fast path for fresh messages, not clarifications
-        intent = _try_pattern_match(text)
-    
-    # Fallback to LLM for complex messages that don't match simple patterns
-    if intent is None:
-        try:
-            intent = await asyncio.to_thread(
-                parse_message, parse_text, session_context=stored
-            )
-        except IntentParseError:
-            logger.exception("intent parse failed chat_id=%s", chat_id)
-            await message.reply_text(
-                "Sorry, I couldn't understand that. Try rephrasing?"
-            )
-            return
-
-    if intent.action == "unknown":
-        await _handle_general_assistant(update, text, chat_id)
-        return
-
-    if intent.needs_clarification:
-        q = intent.clarification_question or "Could you clarify that?"
-        draft_store.set_pending_clarification(
-            chat_id,
-            original_message=clarification["original_message"] if clarification else text,
-            question=q,
-        )
-        # Parser-level clarifications are open-ended (no candidate list) — use
-        # force-reply so the next message is unambiguously an answer.
-        await message.reply_text(q, reply_markup=ForceReply(selective=True))
-        return
-
-    if intent.action == "set_context":
-        f = intent.filters
-        exercise = getattr(f, "exercise", None)
-        if exercise:
-            options = notion_schema.PROPERTIES_BY_DB["ledger"]["exercise_type"]["options"]
-            exercise = logging_flow.normalise_option(exercise, options) or exercise
-        ctx = session_context.set_context(
-            chat_id, subject=f.subject, chapter=f.chapter, block=f.block,
-            exercise=exercise,
-        )
-        await message.reply_text(
-            "Context set.\n\n" + briefing.build_briefing(ctx),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    if intent.action.startswith("log_"):
-        original = clarification["original_message"] if clarification else text
-        await _handle_log(
-            update, context, intent, chat_id,
-            original_message=original,
-            first_round=clarification is None,
-        )
-        return
-
-    if intent.action == "remember":
-        statement = str(intent.fields.get("statement") or "").strip() or text
-        await _handle_remember(update, statement, chat_id)
-        return
-
-    if intent.action in ("query", "ask"):
-        # Route both structured queries and free-form questions through the
-        # LLM SQL loop — it can answer anything the mirror knows, including
-        # aggregations, date ranges, and computed columns. Falls back to the
-        # hand-coded query_flow only when the LLM is unreachable.
-        question = text
-        if intent.action == "ask":
-            question = intent.fields.get("question") or text
-        await _handle_question(update, question, intent=intent, chat_id=chat_id)
-        return
-
-    # A future parser action should degrade into a useful conversation instead
-    # of exposing an implementation acknowledgement to the user.
-    await _handle_general_assistant(update, text, chat_id)
+    # Agent path: route free-form text through the agentic loop.
+    try:
+        await _handle_agent_text(update, chat_id, text)
+    except Exception:
+        logger.exception("agent path failed chat_id=%s, falling back to legacy flow", chat_id)
+        await _legacy_catch_all_handler(update, context, chat_id, text, clarification)
 
 
 async def _handle_question(
@@ -2789,12 +3050,14 @@ async def _handle_question(
             question, history=history, on_step=_on_step, chat_id=chat_id,
         )
         _edit_seq += 1  # invalidate any pending status-edit tasks before writing the answer
-        if answer.startswith("⚠️") and intent is not None and intent.action == "query":
+        _err_prefix = sql_query_flow.ANSWER_ERROR_PREFIX
+        if answer.startswith(_err_prefix) and intent is not None and intent.action == "query":
             result = await asyncio.to_thread(query_flow.run_query, intent)
             answer = query_flow.format_result(result)
         # Only remember successful answers, so an error turn never poisons the
-        # follow-up window.
-        if not answer.startswith("⚠️"):
+        # follow-up window.  Use the structured prefix (not bare ⚠️) so a valid
+        # answer that happens to start with the emoji is not misclassified.
+        if not answer.startswith(_err_prefix):
             await asyncio.to_thread(draft_store.record_qa, chat_id, question, answer)
         try:
             await _edit_markdown(status_msg, answer, disable_web_page_preview=True)
@@ -3251,6 +3514,28 @@ async def _commitment_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("commitment nudge job failed")
 
 
+async def _nightly_insight_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nightly: derive a learner profile and extract one new insight."""
+    try:
+        import learner_profile
+        chat_id = telegram_allowed_user_id()
+        insight = await asyncio.to_thread(
+            learner_profile.nightly_insight, chat_id, use_llm=True
+        )
+        if insight is None:
+            return
+        if not insight.get("created"):
+            return
+        await _send_markdown(
+            context.bot, chat_id,
+            f"🌙 *Nightly insight*\n\n{insight['text']}\n\n"
+            f"_confidence: {insight.get('confidence', 'low')} · "
+            f"source: {insight.get('source', 'deterministic')}_"
+        )
+    except Exception:
+        logger.exception("nightly insight job failed")
+
+
 async def _user_jobs_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fire due user-created jobs (dedup via reminders.claim per job per day)."""
     try:
@@ -3318,6 +3603,14 @@ async def post_init(application: Application) -> None:
         application.job_queue.run_daily(
             _guard_scheduled(_commitment_nudge_job), time=_clock(config_settings.commitment_nudge_time()),
             days=tuple(range(7)), name="commitment_nudge",
+        )
+        application.job_queue.run_daily(
+            _guard_scheduled(_nightly_insight_job), time=_clock(config_settings.nightly_insight_time()),
+            days=tuple(range(7)), name="nightly_insight",
+        )
+        application.job_queue.run_daily(
+            _guard_scheduled(_nightly_insight_job), time=_clock(config_settings.nightly_insight_time()),
+            days=tuple(range(7)), name="nightly_insight",
         )
         application.job_queue.run_repeating(
             _guard_scheduled(_exam_reminder_scan), interval=600, first=120, name="exam_reminders"
@@ -3410,6 +3703,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_debrief_callback, pattern=r"^debrief:"))
     app.add_handler(CallbackQueryHandler(on_plan_callback, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_log_callback, pattern=r"^log:"))
+    app.add_handler(CallbackQueryHandler(on_agent_callback, pattern=r"^agent:"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, catch_all))
     logger.info("Starting Telegram long polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -612,3 +612,79 @@ def close_bug_report(
         )
         conn.commit()
         return cur.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Pending doubt resolution: conversational verification before marking solved
+# ---------------------------------------------------------------------------
+
+PENDING_RESOLVE_TABLE = "pending_doubt_resolutions"
+PENDING_RESOLVE_TTL_MINUTES = 30
+
+
+def _init_pending_resolve(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {PENDING_RESOLVE_TABLE} (
+            chat_id INTEGER PRIMARY KEY,
+            doubt_id TEXT NOT NULL,
+            doubt_title TEXT NOT NULL,
+            resolution TEXT NOT NULL,
+            teacher_asked INTEGER NOT NULL DEFAULT 0,
+            verification_question TEXT NOT NULL,
+            asked_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def set_pending_doubt_resolution(
+    chat_id: int,
+    doubt_id: str,
+    doubt_title: str,
+    resolution: str,
+    teacher_asked: bool,
+    verification_question: str,
+    *,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    with _connect(db_path) as conn:
+        _init_pending_resolve(conn)
+        conn.execute(
+            f"INSERT OR REPLACE INTO {PENDING_RESOLVE_TABLE} "
+            "(chat_id, doubt_id, doubt_title, resolution, teacher_asked, "
+            "verification_question, asked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, doubt_id, doubt_title, resolution,
+             int(teacher_asked), verification_question, _utc_now().isoformat()),
+        )
+        conn.commit()
+
+
+def get_pending_doubt_resolution(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> dict[str, Any] | None:
+    with _connect(db_path) as conn:
+        _init_pending_resolve(conn)
+        row = conn.execute(
+            f"SELECT * FROM {PENDING_RESOLVE_TABLE} WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        asked = dt.datetime.fromisoformat(row["asked_at"])
+        if (_utc_now() - asked).total_seconds() > PENDING_RESOLVE_TTL_MINUTES * 60:
+            conn.execute(
+                f"DELETE FROM {PENDING_RESOLVE_TABLE} WHERE chat_id = ?", (chat_id,)
+            )
+            conn.commit()
+            return None
+    return dict(row)
+
+
+def clear_pending_doubt_resolution(
+    chat_id: int, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> None:
+    with _connect(db_path) as conn:
+        _init_pending_resolve(conn)
+        conn.execute(
+            f"DELETE FROM {PENDING_RESOLVE_TABLE} WHERE chat_id = ?", (chat_id,)
+        )
+        conn.commit()

@@ -43,7 +43,8 @@ def _require_object(data: Any) -> dict[str, Any]:
 def _build_domain_prompt(kind: str, contract: str) -> str:
     import session_context
     now = session_context.local_now()
-    identity = bot_identity.identity_prompt(role=f"{kind} parser")
+    import actions
+    identity = actions.identity_with_actions(role=f"{kind} parser", context="any")
     return f"""{identity}
 
 You extract one {kind} for this JEE study system.

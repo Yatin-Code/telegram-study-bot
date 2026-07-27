@@ -219,7 +219,7 @@ def test_loop_llm_failure() -> bool:
 
     with patch.object(sql_query_flow, "_call_llm", side_effect=mock_call):
         answer = sql_query_flow.answer_question("anything", db_path=db)
-    ok = _check(ok, "graceful error message", "couldn't reach the LLM" in answer, answer)
+    ok = _check(ok, "graceful error message", "unavailable" in answer.lower(), answer)
 
     db.unlink(missing_ok=True)
     assert ok

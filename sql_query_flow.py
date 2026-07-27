@@ -201,8 +201,10 @@ def _build_system_prompt(
         now_block = advisor.now_block(chat_id, db_path=db_path)
     except Exception:
         now_block = ""
+    import actions
+    identity = actions.identity_with_actions(role="study-data SQL analyst", context="any")
     prompt = SYSTEM_PROMPT.format(
-        bot_identity=bot_identity.identity_prompt(role="study-data SQL analyst"),
+        bot_identity=identity,
         max_iter=MAX_ITERATIONS,
         local_date=session_context.local_today_iso(),
         now_block=now_block,
@@ -465,11 +467,29 @@ def answer_question(
                 try:
                     result = sql_tool.run_sql(sql, db_path=db_path)
                 except sql_tool.SQLRejectedError as e:
-                    feedback = f"ERROR (rejected): {e}"
-                    _emit("retry", "query rejected, retrying")
+                    feedback = f"ERROR (query rejected): {e}"
+                    _emit("retry", "query rejected, rewrite required")
+                    messages.append({"role": "user", "content": feedback})
+                    continue
                 except sql_tool.SQLExecutionError as e:
-                    feedback = f"ERROR (sqlite): {e}"
-                    _emit("retry", "SQL error, retrying")
+                    is_transient, is_permanent, classification = sql_tool.classify_sql_error(str(e))
+                    if is_permanent or (not is_transient and not is_permanent):
+                        feedback = (
+                            f"ERROR (schema/query problem — fix before retrying): {e}\n"
+                            "Hint: check column names, table names, and SQL syntax. "
+                            "Use `get_schema('table_name')` to see available columns."
+                        )
+                        _emit("retry", f"permanent error, rewrite required ({classification})")
+                    else:
+                        backoff = min(2.0 ** iteration, 10.0)
+                        _emit("retry", f"transient error ({e}), backing off {backoff:.1f}s")
+                        time.sleep(backoff)
+                        feedback = (
+                            f"ERROR (transient, will retry): {e}\n"
+                            "Rewriting query to avoid the issue..."
+                        )
+                    messages.append({"role": "user", "content": feedback})
+                    continue
                 else:
                     feedback = _format_results(result, sql)
                     _emit("result", f"→ {result['row_count']} row(s)")

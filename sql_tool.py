@@ -47,6 +47,54 @@ class SQLRejectedError(SQLExecutionError):
     pass
 
 
+# Transient SQLite errors: safe to retry after a short wait.
+# Permanent errors: the query itself is broken and needs rewriting — retrying
+# the same query will never succeed.
+_TRANSIENT_ERROR_PATTERNS = (
+    "database is locked",
+    "database table is locked",
+    "SQLITE_BUSY",
+    "SQLITE_LOCKED",
+    "timeout",
+    "locked",
+)
+
+# Permanent errors: query must be rewritten before re-sending.
+_PERMANENT_ERROR_PATTERNS = (
+    "no such column",
+    "no such table",
+    "syntax error",
+    "unrecognized token",
+    "ambiguous column name",
+    "no such function",
+    "no such index",
+    "duplicate column name",
+    "table ",
+    "has no column named",
+    "comma terminator",
+    "unterminated string",
+    "integer too large",
+)
+
+
+def classify_sql_error(message: str) -> tuple[bool, bool, str]:
+    """Classify a SQLite error message.
+
+    Returns (is_transient, is_permanent, classification):
+      - is_transient=True  → retry with backoff
+      - is_permanent=True  → query is broken, fix the query not the data
+      - both False         → unknown, treat as transient (safe default)
+
+    The message is lowercased before matching.
+    """
+    msg = message.lower()
+    if any(p in msg for p in _TRANSIENT_ERROR_PATTERNS):
+        return (True, False, "transient")
+    if any(p in msg for p in _PERMANENT_ERROR_PATTERNS):
+        return (False, True, "permanent_schema")
+    return (False, False, "unknown")
+
+
 def _validate_sql(sql: str) -> None:
     """Reject anything that isn't a single read-only SELECT/PRAGMA."""
     stripped = sql.strip().rstrip(";").strip()

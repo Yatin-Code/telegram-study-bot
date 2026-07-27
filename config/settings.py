@@ -168,6 +168,17 @@ def telegram_allowed_user_id() -> int:
         )
 
 
+def rich_messages_enabled() -> bool:
+    """Bot API 10.1+ rich messages. Default on; set RICH_MESSAGES=0 to disable."""
+    raw = os.environ.get("RICH_MESSAGES", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def telegram_api_base_url() -> str:
+    """Bot API base URL. Override for a local Bot API server."""
+    return os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+
+
 # --- LLM (Phase 5) ----------------------------------------------------------
 
 def llm_provider() -> str:
@@ -281,6 +292,11 @@ def commitment_check_time() -> str:
 def commitment_nudge_time() -> str:
     """Local HH:MM for the morning adherence nudge (re-checks yesterday first)."""
     return _get("COMMITMENT_NUDGE_TIME", "07:30")
+
+
+def nightly_insight_time() -> str:
+    """Local HH:MM for the nightly learner insight extraction."""
+    return _get("NIGHTLY_INSIGHT_TIME", "02:00")
 
 
 def commitment_warn_after() -> str:

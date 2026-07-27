@@ -713,3 +713,72 @@ def apply_ai_actions(
         except Exception as exc:
             results.append(f"⚠️ {kind} failed: {exc}")
     return results, skip
+
+
+# ---------------------------------------------------------------------------
+# Conversational onboarding: personalize prompts based on previous answers
+# ---------------------------------------------------------------------------
+
+def personalized_prompt(
+    section_id: str, *, db_path: str | Path = DEFAULT_DB_PATH
+) -> str:
+    section = section_by_id(section_id)
+    if section is None:
+        return ""
+    base = section["prompt"]
+    if section_id == "chapters":
+        base = chapters_prompt()
+    stats = status(db_path=db_path)
+    context = _onboarding_context(stats)
+    if not context:
+        return base
+    try:
+        from llm import router
+        prompt = (
+            f"The user is in the onboarding wizard for a JEE study bot. "
+            f"Current section: {section['title']}.\n"
+            f"Original prompt: {base}\n"
+            f"What the user has already told us: {context}\n\n"
+            f"Rewrite the prompt to be more personal and conversational. "
+            f"Reference what the user already shared. Keep it concise (2-3 lines). "
+            f"Return only the rewritten prompt, no preamble."
+        )
+        response = router.complete(router.LLMRequest(
+            messages=[{"role": "user", "content": prompt}],
+            purpose="domain", max_output_tokens=300, temperature=0.4,
+        ))
+        return response.text.strip() or base
+    except Exception:
+        return base
+
+
+def _onboarding_context(stats: dict[str, dict[str, Any]]) -> str:
+    parts: list[str] = []
+    tz = stats.get("timezone", {})
+    if tz.get("ok"):
+        parts.append(f"timezone: {tz.get('detail', '')}")
+    exam = stats.get("target_exam", {})
+    if exam.get("ok"):
+        parts.append(f"target exam: {exam.get('detail', '')}")
+    mock = stats.get("next_mock", {})
+    if mock.get("ok"):
+        parts.append(f"next mock: {mock.get('detail', '')}")
+    tt = stats.get("timetable", {})
+    if tt.get("ok"):
+        parts.append(f"timetable: {tt.get('detail', '')}")
+    ch = stats.get("chapters", {})
+    if ch.get("ok"):
+        parts.append(f"chapters: {ch.get('detail', '')}")
+    bl = stats.get("backlog", {})
+    if bl.get("ok"):
+        parts.append(f"backlog: {bl.get('detail', '')}")
+    comm = stats.get("commitments", {})
+    if comm.get("ok"):
+        parts.append(f"commitments: {comm.get('detail', '')}")
+    cap = stats.get("capacity", {})
+    if cap.get("ok"):
+        parts.append(f"capacity: {cap.get('detail', '')}")
+    prefs = stats.get("prefs", {})
+    if prefs.get("ok"):
+        parts.append(f"preferences: {prefs.get('detail', '')}")
+    return "; ".join(parts) if parts else ""

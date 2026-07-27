@@ -131,6 +131,7 @@ def test_flush_pending_dead_letters_after_bounded_attempts(tmp_path, monkeypatch
 
 
 def test_unknown_intent_routes_to_general_assistant(monkeypatch):
+    """Test that free-form text is routed through the agent."""
     replies: list[str] = []
 
     class Message:
@@ -150,7 +151,7 @@ def test_unknown_intent_routes_to_general_assistant(monkeypatch):
 
     routed: list[tuple[str, int]] = []
 
-    async def assistant(_update, text, chat_id):
+    async def agent_handler(_update, chat_id, text):
         routed.append((text, chat_id))
 
     monkeypatch.setattr(bot, "_reject_if_unauthorized", allowed)
@@ -159,21 +160,12 @@ def test_unknown_intent_routes_to_general_assistant(monkeypatch):
     monkeypatch.setattr(bot.draft_store, "get_pending_setting_edit", lambda _chat: None)
     monkeypatch.setattr(bot.user_jobs, "get_pending_edit", lambda _chat: None)
     monkeypatch.setattr(bot.draft_store, "get_session_debrief", lambda _chat: None)
+    monkeypatch.setattr(bot.draft_store, "get_pending_doubt_resolution", lambda _chat: None)
     monkeypatch.setattr(bot.onboarding, "active_section", lambda _chat: None)
     monkeypatch.setattr(bot.onboarding, "is_complete", lambda _chat: True)
     monkeypatch.setattr(bot.draft_store, "get_editing_draft_for_chat", lambda _chat: None)
     monkeypatch.setattr(bot.draft_store, "get_pending_clarification", lambda _chat: None)
-    monkeypatch.setattr(bot, "_try_pattern_match", lambda _text: None)
-    monkeypatch.setattr(
-        bot,
-        "parse_message",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            action="unknown",
-            needs_clarification=True,
-            clarification_question="What did you mean?",
-        ),
-    )
-    monkeypatch.setattr(bot, "_handle_general_assistant", assistant)
+    monkeypatch.setattr(bot, "_handle_agent_text", agent_handler)
 
     asyncio.run(bot.catch_all(update, SimpleNamespace()))
 

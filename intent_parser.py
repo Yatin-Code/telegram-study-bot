@@ -342,8 +342,10 @@ def _build_system_prompt(session_context: Optional[dict[str, Any]]) -> str:
         )
     else:
         context_block = time_line + "Current session context: none set.\n"
+    import actions
+    identity = actions.identity_with_actions(role="intent parser", context="any")
     return SYSTEM_PROMPT_TEMPLATE.format(
-        bot_identity=bot_identity.identity_prompt(role="intent parser"),
+        bot_identity=identity,
         schema_digest=_schema_digest(),
         context_block=context_block,
     )

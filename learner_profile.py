@@ -480,7 +480,8 @@ def _call_insight_model(
             "confidence": confidence, "evidence_keys": clean_keys,
         }
 
-    prompt = f"""{bot_identity.identity_prompt(role="nightly learner insight extractor")}
+    import actions
+    prompt = f"""{actions.identity_with_actions(role="nightly learner insight extractor", context="any")}
 
 Extract exactly one NEW, useful learner insight from the supplied deterministic
 evidence. Cite only evidence keys that appear below. Do not restate an existing

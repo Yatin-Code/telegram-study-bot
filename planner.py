@@ -159,7 +159,8 @@ def _ai_rank_suggestion_ids(
             raise ValueError("ranking cannot be empty")
         return clean
 
-    prompt = f"""{bot_identity.identity_prompt(role="plan action ranker")}
+    import actions
+    prompt = f"""{actions.identity_with_actions(role="plan action ranker", context="planning_time")}
 
 Rank the supplied already-validated plan actions for {plan_date}. You may only
 reorder IDs from the list. Do not invent, delete, or modify actions. Prefer hard

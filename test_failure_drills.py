@@ -46,7 +46,7 @@ def test_answer_loop_llm_dead_is_honest(db, monkeypatch):
     monkeypatch.setattr(sql_query_flow.time, "sleep", lambda s: None)
     answer = sql_query_flow.answer_question("how many questions today?", db_path=db)
     assert answer.startswith("⚠️")
-    assert "couldn't reach" in answer.lower() or "trouble" in answer.lower()
+    assert "unavailable" in answer.lower()
 
 
 def test_llm_retries_transient_then_succeeds(db, monkeypatch):
