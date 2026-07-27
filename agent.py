@@ -23,6 +23,7 @@ from typing import Any, Callable, Coroutine, Optional
 
 import agent_tools
 import bot_identity
+import conversation_history
 import session_context
 from llm import router as llm_router
 from llm.router import LLMRequest
@@ -698,11 +699,19 @@ async def run(
     """
     on_status = on_status or _noop_status
     system_prompt = _build_system_prompt(chat_id, user_text=user_text)
+    history = conversation_history.recent_messages(chat_id, limit=15)
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
+        *history,
         {"role": "user", "content": user_text},
     ]
-    return await _run_loop(chat_id, messages, on_status)
+    result = await _run_loop(chat_id, messages, on_status)
+    conversation_history.save_message(chat_id, "user", user_text)
+    if result["type"] == "response":
+        conversation_history.save_message(
+            chat_id, "assistant", result["response"].text or "(no response)"
+        )
+    return result
 
 
 async def _run_loop(
@@ -817,4 +826,9 @@ async def continue_run(
 
     _delete_state(state_id)
 
-    return await _run_loop(chat_id, messages, on_status)
+    result = await _run_loop(chat_id, messages, on_status)
+    if result["type"] == "response":
+        conversation_history.save_message(
+            chat_id, "assistant", result["response"].text or "(no response)"
+        )
+    return result
