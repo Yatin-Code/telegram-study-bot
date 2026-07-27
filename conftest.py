@@ -102,4 +102,8 @@ def _llm_auto_mock(monkeypatch):
                     break
         return _make_mock_response(user_text)
 
+    def _mock_stream_complete(request, **kwargs):
+        yield _mock_complete(request, **kwargs).text
+
     monkeypatch.setattr(router_mod, "complete", _mock_complete, raising=False)
+    monkeypatch.setattr(router_mod, "stream_complete", _mock_stream_complete, raising=False)

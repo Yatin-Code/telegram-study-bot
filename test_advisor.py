@@ -88,6 +88,33 @@ def test_log_warnings_only_late_and_only_nonserving(db):
     assert advisor.log_warnings(theory, now=evening, db_path=db) == []
 
 
+def test_memory_prompt_block_includes_op_goals_and_prefs(db):
+    # Local operational goal should appear alongside prefs
+    sd.create_goal({
+        "title": "Local CY Goal",
+        "goal_type": "Coverage",
+        "metric": "cognitive_yield",
+        "target": 300,
+        "period": "Daily",
+    }, db_path=db)
+    commitments.add_pref(1, "I prefer morning study blocks", db_path=db)
+
+    block = advisor.memory_prompt_block(1, db_path=db)
+    assert "Local CY Goal" in block
+    assert "morning study blocks" in block
+
+
+def test_memory_prompt_block_includes_op_work_items(db):
+    sd.create_work_item({
+        "title": "Physics Rotation notes",
+        "kind": "PYQ",
+        "status": "Planned",
+    }, db_path=db)
+
+    block = advisor.memory_prompt_block(1, db_path=db)
+    assert "Physics Rotation notes" in block
+
+
 def test_trajectory_accuracy_drop(db):
     for i in range(3):  # prior week: 80% on plenty of questions
         insert(db, "ledger", notion_page_id=f"p{i}", date=f"2026-07-{7 + i:02d}",

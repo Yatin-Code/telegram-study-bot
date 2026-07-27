@@ -1,9 +1,9 @@
 """
-SQLite mirror for the four Notion-owned databases.
+SQLite mirror for Notion-owned databases (ledger, doubts, revision).
 
-Notion is authoritative only for Ledger, Doubts, Revision and Daily Plan.
-Bot-owned operational state uses operational_store.py instead.
-queries/listing flows should read from SQLite, never hit Notion live.
+Notion is authoritative only for Ledger, Doubts and Revision.
+Bot-owned operational state (including daily plan) uses operational_store.py.
+Queries/listing flows should read from SQLite, never hit Notion live.
 
 Usage:
     python sync.py --once
@@ -31,6 +31,7 @@ from typing import Any, Iterable, Sequence
 
 import formulas
 from config import notion_schema
+from config.ownership import NOTION_OWNED_KEYS
 from notion_client_wrapper import page_plain_text, parse_page, query_database_iter
 
 
@@ -48,7 +49,7 @@ SYNC_META_TABLE = "sync_meta"
 _sync_lock = threading.RLock()
 
 DB_TABLES = {key: key for key in notion_schema.PROPERTIES_BY_DB}
-NOTION_SOURCE_KEYS = ("ledger", "doubts", "revision", "daily_plan")
+NOTION_SOURCE_KEYS = NOTION_OWNED_KEYS
 
 
 SQLITE_TYPE_BY_NOTION_TYPE = {

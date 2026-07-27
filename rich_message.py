@@ -28,8 +28,38 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
+# Once True, skip rich API methods for this process (endpoint missing / unsupported).
+_rich_unsupported: bool = False
+
+
+def reset_capability_latch() -> None:
+    """Test helper: clear the process-wide unsupported latch."""
+    global _rich_unsupported
+    _rich_unsupported = False
+
+
+def _mark_unsupported(exc: BaseException) -> None:
+    """Latch off rich path when the Bot API clearly lacks the method."""
+    global _rich_unsupported
+    msg = str(exc).lower()
+    # Only hard endpoint-missing signals — not generic validation rejections.
+    markers = (
+        "unknown method",
+        "method not found",
+        "not found: method",
+        "does not exist",
+        "method is unavailable",
+        "there is no method",
+    )
+    if any(m in msg for m in markers):
+        if not _rich_unsupported:
+            logger.warning("Rich messages unsupported on this Bot API; latching plain path: %s", exc)
+        _rich_unsupported = True
+
 
 def _enabled() -> bool:
+    if _rich_unsupported:
+        return False
     try:
         return config_settings.rich_messages_enabled()
     except Exception:
@@ -246,6 +276,7 @@ async def send_rich(
             message_thread_id=message_thread_id,
         )
     except Exception as exc:
+        _mark_unsupported(exc)
         logger.warning("sendRichMessage failed, falling back to plain: %s", exc)
         return await _send_plain(
             token, chat_id, text,
@@ -284,6 +315,7 @@ async def edit_rich(
             reply_markup=reply_markup,
         )
     except Exception as exc:
+        _mark_unsupported(exc)
         logger.warning("editMessageText(rich_message) failed, falling back to plain: %s", exc)
         return await _edit_plain(
             token, chat_id, message_id, text,

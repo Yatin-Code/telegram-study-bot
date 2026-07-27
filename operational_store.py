@@ -1,9 +1,8 @@
 """Authoritative SQLite storage for study-planning operational state.
 
-Notion remains authoritative for the user-authored daily plan and the existing
-Ledger, Doubts and Revision databases. Everything the bot itself owns lives in
-the local tables defined here. The ``op_`` prefix keeps these tables separate
-from old Notion mirror tables and makes the ownership boundary explicit.
+Notion owns only ledger, doubts, and revision (see config.ownership).
+Everything the bot itself owns — goals, work items, exams, daily plan,
+timetable, doubt attempts — lives in the local ``op_*`` tables defined here.
 """
 
 from __future__ import annotations
@@ -17,21 +16,16 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from config import notion_schema
+from config.ownership import SQL_OWNED_KEYS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
 
-OPERATIONAL_KEYS = (
-    "work_items",
-    "goals",
-    "exams",
-    "exam_questions",
-    "doubt_attempts",
-    "timetable",
-)
+OPERATIONAL_KEYS = SQL_OWNED_KEYS
 OP_TABLES = {key: f"op_{key}" for key in OPERATIONAL_KEYS}
-SCHEMA_VERSION = 1
+# v2: daily_plan moved from Notion-owned mirror to op_daily_plan.
+SCHEMA_VERSION = 2
 EXECUTION_LINKS_TABLE = "op_execution_links"
 
 _SQL_TYPES = {
@@ -195,7 +189,7 @@ def _ensure_property_columns(conn: sqlite3.Connection, db_key: str) -> None:
     """Apply additive schema changes to databases created by older releases."""
     table = table_for(db_key)
     existing = {
-        str(row["name"])
+        str(row[1])  # PRAGMA table_info: (cid, name, type, ...)
         for row in conn.execute(f"PRAGMA table_info({_quote(table)})").fetchall()
     }
     for name, definition in notion_schema.PROPERTIES_BY_DB[db_key].items():
@@ -250,10 +244,20 @@ def init_db(conn: sqlite3.Connection) -> None:
             "VALUES (1, ?, ?)",
             (SCHEMA_VERSION, _utc_now()),
         )
-    elif int(current["schema_version"]) > SCHEMA_VERSION:
-        raise OperationalStoreError(
-            "database schema is newer than this application build"
-        )
+    else:
+        version = int(current[0])
+        if version > SCHEMA_VERSION:
+            raise OperationalStoreError(
+                "database schema is newer than this application build"
+            )
+        if version < SCHEMA_VERSION:
+            # Pull any newly SQL-owned keys (e.g. daily_plan → op_daily_plan).
+            _import_legacy_notion_rows(conn)
+            conn.execute(
+                "UPDATE operational_schema_meta SET schema_version=?, migrated_at=? "
+                "WHERE singleton=1",
+                (SCHEMA_VERSION, _utc_now()),
+            )
     conn.commit()
 
 
@@ -265,7 +269,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {
-        str(row["name"])
+        str(row[1])  # PRAGMA table_info: (cid, name, type, ...)
         for row in conn.execute(f"PRAGMA table_info({_quote(table)})").fetchall()
     }
 

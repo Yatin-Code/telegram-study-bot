@@ -300,7 +300,7 @@ def planning_message(
             f"- {x}" for x in facts["errors"]
         )
     elif facts["warnings"]:
-        message = "Today's Notion plan needs a quick check:\n" + "\n".join(
+        message = "Today's plan needs a quick check:\n" + "\n".join(
             f"- {x}" for x in facts["warnings"]
         )
     else:

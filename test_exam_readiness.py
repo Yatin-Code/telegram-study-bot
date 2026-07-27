@@ -102,11 +102,11 @@ def test_full_audit_filters_syllabus_and_uses_exact_seven_day_evidence(db):
     )
 
     with sqlite3.connect(db) as conn:
-        plans_before = conn.execute("SELECT COUNT(*) FROM daily_plan").fetchone()[0]
+        plans_before = conn.execute("SELECT COUNT(*) FROM op_daily_plan").fetchone()[0]
     now = dt.datetime(2026, 7, 22, 12, tzinfo=dt.timezone.utc)
     snapshot = exam_readiness.collect(exam, now=now, db_path=db, phase="t7")
     with sqlite3.connect(db) as conn:
-        plans_after = conn.execute("SELECT COUNT(*) FROM daily_plan").fetchone()[0]
+        plans_after = conn.execute("SELECT COUNT(*) FROM op_daily_plan").fetchone()[0]
 
     assert {row["notion_page_id"] for row in snapshot["doubts"]} == {
         "d-rotation", "d-unknown",

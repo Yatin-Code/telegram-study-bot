@@ -1205,17 +1205,21 @@ def active_plan(chat_id: int | str, *, db_path: str | Path = DEFAULT_DB_PATH) ->
         ).fetchone()
         if state is None:
             return None
-        item = conn.execute(
-            "SELECT * FROM daily_plan WHERE notion_page_id=? AND archived=0",
-            (state["plan_item_id"],),
-        ).fetchone()
-    if item is None or item["status"] not in (None, "Planned", "Active"):
+        plan_item_id = state["plan_item_id"]
+        work_item_id = state["work_item_id"]
+    item = _row(
+        "daily_plan",
+        "archived=0 AND (id=? OR notion_page_id=?)",
+        (plan_item_id, plan_item_id),
+        db_path=db_path,
+    )
+    if item is None or item.get("status") not in (None, "Planned", "Active"):
         with _connect(db_path) as conn:
             conn.execute(f"DELETE FROM {ACTIVE_PLAN_TABLE} WHERE chat_id=?", (str(chat_id),))
             conn.commit()
         return None
     result = dict(item)
-    result["work_item_id"] = state["work_item_id"]
+    result["work_item_id"] = work_item_id
     return result
 
 
@@ -1266,18 +1270,20 @@ def activate_next_plan(
     marker_note = f"SQLite work item: {work_id}"
     if marker_note not in existing_note:
         existing_note = marker_note + (f"; {existing_note}" if existing_note else "")
-    notion.update_page(
-        item["notion_page_id"],
+    plan_id = str(item.get("id") or item.get("notion_page_id") or "")
+    operational_store.update(
+        "daily_plan",
+        plan_id,
         {"status": "Active", "planner_note": existing_note},
+        db_path=db_path,
     )
     with _connect(db_path) as conn:
         conn.execute(
             f"INSERT OR REPLACE INTO {ACTIVE_PLAN_TABLE} "
             "(chat_id, plan_item_id, work_item_id, activated_at) VALUES (?,?,?,?)",
-            (str(chat_id), item["notion_page_id"], work_id, session_context.local_now().isoformat()),
+            (str(chat_id), plan_id, work_id, session_context.local_now().isoformat()),
         )
         conn.commit()
-    _sync(("daily_plan", "work_items"), db_path)
     return active_plan(chat_id, db_path=db_path) or {**item, "work_item_id": work_id, "status": "Active"}
 
 
@@ -1289,7 +1295,8 @@ def complete_active_plan(
     if not item:
         raise DomainError("no active plan item")
     plan_status = "Moved" if carry_to_backlog else "Completed"
-    notion.update_page(item["notion_page_id"], {"status": plan_status})
+    plan_id = str(item.get("id") or item.get("notion_page_id") or "")
+    operational_store.update("daily_plan", plan_id, {"status": plan_status}, db_path=db_path)
     work_id = item.get("work_item_id")
     if work_id:
         operational_store.update("work_items", work_id, {
@@ -1299,8 +1306,7 @@ def complete_active_plan(
     with _connect(db_path) as conn:
         conn.execute(f"DELETE FROM {ACTIVE_PLAN_TABLE} WHERE chat_id=?", (str(chat_id),))
         conn.commit()
-    _sync(("daily_plan", "work_items"), db_path)
-    return {"plan_item_id": item["notion_page_id"], "work_item_id": work_id, "status": plan_status}
+    return {"plan_item_id": plan_id, "work_item_id": work_id, "status": plan_status}
 
 
 def weak_points(*, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:

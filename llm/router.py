@@ -24,6 +24,7 @@ import dataclasses
 import logging
 import sqlite3
 import time
+from collections.abc import Iterator
 from typing import Any, Callable, Literal, Optional
 
 import httpx
@@ -320,6 +321,169 @@ def complete(req: LLMRequest, *, _certify_route: Optional[registry.Route] = None
         )
 
     raise AllRoutesExhausted(attempts_log)
+
+
+def stream_complete(req: LLMRequest) -> Iterator[str]:
+    """Yield text deltas for agent chat streaming.
+
+    Same route selection as ``complete`` (Eaon first, then certified pool), but
+    stops at the first route that streams successfully. Non-streaming adapters
+    yield one full chunk. Tool-call / structured paths should keep using
+    ``complete`` — this is for user-visible final replies only.
+    """
+    route = _FORCED_ROUTE.get()
+    if route is not None:
+        env = env_loader.load()
+        api_key = env.get(route.env_key, "")
+        if not api_key:
+            raise RouterUnavailable(f"no key for {route.id}")
+        base_url = registry.resolve_base_url(route, env)
+        estimated = quota.estimate_tokens(req.messages, req.max_output_tokens)
+        reservation = quota.reserve(route, req.purpose, estimated)
+        if reservation is None:
+            raise AllRoutesExhausted([(route.id, "quota_or_cooldown")])
+        try:
+            parts: list[str] = []
+            for delta in adapters.stream_call(route, req, api_key, base_url):
+                parts.append(delta)
+                yield delta
+            text = "".join(parts)
+            try:
+                _validate(req, text)
+            except Exception:
+                quota.reconcile(reservation, route, success=True, reason="validation_failed")
+                quota.record_route_result(route.id, success=True)
+                raise AllRoutesExhausted([(route.id, "validation_failed")])
+            quota.reconcile(reservation, route, success=True)
+            quota.record_route_result(route.id, success=True)
+        except AllRoutesExhausted:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            reason, _ = _classify(exc)
+            headers = dict(exc.response.headers) if isinstance(exc, httpx.HTTPStatusError) else {}
+            quota.reconcile(reservation, route, success=False, rate_headers=headers, reason=reason)
+            quota.record_route_result(route.id, success=False, reason=reason)
+            raise AllRoutesExhausted([(route.id, reason)]) from exc
+        return
+
+    env = env_loader.load()
+    resolved = registry.resolve_routes(env)
+    legacy_ok = _legacy_configured()
+    if not resolved and not legacy_ok:
+        raise RouterUnavailable("no resolvable routes and no legacy gateway configured")
+
+    attempts_log: list[tuple[str, str]] = []
+    estimated = quota.estimate_tokens(req.messages, req.max_output_tokens)
+
+    if legacy_ok:
+        try:
+            for delta in _legacy_stream(req):
+                yield delta
+            quota.record_unmetered_request(
+                "eaon:legacy", req.purpose, estimated, success=True,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            reason, _ = _classify(exc)
+            quota.record_unmetered_request(
+                "eaon:legacy", req.purpose, estimated, success=False, reason=reason,
+            )
+            attempts_log.append(("eaon:legacy", reason))
+
+    candidates = _candidate_routes(req, resolved, estimated)
+    for route in candidates:
+        api_key = env.get(route.env_key, "")
+        if not api_key:
+            attempts_log.append((route.id, "missing_key"))
+            continue
+        base_url = registry.resolve_base_url(route, env)
+        try:
+            reservation = quota.reserve(route, req.purpose, estimated)
+        except sqlite3.OperationalError as exc:
+            attempts_log.append((route.id, "quota_db_locked"))
+            continue
+        if reservation is None:
+            attempts_log.append((route.id, "quota_or_cooldown"))
+            continue
+        try:
+            parts = []
+            for delta in adapters.stream_call(route, req, api_key, base_url):
+                parts.append(delta)
+                yield delta
+            text = "".join(parts)
+            try:
+                _validate(req, text)
+            except Exception:
+                quota.reconcile(reservation, route, success=True, reason="validation_failed")
+                quota.record_route_result(route.id, success=True)
+                attempts_log.append((route.id, "validation_failed"))
+                continue
+            quota.reconcile(reservation, route, success=True)
+            quota.record_route_result(route.id, success=True)
+            return
+        except Exception as exc:  # noqa: BLE001
+            reason, _ = _classify(exc)
+            headers = dict(exc.response.headers) if isinstance(exc, httpx.HTTPStatusError) else {}
+            quota.reconcile(reservation, route, success=False, rate_headers=headers, reason=reason)
+            quota.record_route_result(
+                route.id, success=False, reason=reason,
+                retry_after=headers.get("retry-after"),
+            )
+            attempts_log.append((route.id, reason))
+            logger.info("stream route %s failed (%s); advancing", route.id, reason)
+            continue
+
+    raise AllRoutesExhausted(attempts_log)
+
+
+def _legacy_stream(req: LLMRequest) -> Iterator[str]:
+    """Stream from the Eaon OpenAI-compatible gateway; fall back to full call."""
+    provider = settings.llm_provider()
+    if provider == "anthropic":
+        text, _latency = _legacy_call(req)
+        if text:
+            yield text
+        return
+
+    timeout = adapters._timeout_for(req.purpose)
+    models = _legacy_models()
+    if req.pinned_model and req.pinned_model not in models:
+        models = [req.pinned_model, *models]
+    last: Optional[Exception] = None
+    for model in models:
+        try:
+            url = settings.llm_base_url().rstrip("/") + "/chat/completions"
+            payload = {
+                "model": model,
+                "messages": req.messages,
+                "temperature": req.temperature,
+                "max_tokens": req.max_output_tokens,
+                "stream": True,
+            }
+            with httpx.Client(timeout=timeout) as client:
+                with client.stream(
+                    "POST", url, json=payload, headers=_legacy_headers_openai(),
+                ) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        delta = adapters._openai_delta_from_sse_line(line)
+                        if delta:
+                            yield delta
+            return
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            reason, _ = _classify(exc)
+            logger.warning("legacy stream model %s failed: %s", model, reason)
+            continue
+    if last is not None:
+        # Last resort: non-streaming legacy call.
+        text, _ = _legacy_call(req)
+        if text:
+            yield text
+        return
+    raise RuntimeError("legacy stream produced no models")
 
 
 def _summarise(attempts: list[tuple[str, str]]) -> str:

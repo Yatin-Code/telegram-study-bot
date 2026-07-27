@@ -12,10 +12,9 @@ from notion_client_wrapper import _request
 
 
 HUB_TITLE = "Study Bot System"
-MANAGED_KEYS = (
-    "work_items", "goals", "exams", "exam_questions",
-    "doubt_attempts", "timetable", "daily_plan",
-)
+# SQL-owned domains live in operational_store (op_*). This script no longer
+# creates Notion DBs for them. ledger/doubts/revision are user-authored outside.
+MANAGED_KEYS: tuple[str, ...] = ()
 
 
 def _schema_payload(prop: dict[str, Any], resolved: dict[str, str]) -> dict[str, Any] | None:

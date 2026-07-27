@@ -11,6 +11,14 @@ import pytest
 import rich_message
 
 
+@pytest.fixture(autouse=True)
+def _reset_rich_latch():
+    rich_message.reset_capability_latch()
+    yield
+    rich_message.reset_capability_latch()
+
+
+
 class _FakeResponse:
     def __init__(self, data: dict, status_code: int = 200):
         self._data = data
@@ -189,3 +197,29 @@ async def test_rich_messages_disabled_skips_rich(monkeypatch):
 async def test_send_rich_message_draft_rejects_zero_draft_id():
     with pytest.raises(ValueError, match="non-zero"):
         await rich_message.send_rich_message_draft("tok", 1, {"markdown": "x"}, 0)
+
+
+async def test_capability_latch_skips_rich_after_unsupported(monkeypatch):
+    monkeypatch.setenv("RICH_MESSAGES", "1")
+    rich_message.reset_capability_latch()
+
+    class _MissingMethodClient(_FakeAsyncClient):
+        async def post(self, url: str, json: dict | None = None):
+            method = url.rstrip("/").rsplit("/", 1)[-1]
+            self.calls.append((method, dict(json or {})))
+            if method == "sendRichMessage":
+                return _FakeResponse({"ok": False, "description": "Unknown method"}, 404)
+            return _FakeResponse(self._default_ok)
+
+    client = _MissingMethodClient()
+    with _patch_client(client):
+        await rich_message.send_rich("tok", 1, "hi", parse_mode="markdown")
+    assert rich_message._rich_unsupported is True
+    # second call should go straight to plain, never retry sendRichMessage
+    client2 = _FakeAsyncClient()
+    with _patch_client(client2):
+        await rich_message.send_rich("tok", 1, "again", parse_mode="markdown")
+    methods = [m for m, _ in client2.calls]
+    assert "sendRichMessage" not in methods
+    assert "sendMessage" in methods
+    rich_message.reset_capability_latch()

@@ -19,13 +19,14 @@ from .errors import AllRoutesExhausted, RouterUnavailable
 
 def __getattr__(name: str):
     """Lazy router re-exports; keeps ``python -m llm.certify`` deterministic."""
-    if name in {"LLMRequest", "LLMResponse", "complete"}:
+    if name in {"LLMRequest", "LLMResponse", "complete", "stream_complete"}:
         from . import router
         return getattr(router, name)
     raise AttributeError(name)
 
 __all__ = [
     "complete",
+    "stream_complete",
     "LLMRequest",
     "LLMResponse",
     "RouterUnavailable",

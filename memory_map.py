@@ -42,7 +42,6 @@ _MIRROR_TABLES = [
     ("ledger", "ledger"),
     ("doubts", "doubts"),
     ("revision", "revision"),
-    ("daily_plan", "daily plan"),
 ]
 _OP_TABLES = [
     ("op_goals", "goals"),
@@ -51,6 +50,7 @@ _OP_TABLES = [
     ("op_exam_questions", "exam questions"),
     ("op_doubt_attempts", "doubt attempts"),
     ("op_timetable", "coaching schedule"),
+    ("op_daily_plan", "daily plan"),
     ("op_execution_links", "execution links"),
 ]
 _INTERNAL_TABLES = [

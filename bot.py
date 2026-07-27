@@ -683,6 +683,7 @@ def _inspect_home_view() -> tuple[str, InlineKeyboardMarkup]:
     )
     buttons = [
         [InlineKeyboardButton("📊 SQLite Mirror", callback_data="inspect:menu:sqlite")],
+        [InlineKeyboardButton("⚙️ Operational / Memory", callback_data="inspect:menu:ops")],
         [InlineKeyboardButton("☁️ Notion Sync Status", callback_data="inspect:menu:notion")],
         [InlineKeyboardButton("🧠 In-Context Memory", callback_data="inspect:menu:context")],
     ]
@@ -697,24 +698,20 @@ def _inspect_sqlite_menu() -> tuple[str, InlineKeyboardMarkup]:
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         counts = {}
-        for table in ("ledger", "doubts", "revision", "daily_plan", "goals", "work_items", "exams", "timetable"):
+        for table in ("ledger", "doubts", "revision"):
             try:
                 row = conn.execute(f'SELECT COUNT(*) AS n FROM "{table}" WHERE archived=0').fetchone()
                 counts[table] = row["n"] if row else 0
-            except:
+            except Exception:
                 counts[table] = 0
         conn.close()
-        
+
         text = (
-            "📊 *SQLite Mirror*\n\n"
+            "📊 *Notion Mirror* (ledger / doubts / revision)\n\n"
             f"• Ledger: {counts['ledger']} active sessions\n"
             f"• Doubts: {counts['doubts']} active doubts\n"
-            f"• Revision: {counts['revision']} active items\n"
-            f"• Daily Plan: {counts['daily_plan']} active tasks\n"
-            f"• Goals: {counts['goals']} active goals\n"
-            f"• Work Items: {counts['work_items']} backlog items\n"
-            f"• Exams: {counts['exams']} scheduled\n"
-            f"• Timetable: {counts['timetable']} classes\n\n"
+            f"• Revision: {counts['revision']} active items\n\n"
+            "Planning tables live under Operational / Memory.\n\n"
             "Tap a table to see recent records:"
         )
     except Exception as e:
@@ -729,11 +726,90 @@ def _inspect_sqlite_menu() -> tuple[str, InlineKeyboardMarkup]:
         ])
         buttons.append([
             InlineKeyboardButton(f"Revision ({counts.get('revision', 0)})", callback_data="inspect:table:revision"),
-            InlineKeyboardButton(f"Goals ({counts.get('goals', 0)})", callback_data="inspect:table:goals"),
+        ])
+    buttons.append([InlineKeyboardButton("↩ Back", callback_data="inspect:home")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _inspect_ops_menu() -> tuple[str, InlineKeyboardMarkup]:
+    """Operational + memory tables (not Notion-mirrored)."""
+    import sqlite3
+    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
+    tables = (
+        "op_goals", "op_exams", "op_work_items", "op_timetable", "op_daily_plan",
+        "op_doubt_attempts", "user_prefs", "user_jobs", "conversation_history",
+        "chat_context",
+    )
+    counts: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(str(db))
+        for table in tables:
+            try:
+                if table in ("user_prefs",):
+                    row = conn.execute(
+                        f'SELECT COUNT(*) AS n FROM "{table}" WHERE active = 1'
+                    ).fetchone()
+                elif table in ("user_jobs",):
+                    row = conn.execute(
+                        f'SELECT COUNT(*) AS n FROM "{table}" WHERE enabled = 1'
+                    ).fetchone()
+                elif table in ("conversation_history", "chat_context"):
+                    row = conn.execute(f'SELECT COUNT(*) AS n FROM "{table}"').fetchone()
+                else:
+                    row = conn.execute(
+                        f'SELECT COUNT(*) AS n FROM "{table}" WHERE archived=0'
+                    ).fetchone()
+                counts[table] = int(row[0]) if row else 0
+            except Exception:
+                counts[table] = 0
+        conn.close()
+        text = (
+            "⚙️ *Operational / Memory*\n\n"
+            f"• op_goals: {counts.get('op_goals', 0)}\n"
+            f"• op_exams: {counts.get('op_exams', 0)}\n"
+            f"• op_work_items: {counts.get('op_work_items', 0)}\n"
+            f"• op_timetable: {counts.get('op_timetable', 0)}\n"
+            f"• op_daily_plan: {counts.get('op_daily_plan', 0)}\n"
+            f"• op_doubt_attempts: {counts.get('op_doubt_attempts', 0)}\n"
+            f"• user_prefs: {counts.get('user_prefs', 0)}\n"
+            f"• user_jobs: {counts.get('user_jobs', 0)}\n"
+            f"• conversation_history: {counts.get('conversation_history', 0)}\n"
+            f"• chat_context: {counts.get('chat_context', 0)}\n\n"
+            "Tap a table to see recent records:"
+        )
+    except Exception as e:
+        text = f"⚠️ Operational read failed: {e}"
+        counts = {}
+
+    buttons = []
+    if counts:
+        buttons.append([
+            InlineKeyboardButton(f"op_goals ({counts.get('op_goals', 0)})", callback_data="inspect:table:op_goals"),
+            InlineKeyboardButton(f"op_exams ({counts.get('op_exams', 0)})", callback_data="inspect:table:op_exams"),
         ])
         buttons.append([
-            InlineKeyboardButton(f"Exams ({counts.get('exams', 0)})", callback_data="inspect:table:exams"),
-            InlineKeyboardButton(f"Plan ({counts.get('daily_plan', 0)})", callback_data="inspect:table:daily_plan"),
+            InlineKeyboardButton(f"op_work ({counts.get('op_work_items', 0)})", callback_data="inspect:table:op_work_items"),
+            InlineKeyboardButton(f"op_tt ({counts.get('op_timetable', 0)})", callback_data="inspect:table:op_timetable"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                f"op_plan ({counts.get('op_daily_plan', 0)})",
+                callback_data="inspect:table:op_daily_plan",
+            ),
+        ])
+        buttons.append([
+            InlineKeyboardButton(f"prefs ({counts.get('user_prefs', 0)})", callback_data="inspect:table:user_prefs"),
+            InlineKeyboardButton(f"jobs ({counts.get('user_jobs', 0)})", callback_data="inspect:table:user_jobs"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(f"history ({counts.get('conversation_history', 0)})", callback_data="inspect:table:conversation_history"),
+            InlineKeyboardButton(f"context ({counts.get('chat_context', 0)})", callback_data="inspect:table:chat_context"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                f"doubt attempts ({counts.get('op_doubt_attempts', 0)})",
+                callback_data="inspect:table:op_doubt_attempts",
+            ),
         ])
     buttons.append([InlineKeyboardButton("↩ Back", callback_data="inspect:home")])
     return text, InlineKeyboardMarkup(buttons)
@@ -749,40 +825,78 @@ def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboard
         "ledger": ("task", ["date", "task", "questions_attempted", "questions_correct", "cognitive_yield"]),
         "doubts": ("core_concept", ["date_logged", "core_concept", "status"]),
         "revision": ("chapter_module", ["next_execution_date", "chapter_module", "subject"]),
-        "daily_plan": ("title", ["plan_date", "sequence", "title", "status"]),
-        "goals": ("title", ["title", "target", "metric", "period", "status"]),
-        "work_items": ("title", ["title", "kind", "priority", "status"]),
-        "exams": ("title", ["exam_date", "title", "kind", "status", "max_marks", "actual_marks"]),
-        "timetable": ("title", ["weekday", "start_time", "end_time", "title", "subject"]),
+        "op_daily_plan": ("title", ["plan_date", "sequence", "title", "status"]),
+        "op_goals": ("title", ["title", "target", "metric", "period", "status", "subject"]),
+        "op_exams": ("title", ["exam_date", "title", "kind", "status", "max_marks", "actual_marks"]),
+        "op_work_items": ("title", ["title", "kind", "priority", "status", "subject"]),
+        "op_timetable": ("title", ["weekday", "start_time", "end_time", "title", "subject"]),
+        "op_doubt_attempts": ("title", ["title", "attempt_no", "outcome", "stuck_point"]),
+        "user_prefs": ("text", ["text", "category", "created_at", "active"]),
+        "user_jobs": ("title", ["title", "schedule_kind", "run_time", "action_kind", "enabled", "last_run"]),
+        "conversation_history": ("content", ["role", "content", "tool_name", "created_at"]),
+        "chat_context": ("subject", ["chat_id", "subject", "chapter", "block", "session_started_at"]),
     }
-    
+    ops_tables = {
+        "op_goals", "op_exams", "op_work_items", "op_timetable", "op_daily_plan",
+        "op_doubt_attempts", "user_prefs", "user_jobs", "conversation_history", "chat_context",
+    }
+    back_menu = "inspect:menu:ops" if table in ops_tables else "inspect:menu:sqlite"
+
     if table not in config:
         return f"⚠️ Unknown table: {table}", InlineKeyboardMarkup([[
-            InlineKeyboardButton("↩ Back", callback_data="inspect:menu:sqlite")
+            InlineKeyboardButton("↩ Back", callback_data=back_menu)
         ]])
-    
+
     title_col, display_cols = config[table]
-    
+
     try:
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            f'SELECT * FROM "{table}" WHERE archived=0 '
-            f'ORDER BY COALESCE(last_edited_time, created_time, last_synced_at) DESC LIMIT ?',
-            (limit,)
-        ).fetchall()
-        conn.close()
-        
-        if not rows:
-            text = f"📊 *{table.title()}*\n\nNo active records found."
+        if table == "user_prefs":
+            rows = conn.execute(
+                'SELECT * FROM "user_prefs" WHERE active = 1 '
+                'ORDER BY created_at DESC LIMIT ?',
+                (limit,),
+            ).fetchall()
+        elif table == "user_jobs":
+            rows = conn.execute(
+                'SELECT * FROM "user_jobs" ORDER BY id DESC LIMIT ?',
+                (limit,),
+            ).fetchall()
+        elif table == "conversation_history":
+            rows = conn.execute(
+                'SELECT * FROM "conversation_history" '
+                'ORDER BY id DESC LIMIT ?',
+                (limit,),
+            ).fetchall()
+        elif table == "chat_context":
+            rows = conn.execute(
+                'SELECT * FROM "chat_context" LIMIT ?',
+                (limit,),
+            ).fetchall()
         else:
-            lines = [f"📊 *{table.title()}* (showing {len(rows)} most recent)\n"]
+            rows = conn.execute(
+                f'SELECT * FROM "{table}" WHERE archived=0 '
+                f'ORDER BY COALESCE(last_edited_time, created_time, last_synced_at) DESC LIMIT ?',
+                (limit,)
+            ).fetchall()
+        conn.close()
+
+        if not rows:
+            text = f"📊 *{table}*\n\nNo active records found."
+        else:
+            lines = [f"📊 *{table}* (showing {len(rows)} most recent)\n"]
             for i, row in enumerate(rows, 1):
-                lines.append(f"\n*{i}.* {row[title_col] or '(untitled)'}")
+                title_val = row[title_col] if title_col in row.keys() else None
+                title_str = str(title_val) if title_val not in (None, "") else "(untitled)"
+                if len(title_str) > 80:
+                    title_str = title_str[:77] + "..."
+                lines.append(f"\n*{i}.* {title_str}")
                 for col in display_cols:
+                    if col == title_col:
+                        continue
                     val = row[col] if col in row.keys() else None
                     if val is not None and val != "":
-                        # Truncate long values
                         val_str = str(val)
                         if len(val_str) > 100:
                             val_str = val_str[:97] + "..."
@@ -790,9 +904,9 @@ def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboard
             text = "\n".join(lines)
     except Exception as e:
         text = f"⚠️ Failed to read {table}: {e}"
-    
+
     buttons = [
-        [InlineKeyboardButton("↩ Back to Tables", callback_data="inspect:menu:sqlite")],
+        [InlineKeyboardButton("↩ Back to Tables", callback_data=back_menu)],
         [InlineKeyboardButton("🏠 Home", callback_data="inspect:home")],
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -913,6 +1027,8 @@ async def on_inspect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif action == "menu":
             if param == "sqlite":
                 text, markup = _inspect_sqlite_menu()
+            elif param == "ops":
+                text, markup = _inspect_ops_menu()
             elif param == "notion":
                 text, markup = _inspect_notion_view()
             elif param == "context":
@@ -965,7 +1081,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         counts = {t: conn.execute(f'SELECT COUNT(*) AS n FROM "{t}" WHERE archived=0').fetchone()["n"]
-                  for t in ("ledger", "doubts", "revision", "daily_plan")}
+                  for t in ("ledger", "doubts", "revision")}
         meta = conn.execute(
             "SELECT db_key, last_completed_at FROM sync_meta ORDER BY last_completed_at DESC LIMIT 1"
         ).fetchone()
@@ -978,8 +1094,8 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = session_context.get_context(update.effective_chat.id)
     lines = [
         "🤖 *Bot Health*",
-        f"• Notion mirror: ledger={counts['ledger']}, doubts={counts['doubts']}, revision={counts['revision']}, plan={counts['daily_plan']}",
-        f"• SQLite: {operations['integrity']}, schema v{operations['schema_version']}, goals={operations['counts']['goals']}, backlog={operations['counts']['work_items']}",
+        f"• Notion mirror: ledger={counts['ledger']}, doubts={counts['doubts']}, revision={counts['revision']}",
+        f"• SQLite: {operations['integrity']}, schema v{operations['schema_version']}, goals={operations['counts'].get('goals', 0)}, backlog={operations['counts'].get('work_items', 0)}, plan={operations['counts'].get('daily_plan', 0)}",
         f"• Last sync: {last_sync}",
         f"• Context: {_format_context(ctx)}",
         f"• Pending writes: {logging_flow.pending_count()} "
@@ -2684,6 +2800,7 @@ async def _handle_agent_text(update: Update, chat_id: int, text: str) -> None:
     """Route a free-form user message through the agentic loop."""
     message = update.effective_message
     status_msg = None
+    streamer = agent_renderer.AgentChatStreamer(message)
 
     async def on_status(status_text: str) -> None:
         nonlocal status_msg
@@ -2695,7 +2812,9 @@ async def _handle_agent_text(update: Update, chat_id: int, text: str) -> None:
         except Exception:
             pass
 
-    result = await agent.run(chat_id, text, on_status=on_status)
+    result = await agent.run(
+        chat_id, text, on_status=on_status, on_stream=streamer.on_stream,
+    )
 
     if result["type"] == "preview":
         preview = result["preview"]
@@ -2718,7 +2837,9 @@ async def _handle_agent_text(update: Update, chat_id: int, text: str) -> None:
             await status_msg.delete()
         except Exception:
             pass
-    await agent_renderer.render(update, result["response"])
+    finalized = await streamer.finalize(result["response"])
+    if finalized is None:
+        await agent_renderer.render(update, result["response"])
 
 
 def _errors_last_24h() -> int:
@@ -2752,6 +2873,7 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     confirmed = action == "confirm"
 
     status_msg = None
+    streamer = agent_renderer.AgentChatStreamer(query.message)
 
     async def on_status(text: str) -> None:
         nonlocal status_msg
@@ -2763,7 +2885,9 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             pass
 
-    result = await agent.continue_run(state_id, confirmed=confirmed, on_status=on_status)
+    result = await agent.continue_run(
+        state_id, confirmed=confirmed, on_status=on_status, on_stream=streamer.on_stream,
+    )
 
     if result["type"] == "preview":
         preview = result["preview"]
@@ -2785,7 +2909,9 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await status_msg.delete()
         except Exception:
             pass
-    await agent_renderer.render(query, result["response"])
+    finalized = await streamer.finalize(result["response"])
+    if finalized is None:
+        await agent_renderer.render(query, result["response"])
 
 
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3336,7 +3462,7 @@ async def _expire_drafts(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _planning_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await sync.sync_once_locked(db_keys=("daily_plan", "goals", "work_items", "revision"))
+        await sync.sync_once_locked(db_keys=("revision", "doubts", "ledger"))
         today = session_context.local_today_iso()
         if reminders.claim(f"planning:{today}"):
             message = await asyncio.to_thread(reminders.planning_message)
@@ -3348,7 +3474,7 @@ async def _planning_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _schedule_watch_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await sync.sync_once_locked(
-            db_keys=("daily_plan", "goals", "work_items", "revision", "exams")
+            db_keys=("revision", "doubts", "ledger")
         )
         change = await asyncio.to_thread(reminders.settled_plan_change)
         if change and reminders.claim(change[0]):
@@ -3444,7 +3570,7 @@ async def _exam_reminder_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await sync.sync_once_locked(db_keys=("doubts", "doubt_attempts", "timetable", "daily_plan"))
+        await sync.sync_once_locked(db_keys=("doubts", "revision", "ledger"))
         for item in await asyncio.to_thread(reminders.teacher_opportunities):
             window, decision = item["window"], item["decision"]
             key = reminders.teacher_event_key(window, decision, item.get("doubts"))

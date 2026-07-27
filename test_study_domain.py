@@ -23,21 +23,40 @@ def db(tmp_path):
     path = tmp_path / "domain.db"
     with sync.connect(path) as conn:
         sync.init_db(conn)
+        operational_store.init_db(conn)
     return path
 
 
 def insert(path, table, **values):
+    # Map domain keys / bare legacy names to physical tables.
+    physical = {
+        "goals": "op_goals",
+        "work_items": "op_work_items",
+        "exams": "op_exams",
+        "exam_questions": "op_exam_questions",
+        "doubt_attempts": "op_doubt_attempts",
+        "timetable": "op_timetable",
+        "daily_plan": "op_daily_plan",
+    }.get(table, table)
     base = {
         "notion_page_id": values.pop("notion_page_id", f"{table}-id"),
         "archived": 0,
         "last_synced_at": "2026-07-20T00:00:00+00:00",
         "raw_json": "{}",
     }
+    if physical.startswith("op_"):
+        # op_* tables need id + timestamps for operational_store schema.
+        base.setdefault("id", base["notion_page_id"])
+        base.setdefault("created_time", "2026-07-20T00:00:00+00:00")
+        base.setdefault("last_edited_time", "2026-07-20T00:00:00+00:00")
     base.update(values)
     with sqlite3.connect(path) as conn:
+        # Ensure op_* schema exists when tests only call sync.init_db.
+        if physical.startswith("op_"):
+            operational_store.init_db(conn)
         cols = ",".join(f'"{key}"' for key in base)
         marks = ",".join("?" for _ in base)
-        conn.execute(f'INSERT INTO "{table}" ({cols}) VALUES ({marks})', tuple(base.values()))
+        conn.execute(f'INSERT INTO "{physical}" ({cols}) VALUES ({marks})', tuple(base.values()))
         conn.commit()
 
 
@@ -441,9 +460,15 @@ def test_activating_unlinked_plan_creates_and_tracks_work_item(db, monkeypatch):
         captured.update(props)
         return {"id": "work-created"}
 
-    updates = []
+    op_updates = []
+    real_update = operational_store.update
+
+    def fake_op_update(db_key, record_id, properties, *, db_path=None):
+        op_updates.append((db_key, record_id, dict(properties)))
+        return real_update(db_key, record_id, properties, db_path=db_path)
+
     monkeypatch.setattr(sd, "create_work_item", fake_create)
-    monkeypatch.setattr(sd.notion, "update_page", lambda page_id, props: updates.append((page_id, props)) or {})
+    monkeypatch.setattr(operational_store, "update", fake_op_update)
     monkeypatch.setattr(sd, "_sync", lambda *args, **kwargs: None)
 
     active = sd.activate_next_plan("chat-1", "2026-07-20", db_path=db)
@@ -451,10 +476,13 @@ def test_activating_unlinked_plan_creates_and_tracks_work_item(db, monkeypatch):
     assert captured["kind"] == "Coaching Homework"
     assert captured["status"] == "Active"
     assert captured["operation_id"] == "plan-work:plan-1"
-    assert (
-        "plan-1",
-        {"status": "Active", "planner_note": "SQLite work item: work-created"},
-    ) in updates
+    assert any(
+        key == "daily_plan"
+        and rid == "plan-1"
+        and props.get("status") == "Active"
+        and "work-created" in str(props.get("planner_note") or "")
+        for key, rid, props in op_updates
+    )
 
 
 def test_reminder_claim_is_idempotent(db):
@@ -480,7 +508,7 @@ def test_schedule_watcher_waits_for_notion_edits_to_settle(db, monkeypatch):
     assert reminders.settled_plan_change(now=now, db_path=db) is None
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "UPDATE daily_plan SET last_edited_time=?",
+            "UPDATE op_daily_plan SET last_edited_time=?",
             ((now - dt.timedelta(minutes=4)).isoformat(),),
         )
         conn.commit()
@@ -661,7 +689,7 @@ def test_planner_is_bounded_and_does_not_mutate_plan(db):
     assert result["max_iterations"] == 3
     assert result["suggestions"]
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM daily_plan").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM op_daily_plan").fetchone()[0] == 1
 
 
 def test_weak_points_merge_multiple_evidence_sources(db):

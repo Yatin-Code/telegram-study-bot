@@ -331,6 +331,12 @@ def memory_prompt_block(
             db_path=db_path,
         )
     ]
+    goals.extend(
+        g for g in study_domain._rows(
+            "op_goals", "archived=0 AND status='Active' AND period IN ('Daily','Weekly')",
+            db_path=db_path,
+        )
+    )
     if goals:
         lines.append(
             "USER COMMITMENTS (adherence below comes from deterministic checks; "
@@ -341,7 +347,7 @@ def memory_prompt_block(
                 f"- {goal.get('title')} — target "
                 f"{commitments.format_target(goal.get('target'), goal.get('metric'), goal.get('period'))}"
             )
-            goal_id = goal.get("notion_page_id")
+            goal_id = goal.get("notion_page_id") or goal.get("id")
             if goal_id and goal.get("period") == "Daily":
                 days = commitments.streak(goal_id, as_of=today, db_path=db_path)
                 stats = commitments.adherence(goal_id, as_of=today, db_path=db_path)
@@ -353,12 +359,17 @@ def memory_prompt_block(
         if prefs:
             lines.append("USER PREFERENCES (frame advice around these; they are not data):")
             lines.extend(f"- {p['text']}" for p in prefs)
+        # Work items / active plan from operational store too
         try:
-            import learner_profile
-            profile_block = learner_profile.prompt_block(chat_id, db_path=db_path)
-            if profile_block:
-                lines.append(profile_block)
+            work_items = study_domain._rows(
+                "op_work_items",
+                "archived=0 AND status IN ('Planned','In Progress')",
+                db_path=db_path,
+            )
+            if work_items:
+                lines.append("ACTIVE WORK ITEMS:")
+                for wi in work_items[:10]:
+                    lines.append(f"- {wi.get('title')} ({wi.get('status')})")
         except Exception:
-            # Personalisation is advisory; it must never break a data answer.
             pass
     return "\n".join(lines)

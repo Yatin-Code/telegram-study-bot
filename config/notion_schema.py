@@ -1,30 +1,18 @@
 """
-Notion schema for the three study-tracking databases.
+Property schemas for study data domains.
 
-Source of truth: spec Section 1 "Known Notion schema".
-This module hardcodes the *known* structure (property names, types, option
-lists) so the rest of the bot never has to re-discover it at runtime.
+Ownership (see config.ownership):
+  - Notion-owned (mirrored): ledger, doubts, revision
+  - SQLite-owned (op_* tables): work_items, goals, exams, exam_questions,
+    doubt_attempts, timetable, daily_plan
 
-The only thing that CANNOT be hardcoded here is the live `database_id` /
-`data_source_id` for each DB — those must be resolved in Phase 2 by calling
-Notion's /v1/search with the integration token. Until then they are None.
+This module hardcodes property names, types, and option lists so the rest of
+the bot never has to re-discover them at runtime. Property defs are reused for
+both Notion writes (Notion-owned) and SQLite column generation (SQL-owned).
 
-Field name mapping convention
------------------------------
-Each property is recorded as a dict with:
-    notion_name : exact Notion property name (do NOT rename — writes depend on this)
-    type        : one of title | rich_text | number | select | status | date |
-                  checkbox | relation | rollup | formula | people
-    human_name  : short stable key used in code / LLM JSON / SQLite columns
-    options     : list of allowed values for select/status (None otherwise)
-    required    : True if Notion requires this property on page creation
-    read_only   : True for formula/rollup fields — never write these
-    relates_to  : for relation fields, the target DB key in this module
-    notes       : free-form clarification from the spec
-
-DB keys: "ledger", "doubts", "revision"  (used everywhere in code, never the
-human title, which has spaces/punctuation).
+Live Notion `database_id` / `data_source_id` only matter for Notion-owned keys.
 """
+
 
 from __future__ import annotations
 

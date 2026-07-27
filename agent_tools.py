@@ -218,7 +218,7 @@ TOOL_SPECS = [
         "description": (
             "Read-only SELECT query against the local SQLite mirror. "
             "Use this to inspect study data: ledger (study sessions), doubts, exams, "
-            "work_items (backlog), daily_plan, chat_context (session subject/chapter), "
+            "op_work_items (backlog), op_daily_plan, chat_context (session subject/chapter), "
             "commitments, learner_profiles, etc. "
             "ALWAYS use only column names shown in the SQLite schema block in your prompt — "
             "never invent column names."
@@ -254,7 +254,7 @@ TOOL_SPECS = [
             "Inspect the local SQLite mirror schema. Call with no arguments to list all tables. "
             "Call with a table name to get column names, types, and 3 sample rows. "
             "Use this whenever you are unsure about column names or a table exists. "
-            "Known important tables: ledger, doubts, exams, work_items, daily_plan, "
+            "Known important tables: ledger, doubts, revision (Notion); op_exams, op_work_items, op_daily_plan, op_goals (SQLite); "
             "chat_context, commitments, learner_profiles, active_plan_state."
         ),
         "parameters": {

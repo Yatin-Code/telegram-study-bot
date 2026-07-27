@@ -11,6 +11,8 @@ longer patch per-module transport helpers.
 from __future__ import annotations
 
 import dataclasses
+import json
+from collections.abc import Iterator
 from typing import Any, Optional, Protocol
 
 import httpx
@@ -202,3 +204,53 @@ def call(route: Route, req: Any, api_key: str, base_url: str) -> AdapterResult:
     resp = _http_post(url, headers=headers, json=body, timeout=_timeout_for(req.purpose))
     resp.raise_for_status()
     return adapter.parse(resp)
+
+
+def _openai_delta_from_sse_line(line: str) -> str | None:
+    """Parse one SSE line from an OpenAI-compatible stream. Return delta text or None."""
+    line = line.strip()
+    if not line.startswith("data:"):
+        return None
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        chunk = json.loads(data)
+    except Exception:
+        return None
+    choices = chunk.get("choices") or []
+    if not choices:
+        return None
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    return content if isinstance(content, str) and content else None
+
+
+def stream_call(route: Route, req: Any, api_key: str, base_url: str) -> Iterator[str]:
+    """Yield text deltas for one provider call.
+
+    OpenAI-compatible routes use SSE ``stream=True``. Other adapters fall back
+    to a full non-streaming call and yield the complete text once.
+    """
+    adapter = adapter_for(route)
+    url, body, headers = adapter.build(route, req, api_key, base_url)
+    timeout = _timeout_for(req.purpose)
+
+    if route.adapter == "openai":
+        stream_body = dict(body)
+        stream_body["stream"] = True
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream("POST", url, headers=headers, json=stream_body) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    delta = _openai_delta_from_sse_line(line)
+                    if delta:
+                        yield delta
+        return
+
+    # Non-streaming providers: one-shot yield.
+    result = call(route, req, api_key, base_url)
+    if result.text:
+        yield result.text
