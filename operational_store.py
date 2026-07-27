@@ -354,7 +354,7 @@ def create(
             "notion_page_id": record_id,
             "created_time": now,
             "last_edited_time": now,
-            "last_synced_at": None,
+            "last_synced_at": now,
             "archived": 0,
             "raw_json": "{}",
             **clean,
