@@ -423,18 +423,18 @@ def _load_historical_samples(references: list[str]) -> str:
         except ValueError:
             continue
 
+        start_iso = start.isoformat()
+        end_iso = end.isoformat()
         rows = agent_tools.sqlite_query(
             "SELECT date, subject, COUNT(*) AS sessions, "
             "SUM(questions_attempted) AS qs_attempted, "
             "SUM(questions_correct) AS qs_correct, "
             "SUM(COALESCE(actual_time_min, 0)) AS mins "
             "FROM ledger WHERE (archived IS NULL OR archived = 0) "
-            "AND substr(COALESCE(date,''),1,10) BETWEEN ? AND ? "
+            f"AND substr(COALESCE(date,''),1,10) BETWEEN '{start_iso}' AND '{end_iso}' "
             "GROUP BY substr(COALESCE(date,''),1,10) ORDER BY date DESC LIMIT 30"
         )
-        # Filter rows client-side since sqlite_query doesn't support params
-        rows_dict = [r for r in (rows.get("rows", []) if isinstance(rows, dict) else [])
-                       if start.isoformat() <= str(r.get("date", ""))[:10] <= end.isoformat()]
+        rows_dict = rows.get("rows", []) if isinstance(rows, dict) else []
         if not rows_dict:
             continue
         total_sessions = sum(r.get("sessions") or 0 for r in rows_dict)
@@ -450,7 +450,7 @@ def _load_historical_samples(references: list[str]) -> str:
             f"  - {total_sessions} sessions, {total_qs} questions attempted\n"
             f"  - Accuracy: {accuracy}% ({total_correct}/{total_qs})\n"
             f"  - Subjects: {', '.join(sorted(subjects)) if subjects else 'n/a'}\n"
-            f"  - Date range queried: {start.isoformat()} → {end.isoformat()}"
+            f"  - Date range queried: {start_iso} → {end_iso}"
         )
 
     return "\n\n".join(blocks) if blocks else ""

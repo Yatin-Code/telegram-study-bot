@@ -136,7 +136,10 @@ def _run_sql_battery() -> tuple[int, int, list[str]]:
         raise BatteryUnavailable(f"sql battery unavailable: {exc}") from exc
 
     tmp = Path(tempfile.mkdtemp()) / "certify_gt.db"
-    gt.seed(tmp)
+    try:
+        gt.seed(tmp)
+    except Exception as exc:  # noqa: BLE001
+        raise BatteryUnavailable(f"sql battery seed failed: {exc}") from exc
 
     passed = 0
     failures: list[str] = []

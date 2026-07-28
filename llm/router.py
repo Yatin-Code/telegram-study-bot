@@ -203,7 +203,7 @@ def _complete_forced(req: LLMRequest, route: registry.Route) -> LLMResponse:
             completion_tokens=result.usage_completion, rate_headers=result.rate_headers,
             reason="validation_failed",
         )
-        quota.record_route_result(route.id, success=True)
+        quota.record_route_result(route.id, success=False, reason="validation_failed")
         raise AllRoutesExhausted([(route.id, "validation_failed")])
     quota.reconcile(
         reservation, route, success=True, prompt_tokens=result.usage_prompt,
@@ -305,7 +305,7 @@ def complete(req: LLMRequest, *, _certify_route: Optional[registry.Route] = None
                 completion_tokens=result.usage_completion, rate_headers=result.rate_headers,
                 reason="validation_failed",
             )
-            quota.record_route_result(route.id, success=True)
+            quota.record_route_result(route.id, success=False, reason="validation_failed")
             attempts_log.append((route.id, "validation_failed"))
             logger.info("route %s output rejected by validator; advancing", route.id)
             continue
@@ -346,14 +346,15 @@ def stream_complete(req: LLMRequest) -> Iterator[str]:
             parts: list[str] = []
             for delta in adapters.stream_call(route, req, api_key, base_url):
                 parts.append(delta)
-                yield delta
             text = "".join(parts)
             try:
                 _validate(req, text)
             except Exception:
                 quota.reconcile(reservation, route, success=True, reason="validation_failed")
-                quota.record_route_result(route.id, success=True)
+                quota.record_route_result(route.id, success=False, reason="validation_failed")
                 raise AllRoutesExhausted([(route.id, "validation_failed")])
+            for delta in parts:
+                yield delta
             quota.reconcile(reservation, route, success=True)
             quota.record_route_result(route.id, success=True)
         except AllRoutesExhausted:
@@ -409,15 +410,16 @@ def stream_complete(req: LLMRequest) -> Iterator[str]:
             parts = []
             for delta in adapters.stream_call(route, req, api_key, base_url):
                 parts.append(delta)
-                yield delta
             text = "".join(parts)
             try:
                 _validate(req, text)
             except Exception:
                 quota.reconcile(reservation, route, success=True, reason="validation_failed")
-                quota.record_route_result(route.id, success=True)
+                quota.record_route_result(route.id, success=False, reason="validation_failed")
                 attempts_log.append((route.id, "validation_failed"))
                 continue
+            for delta in parts:
+                yield delta
             quota.reconcile(reservation, route, success=True)
             quota.record_route_result(route.id, success=True)
             return
@@ -563,12 +565,13 @@ def _legacy_anthropic(client: httpx.Client, model: str, req: LLMRequest) -> str:
         url = "https://api.anthropic.com/v1/messages"
     system_text = "\n\n".join(m["content"] for m in req.messages if m["role"] == "system")
     convo = [m for m in req.messages if m["role"] != "system"]
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "max_tokens": req.max_output_tokens,
-        "system": system_text,
         "messages": convo,
     }
+    if system_text:
+        payload["system"] = system_text
     headers = {
         "x-api-key": settings.llm_api_key(),
         "anthropic-version": "2023-06-01",

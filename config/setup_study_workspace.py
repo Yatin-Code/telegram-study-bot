@@ -158,25 +158,27 @@ def setup() -> dict[str, str]:
         elif db["title"] in existing:
             resolved[key] = existing[db["title"]]["id"]
 
-    hub = _find_or_create_hub(_find_exercises_db())
-    for key in MANAGED_KEYS:
-        if key not in resolved:
-            created = _create_database(key, hub["id"], resolved)
-            resolved[key] = created["id"]
+    if MANAGED_KEYS:
+        hub = _find_or_create_hub(_find_exercises_db())
+        for key in MANAGED_KEYS:
+            if key not in resolved:
+                created = _create_database(key, hub["id"], resolved)
+                resolved[key] = created["id"]
 
-    for key, db_id in resolved.items():
-        if key in notion_schema.PROPERTIES_BY_DB:
-            _patch_relations(key, db_id, resolved)
+        for key, db_id in resolved.items():
+            if key in notion_schema.PROPERTIES_BY_DB:
+                _patch_relations(key, db_id, resolved)
 
-    env_values = {f"NOTION_{key.upper()}_DB_ID": resolved[key] for key in MANAGED_KEYS}
-    update_env_file(env_values)
-    os.environ.update(env_values)
+    env_values = {f"NOTION_{key.upper()}_DB_ID": resolved[key] for key in MANAGED_KEYS if key in resolved}
+    if env_values:
+        update_env_file(env_values)
+        os.environ.update(env_values)
     for key, db_id in resolved.items():
         if key in notion_schema.DATABASES:
             notion_schema.DATABASES[key]["database_id"] = db_id
     _patch_doubt_workflow()
     _patch_operation_ids(resolved)
-    return {key: resolved[key] for key in MANAGED_KEYS}
+    return {key: resolved[key] for key in MANAGED_KEYS if key in resolved}
 
 
 def main() -> int:

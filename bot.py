@@ -3725,10 +3725,6 @@ async def post_init(application: Application) -> None:
             _guard_scheduled(_nightly_insight_job), time=_clock(config_settings.nightly_insight_time()),
             days=tuple(range(7)), name="nightly_insight",
         )
-        application.job_queue.run_daily(
-            _guard_scheduled(_nightly_insight_job), time=_clock(config_settings.nightly_insight_time()),
-            days=tuple(range(7)), name="nightly_insight",
-        )
         application.job_queue.run_repeating(
             _guard_scheduled(_exam_reminder_scan), interval=600, first=120, name="exam_reminders"
         )

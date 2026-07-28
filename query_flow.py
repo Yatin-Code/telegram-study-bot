@@ -147,7 +147,7 @@ _DUE_WORDS = {"due", "overdue", "pending", "due for revision"}
 
 def _is_due_query(intent: Any) -> bool:
     kw = (getattr(intent.filters, "keyword", None) or "").lower()
-    if any(w in kw for w in ("due", "overdue")):
+    if any(w in kw for w in _DUE_WORDS):
         return True
     # An explicit search term (keyword or chapter) means the user is looking
     # something up by name, not asking "what's due" — don't force the date filter.

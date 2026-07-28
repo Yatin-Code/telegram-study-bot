@@ -155,7 +155,7 @@ def _resolve_date(value: Any) -> Optional[str]:
             return session_context.local_today_iso()
         if v in ("tomorrow",):
             return (session_context.local_now().date() + dt.timedelta(days=1)).isoformat()
-        m = re.match(r"in\s+(\d+)\s+day", v)
+        m = re.match(r"in\s+(\d+)\s+days?", v)
         if m:
             return (session_context.local_now().date() + dt.timedelta(days=int(m.group(1)))).isoformat()
         # ISO date or datetime?

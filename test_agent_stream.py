@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import agent
 
 
@@ -31,6 +33,7 @@ def test_extract_partial_plain_prose():
     assert agent._extract_partial_user_text("Just a sentence") == "Just a sentence"
 
 
+@pytest.mark.asyncio
 async def test_agent_on_stream_receives_visible_text(monkeypatch):
     chunks = [
         '{"text": "Hi',
@@ -56,6 +59,7 @@ async def test_agent_on_stream_receives_visible_text(monkeypatch):
     assert any("Hi" in s for s in seen)
 
 
+@pytest.mark.asyncio
 async def test_agent_on_stream_skips_tool_json(monkeypatch):
     # First turn (no tool results yet) may stream; tool JSON must stay hidden.
     # After tools run, loop uses complete() and pushes final text once.
@@ -87,6 +91,7 @@ async def test_agent_on_stream_skips_tool_json(monkeypatch):
     assert any("Got it." in s for s in seen)
 
 
+@pytest.mark.asyncio
 async def test_agent_tool_loop_uses_complete_not_stream(monkeypatch):
     stream_calls = [0]
     complete_calls = [0]

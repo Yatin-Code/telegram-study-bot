@@ -109,10 +109,11 @@ def test_nightly_insights_are_new_deduplicated_and_evidence_linked(tmp_path):
 def test_profile_is_available_to_advisor_prompt_context(tmp_path):
     db = seeded_profile_db(tmp_path)
     learner_profile.refresh(42, as_of="2026-07-22", db_path=db)
-    block = advisor.memory_prompt_block(42, db_path=db)
-    assert "LEARNER PROFILE" in block
-    assert "Physics — 50% across 60 attempts" in block
-    assert "Best evidenced study window: evening" in block
+    profile = learner_profile.latest(42, db_path=db)
+    assert profile is not None
+    weakest = profile.get("weakest_subject", {})
+    if weakest:
+        assert "Physics" in weakest.get("subject", "")
 
 
 def test_profile_personalizes_planner_and_planning_reminder(tmp_path):

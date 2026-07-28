@@ -55,6 +55,9 @@ def _init(conn: sqlite3.Connection) -> None:
             editing_field TEXT
         )
     """)
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({DRAFTS_TABLE})")}
+    if "editing_field" not in cols:
+        conn.execute(f"ALTER TABLE {DRAFTS_TABLE} ADD COLUMN editing_field TEXT")
     conn.commit()
 
 

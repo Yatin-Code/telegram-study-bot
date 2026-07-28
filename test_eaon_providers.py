@@ -94,7 +94,7 @@ LARGE_MESSAGES = [
 ]
 
 
-def test_model(model: str, messages: list, label: str, timeout: float = 30) -> dict:
+def _check_model(model: str, messages: list, label: str, timeout: float = 30) -> dict:
     """Test a model with given messages. Returns result dict."""
     url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
     payload = {
@@ -159,7 +159,7 @@ def main():
 
     for model in MODELS:
         print(f"\n--- {model}: simple hello ---")
-        r = test_model(model, SIMPLE_MESSAGES, "simple", timeout=30)
+        r = _check_model(model, SIMPLE_MESSAGES, "simple", timeout=30)
         results.append(r)
         status_icon = "✅" if r["status"] == "ok" else "❌"
         print(f"  {status_icon} {r['status']} | {r.get('http_status','')} | {r['latency_ms']}ms")
@@ -175,7 +175,7 @@ def main():
 
     for model in MODELS:
         print(f"\n--- {model}: large payload ---")
-        r = test_model(model, LARGE_MESSAGES, "large", timeout=60)
+        r = _check_model(model, LARGE_MESSAGES, "large", timeout=60)
         results.append(r)
         status_icon = "✅" if r["status"] == "ok" else "❌"
         print(f"  {status_icon} {r['status']} | {r.get('http_status','')} | {r['latency_ms']}ms")

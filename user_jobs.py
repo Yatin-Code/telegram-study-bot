@@ -257,10 +257,12 @@ def update_field(
     else:
         return False, "unknown field"
     with _connect(db_path) as conn:
-        conn.execute(
+        cur = conn.execute(
             f"UPDATE {JOBS_TABLE} SET {column} = ? WHERE id = ?", (value, job_id)
         )
         conn.commit()
+        if cur.rowcount == 0:
+            return False, "job not found"
     return True, value
 
 

@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.asyncio
+
 import agent_renderer
 import rich_message
 from agent import AgentResponse

@@ -215,10 +215,9 @@ def sync_once(
     """Sync selected Notion DBs into SQLite. Returns {db_key: upserted_count}."""
     with _sync_lock:
         if db_keys is None:
-            db_keys = tuple(
-                key for key in NOTION_SOURCE_KEYS
-                if notion_schema.DATABASES[key].get("database_id")
-            )
+            from config import settings
+            configured = set(settings.configured_db_keys())
+            db_keys = tuple(key for key in NOTION_SOURCE_KEYS if key in configured)
         else:
             db_keys = tuple(key for key in db_keys if key in NOTION_SOURCE_KEYS)
         counts: dict[str, int] = {}

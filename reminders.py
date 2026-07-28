@@ -27,6 +27,7 @@ MIN_TIMING_SAMPLES = 4
 def _connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {EVENT_TABLE} (
             event_key TEXT PRIMARY KEY,

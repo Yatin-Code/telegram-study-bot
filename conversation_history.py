@@ -75,8 +75,10 @@ def save_message(
 ) -> None:
     """Persist one message/turn."""
     path = db_path or DEFAULT_DB_PATH
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA journal_mode=WAL")
         _init(conn)
         content = _summarize_tool_result(role, content, tool_name)
         conn.execute(
@@ -87,7 +89,8 @@ def save_message(
     except Exception:
         logger.exception("failed to save conversation message")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def save_turn(
@@ -110,8 +113,10 @@ def recent_messages(
 ) -> list[dict[str, str]]:
     """Return most recent messages oldest-first, excluding tool/system."""
     path = db_path or DEFAULT_DB_PATH
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         _init(conn)
         rows = conn.execute(
@@ -123,17 +128,21 @@ def recent_messages(
         logger.exception("failed to load conversation history")
         return []
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def clear_history(chat_id: int, *, db_path: str | Path | None = None) -> None:
     path = db_path or DEFAULT_DB_PATH
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA journal_mode=WAL")
         _init(conn)
         conn.execute(f"DELETE FROM {TABLE} WHERE chat_id = ?", (chat_id,))
         conn.commit()
     except Exception:
         logger.exception("failed to clear conversation history")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()

@@ -199,6 +199,7 @@ async def test_send_rich_message_draft_rejects_zero_draft_id():
         await rich_message.send_rich_message_draft("tok", 1, {"markdown": "x"}, 0)
 
 
+@pytest.mark.asyncio
 async def test_capability_latch_skips_rich_after_unsupported(monkeypatch):
     monkeypatch.setenv("RICH_MESSAGES", "1")
     rich_message.reset_capability_latch()

@@ -163,3 +163,12 @@ def test_describe_and_schedule_text(db):
                   action_kind="message", action_text="plan!")
     assert "every Mon" in user_jobs.schedule_text(weekly)
     assert "🔔 say" in user_jobs.describe(weekly)
+
+
+def test_update_field_missing_job(db):
+    ok, err = user_jobs.update_field(99999, "time", "12:00", db_path=db)
+    assert not ok
+    assert "not found" in err
+    ok2, err2 = user_jobs.update_field(99999, "text", "hello", db_path=db)
+    assert not ok2
+    assert "not found" in err2

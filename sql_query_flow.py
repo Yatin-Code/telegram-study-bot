@@ -77,6 +77,9 @@ def _active_filter_error(sql: str, user_question: str) -> str | None:
     question = user_question.lower()
     if any(word in question for word in ("archived", "deleted", "removed")):
         return None
+    # Strip comments so `WHERE archived = 0` cannot be smuggled past the check.
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", " ", sql)
     known = set(sql_tool.sync.NOTION_SOURCE_KEYS) | set(sql_tool.operational_store.OP_TABLES.values())
     keywords = {"where", "join", "on", "group", "order", "limit", "left", "right", "inner", "outer", "cross", "union"}
     ref_re = re.compile(

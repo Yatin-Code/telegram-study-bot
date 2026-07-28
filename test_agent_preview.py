@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import agent
 from agent import ToolCall
 
@@ -45,6 +47,7 @@ def test_build_bundle_preview_multiple():
     assert "`op_goals`" in preview
 
 
+@pytest.mark.asyncio
 async def test_agent_multi_write_returns_one_preview(monkeypatch):
     payload = """[
       {"tool": "sqlite_execute", "arguments": {"sql": "INSERT INTO user_prefs (text) VALUES (\'x\')"}},

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import pytest
 
+pytestmark = pytest.mark.asyncio
+
 import agent
 import agent_tools
 
