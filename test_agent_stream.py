@@ -57,32 +57,18 @@ async def test_agent_on_stream_receives_visible_text(monkeypatch):
 
 
 async def test_agent_on_stream_skips_tool_json(monkeypatch):
+    # First turn (no tool results yet) may stream; tool JSON must stay hidden.
+    # After tools run, loop uses complete() and pushes final text once.
     def _fake_stream(messages):
         yield '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
 
-    call_count = [0]
-
     def _mock_llm(messages):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
-        return '{"text": "Got it.", "response_type": "text"}'
+        if any(m.get("role") == "tool" for m in messages):
+            return '{"text": "Got it.", "response_type": "text"}'
+        return '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
 
     monkeypatch.setattr(agent, "_stream_llm", _fake_stream)
-    # Second loop iteration uses _call_llm when? Actually with on_stream always uses _stream_llm.
-    # So second turn also goes through _stream_llm — re-patch after first yield path.
-    streams = [
-        ['{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'],
-        ['{"text": "Got it.", "response_type": "text"}'],
-    ]
-    idx = [0]
-
-    def _multi_stream(messages):
-        batch = streams[min(idx[0], len(streams) - 1)]
-        idx[0] += 1
-        yield from batch
-
-    monkeypatch.setattr(agent, "_stream_llm", _multi_stream)
+    monkeypatch.setattr(agent, "_call_llm", _mock_llm)
     monkeypatch.setattr(agent.agent_tools, "execute_tool", lambda *a, **k: {"rows": [{"n": 1}]})
 
     seen: list[str] = []
@@ -99,3 +85,40 @@ async def test_agent_on_stream_skips_tool_json(monkeypatch):
     # Tool JSON must never appear in the stream
     assert not any("sqlite_query" in s for s in seen)
     assert any("Got it." in s for s in seen)
+
+
+async def test_agent_tool_loop_uses_complete_not_stream(monkeypatch):
+    stream_calls = [0]
+    complete_calls = [0]
+
+    def _fake_stream(messages):
+        stream_calls[0] += 1
+        yield "should-not-run-after-tools"
+
+    def _mock_llm(messages):
+        complete_calls[0] += 1
+        if complete_calls[0] == 1:
+            return '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
+        return '{"text": "Done.", "response_type": "text"}'
+
+    # Force non-stream first turn by pre-seeding is not possible; patch stream
+    # empty so first turn falls back to complete, then second turn has tools.
+    def _empty_stream(messages):
+        stream_calls[0] += 1
+        if False:
+            yield ""
+        return
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent, "_stream_llm", _empty_stream)
+    monkeypatch.setattr(agent, "_call_llm", _mock_llm)
+    monkeypatch.setattr(agent.agent_tools, "execute_tool", lambda *a, **k: {"rows": [{"n": 1}]})
+
+    async def _noop(_t: str) -> None:
+        pass
+
+    result = await agent.run(chat_id=1, user_text="scores", on_status=_noop, on_stream=_noop)
+    assert result["response"].text == "Done."
+    assert complete_calls[0] >= 2
+    # After tool results, stream must not be used again for the final turn.
+    assert stream_calls[0] == 1

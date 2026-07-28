@@ -598,16 +598,12 @@ def _extract_partial_user_text(raw: str) -> str | None:
 
 def _stream_llm(messages: list[dict[str, str]]):
     """Yield raw text deltas from the router stream (agent chat only)."""
-    try:
-        yield from llm_router.stream_complete(LLMRequest(
-            messages=messages,
-            purpose="domain",
-            max_output_tokens=2048,
-            temperature=0.0,
-        ))
-    except Exception as exc:
-        logger.exception("LLM stream failed; falling back to complete()")
-        yield _call_llm(messages)
+    yield from llm_router.stream_complete(LLMRequest(
+        messages=messages,
+        purpose="domain",
+        max_output_tokens=2048,
+        temperature=0.0,
+    ))
 
 
 
@@ -906,29 +902,37 @@ async def _run_loop(
 
     while iteration < max_iterations:
         iteration += 1
-        if on_stream is None:
-            raw = _call_llm(messages)
-        else:
-            # Stream raw tokens; only push user-visible text via on_stream.
-            # If the model starts a tool call, we suppress streaming and keep
-            # collecting the full raw string for parsing.
+        # Tool-loop turns grow to ~7k+ tokens and flaky gateways 502 under
+        # stream more often. Prefer complete() once tools have run; stream only
+        # the pure first-turn chat path. After tools, push the final text once.
+        has_tool_results = any(m.get("role") == "tool" for m in messages)
+        use_stream = on_stream is not None and not has_tool_results
+        raw = ""
+        if use_stream:
             parts: list[str] = []
-            streamed_visible = False
-            for delta in _stream_llm(messages):
-                parts.append(delta)
-                raw_so_far = "".join(parts)
-                visible = _extract_partial_user_text(raw_so_far)
+            try:
+                for delta in _stream_llm(messages):
+                    parts.append(delta)
+                    raw_so_far = "".join(parts)
+                    visible = _extract_partial_user_text(raw_so_far)
+                    if visible is not None:
+                        try:
+                            await on_stream(visible)
+                        except Exception:
+                            logger.exception("on_stream callback failed")
+                raw = "".join(parts)
+            except Exception:
+                logger.exception("LLM stream failed; falling back to complete()")
+                raw = ""
+        if not raw:
+            raw = _call_llm(messages)
+            if on_stream is not None and has_tool_results:
+                visible = _extract_partial_user_text(raw)
                 if visible is not None:
-                    streamed_visible = True
                     try:
                         await on_stream(visible)
                     except Exception:
                         logger.exception("on_stream callback failed")
-            raw = "".join(parts)
-            if not raw:
-                raw = _call_llm(messages)
-            # If we never showed anything (tool call), ignore stream side effects.
-            _ = streamed_visible
         logger.debug("agent raw response: %s", raw[:500])
 
         tool_calls = _parse_tool_calls(raw)

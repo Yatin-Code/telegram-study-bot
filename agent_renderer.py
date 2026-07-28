@@ -144,7 +144,12 @@ class AgentChatStreamer:
             self._failed = True
 
     async def finalize(self, response: AgentResponse) -> Any:
-        """Finish the rich stream, or fall back to a normal render."""
+        """Finish the rich stream, or fall back to a normal render.
+
+        Returns a truthy value when a chat message was already created via the
+        stream (even if finalize failed) so the caller must NOT send a second
+        message. Returns None only when nothing was streamed yet.
+        """
         text = response.text or self._last_text or "Done."
         markup = _build_markup(response)
         if response.response_type == "poll" or not self._started or self._stream is None:
@@ -154,7 +159,8 @@ class AgentChatStreamer:
             return await self._stream.finalize(text)
         except Exception:
             logger.exception("RichStream finalize failed")
-            return None
+            # Message already exists in the chat — signal caller to skip render.
+            return {"ok": False, "message_id": getattr(self._stream, "message_id", None)}
 
 
 async def render(update_or_message, response: AgentResponse):

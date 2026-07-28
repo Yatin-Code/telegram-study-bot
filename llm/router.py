@@ -477,12 +477,11 @@ def _legacy_stream(req: LLMRequest) -> Iterator[str]:
             reason, _ = _classify(exc)
             logger.warning("legacy stream model %s failed: %s", model, reason)
             continue
+    # Do NOT fall through to _legacy_call here — that double-burns the full
+    # model list (stream fail × N + complete × N). Callers already fall back
+    # to complete() once after stream_complete raises.
     if last is not None:
-        # Last resort: non-streaming legacy call.
-        text, _ = _legacy_call(req)
-        if text:
-            yield text
-        return
+        raise last
     raise RuntimeError("legacy stream produced no models")
 
 

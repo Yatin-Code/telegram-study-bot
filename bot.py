@@ -2831,14 +2831,15 @@ async def _handle_agent_text(update: Update, chat_id: int, text: str) -> None:
         await message.reply_text(f"{preview}\n\nProceed?", reply_markup=keyboard)
         return
 
-    # Final response
+    # Final response — one message only (stream finalize OR plain render).
     if status_msg is not None:
         try:
             await status_msg.delete()
         except Exception:
             pass
-    finalized = await streamer.finalize(result["response"])
-    if finalized is None:
+    if streamer.started:
+        await streamer.finalize(result["response"])
+    else:
         await agent_renderer.render(update, result["response"])
 
 
@@ -2909,8 +2910,9 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await status_msg.delete()
         except Exception:
             pass
-    finalized = await streamer.finalize(result["response"])
-    if finalized is None:
+    if streamer.started:
+        await streamer.finalize(result["response"])
+    else:
         await agent_renderer.render(query, result["response"])
 
 
