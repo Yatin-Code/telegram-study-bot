@@ -293,10 +293,22 @@ But these aren't urgent - the pattern matching + inspect command are the critica
 
 ## Files Changed
 - `bot.py`: +414 lines (pattern matching + inspect command)
+- `user_jobs.py`, `sync.py`, `llm/router.py`, `agent.py`, `reminders.py`, `draft_store.py`, `conversation_history.py`, `study_domain.py`, `query_flow.py`, `logging_flow.py`, `sql_query_flow.py`, `llm/certify.py`, `config/setup_study_workspace.py`, `test_user_jobs.py`, `test_agent.py`, `test_agent_chat_streamer.py`, `test_agent_preview.py`, `test_agent_stream.py`, `test_conversation_history.py`, `test_eaon_providers.py`, `test_learner_profile.py`, `test_rich_message.py` (audit bug fixes)
 
 ## Deployment Commands Used
+
+### Pattern matching + /inspect
 ```bash
 git commit -m "Add pattern matching fast path"
+git push origin master
+az vm run-command invoke -g SENTINELRG_INDIA -n SentinelVM \
+  --command-id RunShellScript \
+  --scripts "sudo -u azureuser git -C /home/azureuser/studybot pull && sudo systemctl restart studybot"
+```
+
+### Audit bug fixes
+```bash
+git commit -m "Fix audit bugs: ..."
 git push origin master
 az vm run-command invoke -g SENTINELRG_INDIA -n SentinelVM \
   --command-id RunShellScript \
@@ -307,6 +319,7 @@ az vm run-command invoke -g SENTINELRG_INDIA -n SentinelVM \
 - ✅ Deployed to VPS (SentinelVM, Central India)
 - ✅ Service restarted successfully
 - ✅ Commands registered (/inspect now appears in menu)
+- ✅ Audit fixes live (commit 0dda9d9)
 - ✅ Ready to use
 
 ---
