@@ -707,6 +707,78 @@ def _inspect_safe(text: str) -> str:
     return text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]")
 
 
+def _inspect_friendly_name(table: str) -> str:
+    """Turn snake_case table names into readable titles."""
+    name = table.replace("op_", "").replace("_", " ").title()
+    return name if not table.startswith("op_") else "Op " + name
+
+
+def _inspect_format_value(val: Any, col: str) -> str:
+    """Make raw DB values human-readable."""
+    import datetime as _dt
+
+    if val is None:
+        return ""
+    if col in ("archived", "active", "enabled", "hard_constraint"):
+        return "Yes" if val else "No"
+    if col in ("created_time", "last_edited_time", "last_synced_at", "created_at", "completed_at", "run_time", "last_run"):
+        try:
+            dt = _dt.datetime.fromisoformat(str(val))
+            return dt.strftime("%d %B %Y, %I:%M %p")
+        except Exception:
+            pass
+    if isinstance(val, str) and (val.startswith("{") or val.startswith("[")):
+        try:
+            import json
+            parsed = json.loads(val)
+            if isinstance(parsed, dict) and not parsed:
+                return ""
+            if isinstance(parsed, (dict, list)):
+                return str(parsed)[:120]
+        except Exception:
+            pass
+    val_str = str(val)
+    if len(val_str) > 90:
+        val_str = val_str[:87] + "..."
+    return val_str
+
+
+def _inspect_table_use(table: str) -> str:
+    """Short human description of what the bot uses this table for."""
+    uses = {
+        "active_plan_state": "Tracks which daily/weekly plan is currently live.",
+        "agent_pending_states": "Stores Confirm/Cancel previews from the AI agent.",
+        "chat_context": "Current topic/subject/chapter the bot is helping you with right now.",
+        "chat_qa_history": "Recent question/answer turns used for follow-up queries.",
+        "commitment_checks": "Nightly checks of whether you met your daily study commitments.",
+        "conversation_history": "Recent bot/user chat turns used as conversation memory.",
+        "daily_plan": "Legacy Notion-mirrored daily plan rows.",
+        "doubts": "Your logged doubts synced from Notion.",
+        "drafts": "Pending write previews awaiting your Confirm/Edit/Cancel.",
+        "exam_readiness_items": "Per-exam readiness checklist tracked by the bot.",
+        "exams": "Your exams synced from Notion.",
+        "goals": "Your goals synced from Notion.",
+        "learner_insights": "Long-term insights the bot extracted from your patterns.",
+        "learner_profiles": "Your study preferences and profile.",
+        "ledger": "Your study sessions synced from Notion.",
+        "onboarding_state": "Your progress through /setup.",
+        "op_daily_plan": "The bot's active daily study plan for you.",
+        "op_doubt_attempts": "Your attempts at solving doubts and their outcomes.",
+        "op_exam_questions": "Questions the bot created for your exams.",
+        "op_exams": "Exams the bot is tracking locally (scores, dates, status).",
+        "op_execution_links": "Links between goals, work items, and timetable slots.",
+        "op_goals": "The bot's operating goals for your JEE prep.",
+        "op_timetable": "Your weekly study timetable.",
+        "op_work_items": "Tasks the bot planned for you to complete.",
+        "pending_clarifications": "Follow-up questions the bot asked and is waiting on.",
+        "revision": "Your revision schedule synced from Notion.",
+        "sync_meta": "Last sync timestamps for Notion-mirrored tables.",
+        "user_jobs": "Scheduled reminders/jobs the bot runs for you.",
+        "user_prefs": "Your saved preferences.",
+    }
+    return uses.get(table, "Internal data store used by the bot.")
+
+
 def _inspect_home_view() -> tuple[str, InlineKeyboardMarkup]:
     """Main inspection menu."""
     text = (
@@ -732,11 +804,12 @@ def _inspect_sqlite_menu() -> tuple[str, InlineKeyboardMarkup]:
         text = "⚠️ SQLite read failed or no tables found."
         return text, InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="inspect:home")]])
 
-    text = "📊 *All SQLite Tables*\n\nTap any table to see recent records:"
+    text = "📊 *All SQLite Tables*\n\nTap a table to see what the bot knows:"
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for table in sorted(counts):
-        label = f"{table} ({counts[table]})"
+        friendly = _inspect_friendly_name(table)
+        label = f"{friendly} ({counts[table]})"
         btn = InlineKeyboardButton(label, callback_data=f"inspect:table:{table}")
         if len(row) == 2:
             buttons.append(row)
@@ -760,13 +833,16 @@ def _inspect_ops_menu() -> tuple[str, InlineKeyboardMarkup]:
 
 
 def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboardMarkup]:
-    """Show recent records from any SQLite table."""
+    """Show recent records from any SQLite table in a human-readable way."""
     import sqlite3
 
     db = _inspect_db_path()
     back_menu = "inspect:menu:sqlite"
+    friendly = _inspect_friendly_name(table)
+    use = _inspect_table_use(table)
+
     if not db.exists():
-        return "⚠️ DB not found.", InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=back_menu)]])
+        return "⚠️ DB not found.", InlineKeyboardMarkup([[InlineKeyboardButton(" Back", callback_data=back_menu)]])
 
     try:
         conn = sqlite3.connect(str(db))
@@ -785,26 +861,29 @@ def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboard
         finally:
             conn.close()
 
+        header = f"📊 *{friendly}*"
+        if use:
+            header += f"\n_{use}_"
         if not rows:
-            text = f"📊 `{table}`\n\nNo records found."
+            text = f"{header}\n\nNo records found."
         else:
-            lines = [f"📊 `{table}` (showing {len(rows)} most recent)\n"]
+            lines = [header, f"Showing {len(rows)} most recent records:\n"]
             for i, row in enumerate(rows, 1):
                 lines.append(f"\n*{i}.*")
                 for col in row.keys():
                     val = row[col]
                     if val is None or val == "":
                         continue
-                    val_str = str(val)
-                    if len(val_str) > 90:
-                        val_str = val_str[:87] + "..."
+                    val_str = _inspect_format_value(val, col)
+                    if not val_str:
+                        continue
                     lines.append(f"  • `{col}`: {_inspect_safe(val_str)}")
             text = "\n".join(lines)
     except Exception as e:
         text = f"⚠️ Failed to read {table}: {_inspect_safe(str(e))}"
 
     buttons = [
-        [InlineKeyboardButton("↩ Back to Tables", callback_data=back_menu)],
+        [InlineKeyboardButton(" Back to Tables", callback_data=back_menu)],
         [InlineKeyboardButton(" Home", callback_data="inspect:home")],
     ]
     return text, InlineKeyboardMarkup(buttons)
