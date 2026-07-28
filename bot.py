@@ -671,6 +671,42 @@ async def newsession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text("Session context cleared.")
 
 
+def _inspect_db_path() -> Path:
+    """Path to the bot's SQLite database."""
+    return Path(__file__).resolve().parent / "sqlite_mirror.db"
+
+
+def _inspect_table_counts() -> dict[str, int]:
+    """Return row counts for every SQLite table."""
+    import sqlite3
+    db = _inspect_db_path()
+    if not db.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(str(db))
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            counts: dict[str, int] = {}
+            for (table,) in rows:
+                try:
+                    n = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+                    counts[table] = int(n)
+                except Exception:
+                    counts[table] = -1
+            return counts
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
+def _inspect_safe(text: str) -> str:
+    """Escape characters Telegram Markdown v1 treats as formatting."""
+    return text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]")
+
+
 def _inspect_home_view() -> tuple[str, InlineKeyboardMarkup]:
     """Main inspection menu."""
     text = (
@@ -682,8 +718,7 @@ def _inspect_home_view() -> tuple[str, InlineKeyboardMarkup]:
         "Choose a data source:"
     )
     buttons = [
-        [InlineKeyboardButton("📊 SQLite Mirror", callback_data="inspect:menu:sqlite")],
-        [InlineKeyboardButton("⚙️ Operational / Memory", callback_data="inspect:menu:ops")],
+        [InlineKeyboardButton("📊 All SQLite Tables", callback_data="inspect:menu:sqlite")],
         [InlineKeyboardButton("☁️ Notion Sync Status", callback_data="inspect:menu:notion")],
         [InlineKeyboardButton("🧠 In-Context Memory", callback_data="inspect:menu:context")],
     ]
@@ -691,223 +726,86 @@ def _inspect_home_view() -> tuple[str, InlineKeyboardMarkup]:
 
 
 def _inspect_sqlite_menu() -> tuple[str, InlineKeyboardMarkup]:
-    """SQLite table selection menu."""
-    import sqlite3
-    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
-    try:
-        conn = sqlite3.connect(str(db))
-        conn.row_factory = sqlite3.Row
-        counts = {}
-        for table in ("ledger", "doubts", "revision"):
-            try:
-                row = conn.execute(f'SELECT COUNT(*) AS n FROM "{table}" WHERE archived=0').fetchone()
-                counts[table] = row["n"] if row else 0
-            except Exception:
-                counts[table] = 0
-        conn.close()
+    """List every SQLite table with its row count."""
+    counts = _inspect_table_counts()
+    if not counts:
+        text = "⚠️ SQLite read failed or no tables found."
+        return text, InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="inspect:home")]])
 
-        text = (
-            "📊 *Notion Mirror* (ledger / doubts / revision)\n\n"
-            f"• Ledger: {counts['ledger']} active sessions\n"
-            f"• Doubts: {counts['doubts']} active doubts\n"
-            f"• Revision: {counts['revision']} active items\n\n"
-            "Planning tables live under Operational / Memory.\n\n"
-            "Tap a table to see recent records:"
-        )
-    except Exception as e:
-        text = f"⚠️ SQLite read failed: {e}"
-        counts = {}
-    
-    buttons = []
-    if counts:
-        buttons.append([
-            InlineKeyboardButton(f"Ledger ({counts.get('ledger', 0)})", callback_data="inspect:table:ledger"),
-            InlineKeyboardButton(f"Doubts ({counts.get('doubts', 0)})", callback_data="inspect:table:doubts"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(f"Revision ({counts.get('revision', 0)})", callback_data="inspect:table:revision"),
-        ])
+    text = "📊 *All SQLite Tables*\n\nTap any table to see recent records:"
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for table in sorted(counts):
+        label = f"{table} ({counts[table]})"
+        btn = InlineKeyboardButton(label, callback_data=f"inspect:table:{table}")
+        if len(row) == 2:
+            buttons.append(row)
+            row = [btn]
+        else:
+            row.append(btn)
+    if row:
+        buttons.append(row)
     buttons.append([InlineKeyboardButton("↩ Back", callback_data="inspect:home")])
     return text, InlineKeyboardMarkup(buttons)
 
 
 def _inspect_ops_menu() -> tuple[str, InlineKeyboardMarkup]:
-    """Operational + memory tables (not Notion-mirrored)."""
-    import sqlite3
-    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
-    tables = (
-        "op_goals", "op_exams", "op_work_items", "op_timetable", "op_daily_plan",
-        "op_doubt_attempts", "user_prefs", "user_jobs", "conversation_history",
-        "chat_context",
-    )
-    counts: dict[str, int] = {}
-    try:
-        conn = sqlite3.connect(str(db))
-        for table in tables:
-            try:
-                if table in ("user_prefs",):
-                    row = conn.execute(
-                        f'SELECT COUNT(*) AS n FROM "{table}" WHERE active = 1'
-                    ).fetchone()
-                elif table in ("user_jobs",):
-                    row = conn.execute(
-                        f'SELECT COUNT(*) AS n FROM "{table}" WHERE enabled = 1'
-                    ).fetchone()
-                elif table in ("conversation_history", "chat_context"):
-                    row = conn.execute(f'SELECT COUNT(*) AS n FROM "{table}"').fetchone()
-                else:
-                    row = conn.execute(
-                        f'SELECT COUNT(*) AS n FROM "{table}" WHERE archived=0'
-                    ).fetchone()
-                counts[table] = int(row[0]) if row else 0
-            except Exception:
-                counts[table] = 0
-        conn.close()
-        text = (
-            "⚙️ *Operational / Memory*\n\n"
-            f"• op_goals: {counts.get('op_goals', 0)}\n"
-            f"• op_exams: {counts.get('op_exams', 0)}\n"
-            f"• op_work_items: {counts.get('op_work_items', 0)}\n"
-            f"• op_timetable: {counts.get('op_timetable', 0)}\n"
-            f"• op_daily_plan: {counts.get('op_daily_plan', 0)}\n"
-            f"• op_doubt_attempts: {counts.get('op_doubt_attempts', 0)}\n"
-            f"• user_prefs: {counts.get('user_prefs', 0)}\n"
-            f"• user_jobs: {counts.get('user_jobs', 0)}\n"
-            f"• conversation_history: {counts.get('conversation_history', 0)}\n"
-            f"• chat_context: {counts.get('chat_context', 0)}\n\n"
-            "Tap a table to see recent records:"
-        )
-    except Exception as e:
-        text = f"⚠️ Operational read failed: {e}"
-        counts = {}
-
-    buttons = []
-    if counts:
-        buttons.append([
-            InlineKeyboardButton(f"op_goals ({counts.get('op_goals', 0)})", callback_data="inspect:table:op_goals"),
-            InlineKeyboardButton(f"op_exams ({counts.get('op_exams', 0)})", callback_data="inspect:table:op_exams"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(f"op_work ({counts.get('op_work_items', 0)})", callback_data="inspect:table:op_work_items"),
-            InlineKeyboardButton(f"op_tt ({counts.get('op_timetable', 0)})", callback_data="inspect:table:op_timetable"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(
-                f"op_plan ({counts.get('op_daily_plan', 0)})",
-                callback_data="inspect:table:op_daily_plan",
-            ),
-        ])
-        buttons.append([
-            InlineKeyboardButton(f"prefs ({counts.get('user_prefs', 0)})", callback_data="inspect:table:user_prefs"),
-            InlineKeyboardButton(f"jobs ({counts.get('user_jobs', 0)})", callback_data="inspect:table:user_jobs"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(f"history ({counts.get('conversation_history', 0)})", callback_data="inspect:table:conversation_history"),
-            InlineKeyboardButton(f"context ({counts.get('chat_context', 0)})", callback_data="inspect:table:chat_context"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(
-                f"doubt attempts ({counts.get('op_doubt_attempts', 0)})",
-                callback_data="inspect:table:op_doubt_attempts",
-            ),
-        ])
-    buttons.append([InlineKeyboardButton("↩ Back", callback_data="inspect:home")])
+    """Operational / Memory tables are now shown from the all-tables menu."""
+    text = "️ *Operational / Memory*\n\nThese tables are now shown in *All SQLite Tables*."
+    buttons = [
+        [InlineKeyboardButton("📊 All SQLite Tables", callback_data="inspect:menu:sqlite")],
+        [InlineKeyboardButton("↩ Back", callback_data="inspect:home")],
+    ]
     return text, InlineKeyboardMarkup(buttons)
 
 
 def _inspect_table_view(table: str, limit: int = 5) -> tuple[str, InlineKeyboardMarkup]:
-    """Show recent records from a table."""
+    """Show recent records from any SQLite table."""
     import sqlite3
-    db = Path(__file__).resolve().parent / "sqlite_mirror.db"
-    
-    # Map table to title column and display columns
-    config = {
-        "ledger": ("task", ["date", "task", "questions_attempted", "questions_correct", "cognitive_yield"]),
-        "doubts": ("core_concept", ["date_logged", "core_concept", "status"]),
-        "revision": ("chapter_module", ["next_execution_date", "chapter_module", "subject"]),
-        "op_daily_plan": ("title", ["plan_date", "sequence", "title", "status"]),
-        "op_goals": ("title", ["title", "target", "metric", "period", "status", "subject"]),
-        "op_exams": ("title", ["exam_date", "title", "kind", "status", "max_marks", "actual_marks"]),
-        "op_work_items": ("title", ["title", "kind", "priority", "status", "subject"]),
-        "op_timetable": ("title", ["weekday", "start_time", "end_time", "title", "subject"]),
-        "op_doubt_attempts": ("title", ["title", "attempt_no", "outcome", "stuck_point"]),
-        "user_prefs": ("text", ["text", "category", "created_at", "active"]),
-        "user_jobs": ("title", ["title", "schedule_kind", "run_time", "action_kind", "enabled", "last_run"]),
-        "conversation_history": ("content", ["role", "content", "tool_name", "created_at"]),
-        "chat_context": ("subject", ["chat_id", "subject", "chapter", "block", "session_started_at"]),
-    }
-    ops_tables = {
-        "op_goals", "op_exams", "op_work_items", "op_timetable", "op_daily_plan",
-        "op_doubt_attempts", "user_prefs", "user_jobs", "conversation_history", "chat_context",
-    }
-    back_menu = "inspect:menu:ops" if table in ops_tables else "inspect:menu:sqlite"
 
-    if table not in config:
-        return f"⚠️ Unknown table: {table}", InlineKeyboardMarkup([[
-            InlineKeyboardButton("↩ Back", callback_data=back_menu)
-        ]])
-
-    title_col, display_cols = config[table]
+    db = _inspect_db_path()
+    back_menu = "inspect:menu:sqlite"
+    if not db.exists():
+        return "⚠️ DB not found.", InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=back_menu)]])
 
     try:
         conn = sqlite3.connect(str(db))
-        conn.row_factory = sqlite3.Row
-        if table == "user_prefs":
-            rows = conn.execute(
-                'SELECT * FROM "user_prefs" WHERE active = 1 '
-                'ORDER BY created_at DESC LIMIT ?',
-                (limit,),
-            ).fetchall()
-        elif table == "user_jobs":
-            rows = conn.execute(
-                'SELECT * FROM "user_jobs" ORDER BY id DESC LIMIT ?',
-                (limit,),
-            ).fetchall()
-        elif table == "conversation_history":
-            rows = conn.execute(
-                'SELECT * FROM "conversation_history" '
-                'ORDER BY id DESC LIMIT ?',
-                (limit,),
-            ).fetchall()
-        elif table == "chat_context":
-            rows = conn.execute(
-                'SELECT * FROM "chat_context" LIMIT ?',
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f'SELECT * FROM "{table}" WHERE archived=0 '
-                f'ORDER BY COALESCE(last_edited_time, created_time, last_synced_at) DESC LIMIT ?',
-                (limit,)
-            ).fetchall()
-        conn.close()
+        try:
+            conn.row_factory = sqlite3.Row
+            col_info = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            col_names = {c["name"] for c in col_info}
+            order_by = next(
+                (c for c in ("created_at", "created_time", "last_edited_time", "last_synced_at", "id", "rowid") if c in col_names),
+                "rowid",
+            )
+            if "rowid" not in col_names and order_by == "rowid":
+                rows = conn.execute(f'SELECT *, rowid FROM "{table}" ORDER BY {order_by} DESC LIMIT ?', (limit,)).fetchall()
+            else:
+                rows = conn.execute(f'SELECT * FROM "{table}" ORDER BY "{order_by}" DESC LIMIT ?', (limit,)).fetchall()
+        finally:
+            conn.close()
 
         if not rows:
-            text = f"📊 *{table}*\n\nNo active records found."
+            text = f"📊 `{table}`\n\nNo records found."
         else:
-            lines = [f"📊 *{table}* (showing {len(rows)} most recent)\n"]
+            lines = [f"📊 `{table}` (showing {len(rows)} most recent)\n"]
             for i, row in enumerate(rows, 1):
-                title_val = row[title_col] if title_col in row.keys() else None
-                title_str = str(title_val) if title_val not in (None, "") else "(untitled)"
-                if len(title_str) > 80:
-                    title_str = title_str[:77] + "..."
-                lines.append(f"\n*{i}.* {title_str}")
-                for col in display_cols:
-                    if col == title_col:
+                lines.append(f"\n*{i}.*")
+                for col in row.keys():
+                    val = row[col]
+                    if val is None or val == "":
                         continue
-                    val = row[col] if col in row.keys() else None
-                    if val is not None and val != "":
-                        val_str = str(val)
-                        if len(val_str) > 100:
-                            val_str = val_str[:97] + "..."
-                        lines.append(f"  • {col}: {val_str}")
+                    val_str = str(val)
+                    if len(val_str) > 90:
+                        val_str = val_str[:87] + "..."
+                    lines.append(f"  • `{col}`: {_inspect_safe(val_str)}")
             text = "\n".join(lines)
     except Exception as e:
-        text = f"⚠️ Failed to read {table}: {e}"
+        text = f"⚠️ Failed to read {table}: {_inspect_safe(str(e))}"
 
     buttons = [
         [InlineKeyboardButton("↩ Back to Tables", callback_data=back_menu)],
-        [InlineKeyboardButton("🏠 Home", callback_data="inspect:home")],
+        [InlineKeyboardButton(" Home", callback_data="inspect:home")],
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -1061,8 +959,19 @@ async def on_inspect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         try:
             await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass  # "message is not modified"
+        except Exception as exc:
+            # Markdown parse errors (unescaped underscores etc.) should not silently kill the UI.
+            err = str(exc).lower()
+            if "can't parse" in err or "parse" in err or "entities" in err:
+                try:
+                    plain = _inspect_safe(text)
+                    await query.edit_message_text(plain, reply_markup=markup)
+                except Exception:
+                    logger.exception("inspect fallback plain edit failed")
+            elif "not modified" in err:
+                pass
+            else:
+                logger.exception("inspect edit failed")
     except Exception as exc:
         logger.exception("inspect callback failed")
         try:
