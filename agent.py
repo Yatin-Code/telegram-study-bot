@@ -606,6 +606,29 @@ def _stream_llm(messages: list[dict[str, str]]):
     ))
 
 
+def _tool_result_message(tool: str, result: Any) -> dict[str, str]:
+    """Format a tool result for the chat transcript.
+
+    Eaon/OpenAI-compat gateways 502 on bare ``role: tool`` messages, so we
+    feed results as a user turn with an explicit prefix the model already
+    understands from the system prompt.
+    """
+    payload = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+    return {
+        "role": "user",
+        "content": f"TOOL RESULT ({tool}):\n{payload}",
+    }
+
+
+def _has_tool_results(messages: list[dict[str, str]]) -> bool:
+    for m in messages:
+        if m.get("role") == "tool":
+            return True
+        if str(m.get("content", "")).startswith("TOOL RESULT"):
+            return True
+    return False
+
+
 
 
 def _extract_json(text: str) -> Optional[dict[str, Any]]:
@@ -905,7 +928,7 @@ async def _run_loop(
         # Tool-loop turns grow to ~7k+ tokens and flaky gateways 502 under
         # stream more often. Prefer complete() once tools have run; stream only
         # the pure first-turn chat path. After tools, push the final text once.
-        has_tool_results = any(m.get("role") == "tool" for m in messages)
+        has_tool_results = _has_tool_results(messages)
         use_stream = on_stream is not None and not has_tool_results
         raw = ""
         if use_stream:
@@ -950,7 +973,7 @@ async def _run_loop(
             else:
                 result = agent_tools.execute_tool(tc.tool, tc.arguments)
                 messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
+                messages.append(_tool_result_message(tc.tool, result))
 
         # If any writes were requested, show a combined preview and pause.
         if pending_writes:
@@ -1016,7 +1039,7 @@ async def continue_run(
             )
             result = agent_tools.execute_tool(tool_call.tool, tool_call.arguments)
             messages.append({"role": "assistant", "content": json.dumps({"tool": tool_call.tool, "arguments": tool_call.arguments})})
-            messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
+            messages.append(_tool_result_message(tool_call.tool, result))
     else:
         for tc_data in tool_calls_data:
             tool_call = ToolCall(
@@ -1025,7 +1048,10 @@ async def continue_run(
                 call_id=tc_data.get("call_id", uuid.uuid4().hex[:8]),
             )
             messages.append({"role": "assistant", "content": json.dumps({"tool": tool_call.tool, "arguments": tool_call.arguments})})
-            messages.append({"role": "tool", "content": json.dumps({"cancelled": True, "message": "User cancelled the write."}, ensure_ascii=False)})
+            messages.append(_tool_result_message(
+                tool_call.tool,
+                {"cancelled": True, "message": "User cancelled the write."},
+            ))
 
     _delete_state(state_id)
 

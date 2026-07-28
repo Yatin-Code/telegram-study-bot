@@ -63,7 +63,7 @@ async def test_agent_on_stream_skips_tool_json(monkeypatch):
         yield '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
 
     def _mock_llm(messages):
-        if any(m.get("role") == "tool" for m in messages):
+        if agent._has_tool_results(messages):
             return '{"text": "Got it.", "response_type": "text"}'
         return '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
 
@@ -90,25 +90,24 @@ async def test_agent_on_stream_skips_tool_json(monkeypatch):
 async def test_agent_tool_loop_uses_complete_not_stream(monkeypatch):
     stream_calls = [0]
     complete_calls = [0]
+    seen_roles: list[str] = []
 
-    def _fake_stream(messages):
-        stream_calls[0] += 1
-        yield "should-not-run-after-tools"
-
-    def _mock_llm(messages):
-        complete_calls[0] += 1
-        if complete_calls[0] == 1:
-            return '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
-        return '{"text": "Done.", "response_type": "text"}'
-
-    # Force non-stream first turn by pre-seeding is not possible; patch stream
-    # empty so first turn falls back to complete, then second turn has tools.
     def _empty_stream(messages):
         stream_calls[0] += 1
         if False:
             yield ""
         return
         yield  # pragma: no cover
+
+    def _mock_llm(messages):
+        complete_calls[0] += 1
+        seen_roles.append(",".join(m.get("role", "") for m in messages))
+        if complete_calls[0] == 1:
+            return '{"tool": "sqlite_query", "arguments": {"sql": "SELECT 1 as n"}}'
+        # Second call must not include bare role=tool (Eaon 502s on it).
+        assert not any(m.get("role") == "tool" for m in messages)
+        assert any(str(m.get("content", "")).startswith("TOOL RESULT") for m in messages)
+        return '{"text": "Done.", "response_type": "text"}'
 
     monkeypatch.setattr(agent, "_stream_llm", _empty_stream)
     monkeypatch.setattr(agent, "_call_llm", _mock_llm)
@@ -122,3 +121,11 @@ async def test_agent_tool_loop_uses_complete_not_stream(monkeypatch):
     assert complete_calls[0] >= 2
     # After tool results, stream must not be used again for the final turn.
     assert stream_calls[0] == 1
+
+
+def test_tool_result_message_is_user_role():
+    msg = agent._tool_result_message("sqlite_query", {"rows": [{"n": 1}]})
+    assert msg["role"] == "user"
+    assert msg["content"].startswith("TOOL RESULT (sqlite_query):")
+    assert agent._has_tool_results([msg]) is True
+    assert agent._has_tool_results([{"role": "user", "content": "hi"}]) is False

@@ -106,6 +106,9 @@ async def _post(token: str, method: str, payload: dict[str, Any]) -> Any:
         data = resp.json()
     if not data.get("ok"):
         desc = data.get("description") or f"HTTP {resp.status_code}"
+        # Finalizing a stream with identical text is a no-op success, not a failure.
+        if method == "editMessageText" and "message is not modified" in str(desc).lower():
+            return data.get("result") or {"ok": True, "not_modified": True}
         raise RuntimeError(f"Telegram {method} failed: {desc}")
     return data.get("result")
 
