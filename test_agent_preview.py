@@ -1,57 +1,50 @@
-"""Preview helpers: table name, follow-ups, multi-write bundle."""
+"""Preview helpers: validated single/bundled writes, dedupe guard."""
 
 from __future__ import annotations
 
 import pytest
 
 import agent
-from agent import ToolCall
+from agent import PendingWrite, ToolCall
 
 
-def test_infer_sql_table_insert():
-    assert agent._infer_sql_table("INSERT INTO user_prefs (chat_id, text) VALUES (1, 'x')") == "user_prefs"
-
-
-def test_infer_sql_table_update():
-    assert agent._infer_sql_table('UPDATE "op_goals" SET status=\'Done\'') == "op_goals"
-
-
-def test_build_preview_includes_table_and_followups():
-    tc = ToolCall(
-        tool="sqlite_execute",
-        arguments={"sql": "INSERT INTO op_goals (title, status) VALUES ('AIR1', 'Active')"},
-    )
-    preview = agent._build_preview(tc)
-    assert "`op_goals`" in preview
-    assert "goals and targets" in preview
-    assert "After this I can:" in preview
-    assert "/jobs" in preview or "/weekly" in preview
+def _pw(tool: str, args: dict, preview: str) -> PendingWrite:
+    return PendingWrite(tool_call=ToolCall(tool=tool, arguments=args), preview=preview, run={})
 
 
 def test_build_bundle_preview_single_is_plain():
-    tc = ToolCall(
-        tool="sqlite_execute",
-        arguments={"sql": "INSERT INTO user_prefs (text) VALUES ('mornings')"},
-    )
-    assert agent._build_bundle_preview([tc]) == agent._build_preview(tc)
+    pw = _pw("create_goal", {"title": "AIR1", "target": 1}, "📝 Create goal\n• title: AIR1")
+    assert agent._build_bundle_preview([pw]) == "📝 Create goal\n• title: AIR1"
 
 
 def test_build_bundle_preview_multiple():
-    tcs = [
-        ToolCall(tool="sqlite_execute", arguments={"sql": "INSERT INTO user_prefs (text) VALUES ('a')"}),
-        ToolCall(tool="sqlite_execute", arguments={"sql": "INSERT INTO op_goals (title) VALUES ('b')"}),
+    pws = [
+        _pw("set_context", {"subject": "Physics"}, "📝 Set session context\n• subject: Physics"),
+        _pw("create_goal", {"title": "b"}, "📝 Create goal\n• title: b"),
     ]
-    preview = agent._build_bundle_preview(tcs)
+    preview = agent._build_bundle_preview(pws)
     assert "2" in preview and "things" in preview
-    assert "`user_prefs`" in preview
-    assert "`op_goals`" in preview
+    assert "subject: Physics" in preview
+    assert "title: b" in preview
+
+
+def test_dedupe_tool_calls_drops_exact_duplicates():
+    calls = [
+        ToolCall(tool="set_context", arguments={"subject": "Physics"}),
+        ToolCall(tool="set_context", arguments={"subject": "Physics"}),
+        ToolCall(tool="set_context", arguments={"subject": "Maths"}),
+        ToolCall(tool="sql_select", arguments={"sql": "SELECT 1"}),
+    ]
+    unique = agent._dedupe_tool_calls(calls)
+    assert len(unique) == 3
+    assert [c.arguments.get("subject") for c in unique[:2]] == ["Physics", "Maths"]
 
 
 @pytest.mark.asyncio
 async def test_agent_multi_write_returns_one_preview(monkeypatch):
     payload = """[
-      {"tool": "sqlite_execute", "arguments": {"sql": "INSERT INTO user_prefs (text) VALUES (\'x\')"}},
-      {"tool": "sqlite_execute", "arguments": {"sql": "INSERT INTO op_goals (title) VALUES (\'y\')"}}
+      {"tool": "set_context", "arguments": {"subject": "Physics"}},
+      {"tool": "schedule_reminder", "arguments": {"schedule_kind": "daily", "time": "21:30", "action_kind": "message", "action_text": "revise"}}
     ]"""
 
     def _mock_llm(messages):
@@ -62,7 +55,31 @@ async def test_agent_multi_write_returns_one_preview(monkeypatch):
     async def _noop(_t: str) -> None:
         pass
 
-    result = await agent.run(chat_id=123, user_text="remember and set goal", on_status=_noop)
+    result = await agent.run(chat_id=123, user_text="set context and remind me", on_status=_noop)
     assert result["type"] == "preview"
     assert "2" in result["preview"] and "things" in result["preview"]
     assert result["state_id"]
+
+
+@pytest.mark.asyncio
+async def test_agent_mixed_valid_and_invalid_writes(monkeypatch):
+    """Valid writes preview; invalid ones are fed back — both in one turn."""
+    payload = """[
+      {"tool": "set_context", "arguments": {"subject": "Physics"}},
+      {"tool": "create_goal", "arguments": {"title": "bad", "goal_type": "zzz", "target": 5}}
+    ]"""
+    call_count = [0]
+
+    def _mock_llm(messages):
+        call_count[0] += 1
+        return payload
+
+    monkeypatch.setattr(agent, "_call_llm", _mock_llm)
+
+    async def _noop(_t: str) -> None:
+        pass
+
+    result = await agent.run(chat_id=124, user_text="ctx + goal", on_status=_noop)
+    # The valid write pauses for confirmation...
+    assert result["type"] == "preview"
+    assert call_count[0] == 1

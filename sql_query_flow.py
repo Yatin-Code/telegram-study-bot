@@ -523,4 +523,7 @@ def answer_question(
         return answer or raw.strip()
     except Exception as e:
         logger.exception("SQL loop final answer failed")
-        return f"⚠️ I ran into trouble answering that: {e}"
+        # Keep the structured error prefix so the display layer in bot.py
+        # swaps in friendly text and skips memory-recording, consistent with
+        # the other failure paths in this module.
+        return f"{ANSWER_ERROR_PREFIX}{e}"

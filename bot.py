@@ -211,7 +211,8 @@ async def _reply_markdown(message, text: str, **kwargs):
         except Exception:
             logger.exception("rich reply failed; falling back to plain reply_text")
     try:
-        return await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+        safe = rich_message.sanitize_markdown(text)
+        return await message.reply_text(safe, parse_mode=ParseMode.MARKDOWN, **kwargs)
     except Exception:
         return await message.reply_text(text, **kwargs)
 
@@ -234,7 +235,8 @@ async def _edit_markdown(message, text: str, **kwargs):
             logger.exception("rich edit failed; falling back to plain edit_text")
     edit = getattr(message, "edit_text", None) or message.edit_message_text
     try:
-        return await edit(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+        safe = rich_message.sanitize_markdown(text)
+        return await edit(safe, parse_mode=ParseMode.MARKDOWN, **kwargs)
     except Exception:
         return await edit(text, **kwargs)
 
@@ -254,8 +256,9 @@ async def _send_markdown(bot, chat_id: int, text: str, **kwargs):
         except Exception:
             logger.exception("rich send failed; falling back to plain send_message")
     try:
+        safe = rich_message.sanitize_markdown(text)
         return await bot.send_message(
-            chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, **kwargs
+            chat_id=chat_id, text=safe, parse_mode=ParseMode.MARKDOWN, **kwargs
         )
     except Exception:
         return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
@@ -269,48 +272,116 @@ async def _reject_if_unauthorized(update: Update) -> bool:
     return True
 
 
+def _parse_context_phrase(phrase: str) -> Optional[dict[str, str]]:
+    """Extract subject/block/exercise/chapter tokens from "starting X Y Z".
+
+    Returns a dict with any of subject/chapter/block/exercise, or None when
+    nothing recognizable is found (caller falls through to the agent).
+    """
+    subject = None
+    block = None
+    exercise = None
+    leftover: list[str] = []
+    tokens = phrase.split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i].strip(".,;:")
+        if not token:
+            i += 1
+            continue
+        # "ex 2A" style exercise types span two tokens.
+        if token.lower() == "ex" and i + 1 < len(tokens):
+            pair = f"Ex {tokens[i + 1].strip('.,;:')}"
+            matched = logging_flow.normalise_option(pair, notion_schema.EXERCISE_TYPE_OPTIONS)
+            if matched:
+                exercise = exercise or matched
+                i += 2
+                continue
+        matched = logging_flow.normalise_option(token, notion_schema.EXERCISE_TYPE_OPTIONS)
+        if matched:
+            exercise = exercise or matched
+            i += 1
+            continue
+        matched = logging_flow.normalise_option(token, notion_schema.SUBJECT_OPTIONS)
+        if matched:
+            subject = subject or matched
+            i += 1
+            continue
+        matched = logging_flow.normalise_option(token, notion_schema.BLOCK_OPTIONS)
+        if matched:
+            block = block or matched
+            i += 1
+            continue
+        leftover.append(token)
+        i += 1
+
+    chapter = " ".join(leftover).strip() or None
+    if not any((subject, block, exercise, chapter)):
+        return None
+    # A lone unrecognized word is more likely a mistyped free-text message
+    # than a chapter name — let the agent handle it.
+    if not any((subject, block, exercise)) and chapter and len(chapter.split()) < 2:
+        return None
+    result: dict[str, str] = {}
+    if subject:
+        result["subject"] = subject
+    if chapter:
+        result["chapter"] = chapter
+    if block:
+        result["block"] = block
+    if exercise:
+        result["exercise"] = exercise
+    return result
+
+
 def _try_pattern_match(text: str) -> Optional[Any]:
     """Fast path: regex-based pattern matching for common log messages.
-    
+
     Returns an Intent object if the message matches a known pattern, or None
-    if it should fall back to LLM parsing. This makes 90% of daily logs:
+    if it should fall back to the agent / LLM parsing. This makes 90% of
+    daily logs:
     - Instant (no network call)
     - Bulletproof (works even if LLM is down)
     - Free (no API cost)
-    
+
+    CONSERVATIVE: patterns must consume (almost) the entire message. A message
+    that starts with a recognizable log but adds more ("...and remind me
+    tomorrow") falls through to the agent so nothing is silently dropped.
+
     Patterns handled:
     - "solved 20 questions 15 correct 30 mins" → log_execution
-    - "did 25 qs, 18 correct, 40 min" → log_execution
-    - "completed 15 questions 12 correct 20 minutes" → log_execution
     - "doubt: why does X happen" → log_doubt
+    - "revised wave optics" → log_revision
+    - "starting physics wave optics eb-1 ex 2a" → set_context
     - "list physics doubts" / "show doubts" → query
     - "list revisions" / "show revision" → query
     """
     from intent_parser import Intent, IntentFilters
-    
+
     text_clean = text.strip()
     text_lower = text_clean.lower()
-    
-    # Pattern 1: Execution log with questions + correct + time
+
+    # Pattern 1: Execution log with questions + correct + time.
+    # Whole-message match only (allow one trailing ., !).
     # Matches: "solved 20 questions 15 correct 30 mins"
     #          "did 25 qs, 18 correct, 40 min"
     #          "20 questions 15 correct 30 minutes"
     execution_pattern = re.compile(
-        r'(?:solved|did|completed?|finished)?\s*'  # optional verb
-        r'(\d+)\s*(?:questions?|qs?|q)\s*'         # questions attempted
-        r'(?:,?\s*)?'                               # optional comma/space
-        r'(\d+)\s*(?:correct|right|✓)\s*'          # questions correct
-        r'(?:,?\s*)?'                               # optional comma/space
-        r'(\d+)\s*(?:min(?:ute)?s?|m)\b',          # time in minutes
+        r'(?:solved|did|completed?|finished|attempted)?\s*'  # optional verb
+        r'(\d+)\s*(?:questions?|qs?|q)\s*'                   # questions attempted
+        r'(?:,\s*|\s+)'
+        r'(\d+)\s*(?:correct|right|✓)\s*'                    # questions correct
+        r'(?:,\s*|\s+)'
+        r'(\d+)\s*(?:min(?:ute)?s?|mins|m)\s*[.!]?',          # time in minutes
         re.IGNORECASE
     )
-    
-    match = execution_pattern.search(text_clean)
+
+    match = execution_pattern.fullmatch(text_clean)
     if match:
         attempted = int(match.group(1))
         correct = int(match.group(2))
         time_min = int(match.group(3))
-        
+
         # Sanity check: correct can't exceed attempted
         if correct <= attempted:
             logger.info("fast-path: execution log matched (%d qs, %d correct, %d min)",
@@ -325,7 +396,7 @@ def _try_pattern_match(text: str) -> Optional[Any]:
                 },
                 filters=IntentFilters(),
             )
-    
+
     # Pattern 2: Doubt log (starts with "doubt:" or "doubt -")
     if text_lower.startswith('doubt:') or text_lower.startswith('doubt -'):
         doubt_text = text_clean.split(':', 1)[-1].strip() if ':' in text_clean else text_clean.split('-', 1)[-1].strip()
@@ -337,16 +408,15 @@ def _try_pattern_match(text: str) -> Optional[Any]:
                 fields={'core_concept': doubt_text},
                 filters=IntentFilters(),
             )
-    
-    # Pattern 3: Simple queries for listing data
-    # "list doubts", "show doubts", "doubts list"
-    # "list physics doubts", "show chemistry doubts"
+
+    # Pattern 3: Simple queries for listing data (whole message).
+    # "list doubts", "show doubts", "show physics doubts"
     doubt_query_pattern = re.compile(
-        r'\b(?:list|show|see|view|get)\s+(?:(?:my|all|the)\s+)?'
-        r'(?:(physics|chemistry|maths|chem)\s+)?doubts?\b',
+        r'(?:list|show|see|view|get)\s+(?:(?:my|all|the)\s+)?'
+        r'(?:(physics|chemistry|maths|math|chem)\s+)?doubts?\s*[?.!]?',
         re.IGNORECASE
     )
-    match = doubt_query_pattern.search(text_lower)
+    match = doubt_query_pattern.fullmatch(text_lower)
     if match:
         subject = match.group(1)
         logger.info("fast-path: doubt query matched (subject=%s)", subject or "any")
@@ -356,14 +426,14 @@ def _try_pattern_match(text: str) -> Optional[Any]:
             fields={},
             filters=IntentFilters(subject=subject if subject else None),
         )
-    
-    # Pattern 4: Revision queries
+
+    # Pattern 4: Revision queries (whole message)
     revision_query_pattern = re.compile(
-        r'\b(?:list|show|see|view|get)\s+(?:(?:my|all|the)\s+)?'
-        r'(?:(physics|chemistry|maths|chem)\s+)?revisions?\b',
+        r'(?:list|show|see|view|get)\s+(?:(?:my|all|the)\s+)?'
+        r'(?:(physics|chemistry|maths|math|chem)\s+)?revisions?\s*[?.!]?',
         re.IGNORECASE
     )
-    match = revision_query_pattern.search(text_lower)
+    match = revision_query_pattern.fullmatch(text_lower)
     if match:
         subject = match.group(1)
         logger.info("fast-path: revision query matched (subject=%s)", subject or "any")
@@ -373,8 +443,45 @@ def _try_pattern_match(text: str) -> Optional[Any]:
             fields={},
             filters=IntentFilters(subject=subject if subject else None),
         )
-    
-    # No pattern matched - return None to fall back to LLM
+
+    # Pattern 5: Context setting — "starting physics wave optics eb-1 ex 2a",
+    # "studying chem mole concept", "switching to physics".
+    context_pattern = re.compile(
+        r'(?:starting|studying|switch(?:ed|ing)?\s+to|now\s+doing)\s+(.{2,120})',
+        re.IGNORECASE
+    )
+    match = context_pattern.fullmatch(text_clean)
+    if match:
+        parsed = _parse_context_phrase(match.group(1))
+        if parsed:
+            logger.info("fast-path: context set matched (%s)", parsed)
+            return Intent(
+                action='set_context',
+                database=None,
+                fields={},
+                filters=IntentFilters(
+                    subject=parsed.get('subject'),
+                    chapter=parsed.get('chapter'),
+                    block=parsed.get('block'),
+                    exercise=parsed.get('exercise'),
+                ),
+            )
+
+    # Pattern 6: Revision log — "revised wave optics" (whole message).
+    revision_log_pattern = re.compile(r'revised\s+(.{2,120})', re.IGNORECASE)
+    match = revision_log_pattern.fullmatch(text_clean)
+    if match:
+        chapter = match.group(1).strip()
+        if chapter:
+            logger.info("fast-path: revision log matched (%r)", chapter)
+            return Intent(
+                action='log_revision',
+                database='revision',
+                fields={'chapter_module': chapter},
+                filters=IntentFilters(),
+            )
+
+    # No pattern matched - return None to fall back to the agent / LLM
     return None
 
 
@@ -561,7 +668,7 @@ async def on_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.exception("settings callback failed")
         try:
-            await query.edit_message_text(f"⚠️ Settings action failed: {exc}")
+            await query.edit_message_text("⚠️ That settings action hit a snag — please try again.")
         except Exception:
             pass
 
@@ -657,7 +764,7 @@ async def on_memory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as exc:
         logger.exception("memory callback failed")
         try:
-            await query.edit_message_text(f"⚠️ Memory action failed: {exc}")
+            await query.edit_message_text("⚠️ That memory action hit a snag — please try again.")
         except Exception:
             pass
 
@@ -920,7 +1027,7 @@ def _inspect_notion_view() -> tuple[str, InlineKeyboardMarkup]:
                     lines.append(f"  • Error: {error[:100]}")
             text = "\n".join(lines)
     except Exception as e:
-        text = f"⚠️ Failed to read sync status: {e}"
+        text = "⚠️ I couldn't read the sync status right now — try again in a moment."
     
     buttons = [
         [InlineKeyboardButton("🔄 Force Sync Now", callback_data="inspect:action:sync")],
@@ -1024,7 +1131,7 @@ async def on_inspect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                     text, markup = _inspect_notion_view()
                     text = f"✅ Synced {total} records ({detail})\n\n" + text
                 except Exception as e:
-                    text = f"⚠️ Sync failed: {e}"
+                    text = "⚠️ Sync didn't complete — please try again in a minute."
                     _, markup = _inspect_notion_view()
             elif param == "clearsession":
                 session_context.clear_context(chat_id)
@@ -1054,7 +1161,7 @@ async def on_inspect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as exc:
         logger.exception("inspect callback failed")
         try:
-            await query.edit_message_text(f"⚠️ Inspect action failed: {exc}")
+            await query.edit_message_text("⚠️ That action hit a snag — please try again.")
         except Exception:
             pass
 
@@ -1076,7 +1183,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         last_sync = meta["last_completed_at"] if meta else "never"
         conn.close()
     except Exception as e:
-        await update.effective_message.reply_text(f"⚠️ Health check failed: {e}")
+        await update.effective_message.reply_text("⚠️ Health check is unavailable right now — try again in a moment.")
         return
     operations = operational_store.health(db)
     ctx = session_context.get_context(update.effective_chat.id)
@@ -1135,9 +1242,9 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.exception("manual /sync failed")
         try:
-            await status.edit_text(f"⚠️ Sync failed: {e}")
+            await status.edit_text("⚠️ Sync didn't complete — please try again in a minute.")
         except Exception:
-            await update.effective_message.reply_text(f"⚠️ Sync failed: {e}")
+            await update.effective_message.reply_text("⚠️ Sync didn't complete — please try again in a minute.")
         return
     total = sum(counts.values())
     detail = ", ".join(f"{k}={v}" for k, v in counts.items()) or "nothing to sync"
@@ -1361,7 +1468,7 @@ async def readiness_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
     except Exception as exc:
         logger.exception("readiness command failed")
-        await update.effective_message.reply_text(f"Readiness audit unavailable: {exc}")
+        await update.effective_message.reply_text("Readiness audit is unavailable right now — please try again later.")
 
 
 async def on_readiness_callback(
@@ -1413,7 +1520,7 @@ async def on_readiness_callback(
     except Exception as exc:
         logger.exception("readiness callback failed")
         try:
-            await query.edit_message_text(f"Readiness action was not applied: {exc}")
+            await query.edit_message_text("That readiness action couldn't be applied — please try again.")
         except Exception:
             pass
 
@@ -1484,7 +1591,7 @@ async def on_reset_callback(
     except Exception as exc:
         logger.exception("reset callback failed")
         try:
-            await query.edit_message_text(f"Reset was not armed: {exc}")
+            await query.edit_message_text("The reset couldn't be armed — please try again.")
         except Exception:
             pass
 
@@ -1707,7 +1814,7 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "\n".join(lines) or "No Notion plan items found for today.",
         )
     except Exception as exc:
-        await update.effective_message.reply_text(f"Plan analysis unavailable: {exc}")
+        await update.effective_message.reply_text("Plan analysis is unavailable right now — please try again later.")
 
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1725,7 +1832,7 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "This item is now Active. After the block choose Complete or Carry Backlog."
         )
     except Exception as exc:
-        await update.effective_message.reply_text(f"Next-item lookup unavailable: {exc}")
+        await update.effective_message.reply_text("That lookup is unavailable right now — please try again later.")
 
 
 async def backlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2162,7 +2269,7 @@ async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as exc:
         logger.exception("domain draft commit failed")
         await query.edit_message_text(
-            f"Nothing was confirmed: {exc}. Retry this same idempotent draft?",
+            "Something went wrong confirming that — you can retry this same draft:",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Retry", callback_data=f"domain:confirm:{draft_id}"),
                 InlineKeyboardButton("Cancel", callback_data=f"domain:cancel:{draft_id}"),
@@ -2186,7 +2293,7 @@ async def on_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Plan item completed." if action == "done" else "Remaining work moved to backlog."
         )
     except Exception as exc:
-        await query.edit_message_text(f"Plan state was not changed: {exc}")
+        await query.edit_message_text("The plan state couldn't be changed — please try again.")
 
 
 def _setup_hub_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -2361,7 +2468,7 @@ async def on_onboarding_callback(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         logger.exception("onboarding callback failed")
         try:
-            await query.edit_message_text(f"⚠️ Setup action failed: {exc}")
+            await query.edit_message_text("⚠️ That setup action hit a snag — please try again.")
         except Exception:
             pass
 
@@ -2378,9 +2485,12 @@ async def _handle_setup_ai(update: Update, chat_id: int, section_id: str, text: 
         parsed = await asyncio.to_thread(
             domain_parser.parse_setup_ai, section["title"], prompt, text
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("setup AI parse failed")
-        await status_msg.edit_text(f"⚠️ AI couldn't process that: {exc}")
+        await status_msg.edit_text(
+            "🤖 I'm having trouble processing that right now — "
+            "please try again in a minute."
+        )
         return
     if parsed.get("needs_clarification"):
         await status_msg.edit_text(
@@ -2469,7 +2579,10 @@ async def _handle_job_create(
         parsed = await asyncio.to_thread(domain_parser.parse_job, text)
     except Exception as exc:
         logger.exception("job parse failed")
-        await status_msg.edit_text(f"⚠️ Couldn't parse that job: {exc}")
+        await status_msg.edit_text(
+            "⚠️ I couldn't work out that reminder right now — "
+            "please try again in a minute."
+        )
         return
     if parsed.get("needs_clarification"):
         await status_msg.edit_text(
@@ -2530,6 +2643,10 @@ async def _run_user_job(
         answer = await asyncio.to_thread(
             sql_query_flow.answer_question, job["action_text"], chat_id=chat_id
         )
+        # Friendly fallback so a transient model outage never surfaces as
+        # internal error text in the user's scheduled reminder.
+        if answer.startswith(sql_query_flow.ANSWER_ERROR_PREFIX):
+            answer = "🤖 I couldn't fetch that just now — try again later."
         await context.bot.send_message(chat_id=chat_id, text=f"⏰ {job['title']}\n{answer}")
     await asyncio.to_thread(user_jobs.mark_ran, job["id"], consume_once=consume_once)
 
@@ -2594,7 +2711,7 @@ async def on_jobs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as exc:
         logger.exception("jobs callback failed")
         try:
-            await query.edit_message_text(f"⚠️ Jobs action failed: {exc}")
+            await query.edit_message_text("⚠️ That jobs action hit a snag — please try again.")
         except Exception:
             pass
 
@@ -2629,7 +2746,7 @@ async def on_debrief_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as exc:
         logger.exception("debrief callback failed")
         try:
-            await query.edit_message_text(f"⚠️ Debrief failed: {exc}")
+            await query.edit_message_text("⚠️ That debrief action hit a snag — please try again.")
         except Exception:
             pass
 
@@ -2671,7 +2788,7 @@ async def _handle_debrief_text(message, chat_id: int, state: dict, text: str) ->
     except Exception as exc:
         logger.exception("debrief notes failed")
         draft_store.clear_session_debrief(chat_id)
-        await message.reply_text(f"⚠️ Couldn't save the notes: {exc}")
+        await message.reply_text("⚠️ I couldn't save those notes right now — please try again.")
 
 
 async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2741,6 +2858,23 @@ async def _legacy_catch_all_handler(
             logger.exception("intent parse failed chat_id=%s", chat_id)
             await message.reply_text("Sorry, I couldn't understand that. Try rephrasing?")
             return
+    await _dispatch_intent(update, context, intent, chat_id, text, clarification)
+
+
+async def _dispatch_intent(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    intent: Any,
+    chat_id: int,
+    text: str,
+    clarification: dict | None,
+) -> None:
+    """Route a parsed Intent to its deterministic handler.
+
+    Shared by the deterministic fast path (regex-matched messages) and the
+    legacy LLM intent-parser fallback.
+    """
+    message = update.effective_message
     if intent.action == "unknown":
         await _handle_general_assistant(update, text, chat_id)
         return
@@ -3101,9 +3235,19 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         parse_text = text
 
-    # Agent path: route free-form text through the agentic loop.
+    # Deterministic fast path FIRST: common logs/lists/context-set are answered
+    # instantly, without the LLM. Only fresh messages (never clarification
+    # replies), and only when the pattern consumes the whole message — a
+    # compound message falls through to the agent so nothing is dropped.
+    fast_intent = _try_pattern_match(text) if not clarification else None
+    if fast_intent is not None:
+        await _dispatch_intent(update, context, fast_intent, chat_id, text, None)
+        return
+
+    # Agent path: route free-form text through the agentic loop. parse_text
+    # carries the merged clarification context when one was pending.
     try:
-        await _handle_agent_text(update, chat_id, text)
+        await _handle_agent_text(update, chat_id, parse_text)
     except Exception:
         logger.exception("agent path failed chat_id=%s, falling back to legacy flow", chat_id)
         await _legacy_catch_all_handler(update, context, chat_id, text, clarification)
@@ -3171,10 +3315,16 @@ async def _handle_question(
         if answer.startswith(_err_prefix) and intent is not None and intent.action == "query":
             result = await asyncio.to_thread(query_flow.run_query, intent)
             answer = query_flow.format_result(result)
+        answer_is_error = answer.startswith(_err_prefix)
+        # Never show internal error detail (router/route failures, HTTP codes)
+        # to the user — swap in a friendly message at the display layer.
+        # `sql_query_flow` keeps the raw prefix+reason intact for callers that
+        # inspect it (certification, logging).
+        if answer_is_error:
+            answer = "🤖 I'm having trouble answering that right now — please try again in a minute."
         # Only remember successful answers, so an error turn never poisons the
-        # follow-up window.  Use the structured prefix (not bare ⚠️) so a valid
-        # answer that happens to start with the emoji is not misclassified.
-        if not answer.startswith(_err_prefix):
+        # follow-up window.
+        if not answer_is_error:
             await asyncio.to_thread(draft_store.record_qa, chat_id, question, answer)
         try:
             await _edit_markdown(status_msg, answer, disable_web_page_preview=True)
@@ -3667,6 +3817,15 @@ async def _user_jobs_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("user jobs scan failed")
 
 
+async def _llm_health_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Probe a small batch of ladder candidates; keeps the model ranking honest."""
+    try:
+        from llm import health as llm_health
+        await asyncio.to_thread(llm_health.tick)
+    except Exception:
+        logger.exception("llm health tick failed")
+
+
 async def post_init(application: Application) -> None:
     application.bot_data.setdefault(_MAINTENANCE_LOCK_KEY, asyncio.Lock())
     await application.bot.set_my_commands(BOT_COMMANDS)
@@ -3736,6 +3895,9 @@ async def post_init(application: Application) -> None:
         )
         application.job_queue.run_repeating(
             _guard_scheduled(_user_jobs_scan), interval=60, first=75, name="user_jobs"
+        )
+        application.job_queue.run_repeating(
+            _guard_scheduled(_llm_health_tick), interval=270, first=30, name="llm_health"
         )
         logger.info("Scheduled periodic sync every %ds", sync_secs)
     else:
