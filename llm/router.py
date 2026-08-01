@@ -2,16 +2,19 @@
 
 ``complete(req)``:
 
-1. If the ``llm`` package can't run at all (no ai.env keys, no resolvable
-   routes), raise ``RouterUnavailable`` so the caller uses its own legacy path.
-2. Try the legacy Eaon gateway first, including its configured model fallbacks.
-3. If Eaon fails or its output is rejected, build the candidate list = routes
-   **certified for this purpose** (see :mod:`llm.certify`), ordered by quality.
-4. Try each candidate once, preserving scarce quota by moving across providers
+1. If the ``llm`` package can't run at all (no keys, no candidates,
+   no resolvable routes), raise ``RouterUnavailable`` so the caller uses
+   its own legacy path.
+2. Try the CURATED LADDER first (llm.ladder): hand-picked eaon/g4f models,
+   re-ranked by live probes, traffic cooldowns and certification — so a
+   statically pinned dumb primary can never squat at the top.
+3. Next, catalog routes **certified for this purpose** (see :mod:`llm.certify`).
+4. Finally the legacy env gateway tail (LLM_MODEL / LLM_FALLBACK_MODEL),
+   model order re-ranked by the same ladder.
+5. Try each candidate once, preserving scarce quota by moving across providers
    on 5xx/429/network failures. A validator raise == malformed output advances
    to the next route. First success returns an ``LLMResponse``.
-5. Only if Eaon and every certified external route fail do we raise
-   ``AllRoutesExhausted``.
+6. Only if every stage fails do we raise ``AllRoutesExhausted``.
 
 Secrets discipline: only route ids, providers, models, HTTP status and latency
 are logged — never keys, prompts, or model output.
@@ -31,7 +34,7 @@ import httpx
 
 from config import settings
 
-from . import adapters, certify, env_loader, quota, registry
+from . import adapters, certify, env_loader, ladder, quota, registry
 from .errors import AllRoutesExhausted, RouterUnavailable
 
 logger = logging.getLogger(__name__)
@@ -138,6 +141,32 @@ def _candidate_routes(
     return normal + reserve
 
 
+def _ladder_routes(
+    req: LLMRequest, env: dict[str, str]
+) -> list[tuple[registry.Route, str, str]]:
+    """Curated candidates (health-ranked) with a resolvable key, as
+    (route, api_key, base_url) triples ready for the shared attempt loop.
+
+    Capped at ladder.MAX_ATTEMPTS_PER_REQUEST so a bad day across many dead
+    proxies can't stack timeouts before the catalog/tail get a turn.
+    Never raises — a broken ladder must not take routing down.
+    """
+    out: list[tuple[registry.Route, str, str]] = []
+    try:
+        for candidate in ladder.ordered(req.purpose, db_path=quota.DEFAULT_DB_PATH):
+            if len(out) >= ladder.MAX_ATTEMPTS_PER_REQUEST:
+                break
+            cfg = ladder.gateway_config(candidate.gateway, env)
+            api_key = (env.get(cfg["env_key"]) or "").strip()
+            if not api_key:
+                continue
+            out.append((ladder.to_route(candidate), api_key, cfg["base_url"]))
+    except Exception:  # noqa: BLE001
+        logger.exception("ladder unavailable; continuing without it")
+        return []
+    return out
+
+
 # --- Forced-route mode (certification) --------------------------------------
 # When certifying a model we must run the REAL code paths (parse_message,
 # answer_question, parse_job) but pin every router call to one route, ignoring
@@ -232,47 +261,26 @@ def complete(req: LLMRequest, *, _certify_route: Optional[registry.Route] = None
 
     resolved = registry.resolve_routes(env)
     legacy_ok = _legacy_configured()
+    ladder_routes = _ladder_routes(req, env)
 
-    if not resolved and not legacy_ok:
+    if not resolved and not legacy_ok and not ladder_routes:
         # Router genuinely cannot run — caller uses its own legacy path.
-        raise RouterUnavailable("no resolvable routes and no legacy gateway configured")
+        raise RouterUnavailable("no resolvable routes and no gateway keys configured")
 
     attempts_log: list[tuple[str, str]] = []
     estimated = quota.estimate_tokens(req.messages, req.max_output_tokens)
 
-    # Eaon is the absolute primary. Its configured model list is exhausted
-    # before traffic reaches an independently hosted provider.
-    if legacy_ok:
-        try:
-            text, latency_ms = _legacy_call(req)
-            value = _validate(req, text)
-            quota.record_unmetered_request(
-                "eaon:legacy", req.purpose, estimated, success=True,
-            )
-            try:
-                model_name = settings.llm_model()
-            except Exception:
-                model_name = "eaon-legacy"
-            return LLMResponse(
-                text=text, value=value, route_id="eaon:legacy", provider="legacy",
-                model=model_name, latency_ms=latency_ms, attempts=1,
-                fallback_reason=None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            reason, _ = _classify(exc)
-            quota.record_unmetered_request(
-                "eaon:legacy", req.purpose, estimated, success=False, reason=reason,
-            )
-            attempts_log.append(("eaon:legacy", reason))
-
-    candidates = _candidate_routes(req, resolved, estimated)
-
-    for idx, route in enumerate(candidates):
+    # 1. Curated ladder (health-ranked), capped per request.
+    candidates: list[tuple[registry.Route, str, str]] = list(ladder_routes)
+    # 2. Certified catalog routes.
+    for route in _candidate_routes(req, resolved, estimated):
         api_key = env.get(route.env_key, "")
         if not api_key:
             attempts_log.append((route.id, "missing_key"))
             continue
-        base_url = registry.resolve_base_url(route, env)
+        candidates.append((route, api_key, registry.resolve_base_url(route, env)))
+
+    for route, api_key, base_url in candidates:
         try:
             reservation = quota.reserve(route, req.purpose, estimated)
         except sqlite3.OperationalError as exc:
@@ -319,6 +327,30 @@ def complete(req: LLMRequest, *, _certify_route: Optional[registry.Route] = None
             model=route.model, latency_ms=latency_ms, attempts=len(attempts_log) + 1,
             fallback_reason=_summarise(attempts_log) or None,
         )
+
+    # 3. Legacy env tail (models ladder-ranked inside _legacy_call's loop).
+    if legacy_ok:
+        try:
+            text, latency_ms = _legacy_call(req)
+            value = _validate(req, text)
+            quota.record_unmetered_request(
+                "eaon:legacy", req.purpose, estimated, success=True,
+            )
+            try:
+                model_name = settings.llm_model()
+            except Exception:
+                model_name = "eaon-legacy"
+            return LLMResponse(
+                text=text, value=value, route_id="eaon:legacy", provider="legacy",
+                model=model_name, latency_ms=latency_ms, attempts=len(attempts_log) + 1,
+                fallback_reason=_summarise(attempts_log) or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason, _ = _classify(exc)
+            quota.record_unmetered_request(
+                "eaon:legacy", req.purpose, estimated, success=False, reason=reason,
+            )
+            attempts_log.append(("eaon:legacy", reason))
 
     raise AllRoutesExhausted(attempts_log)
 
@@ -370,34 +402,22 @@ def stream_complete(req: LLMRequest) -> Iterator[str]:
     env = env_loader.load()
     resolved = registry.resolve_routes(env)
     legacy_ok = _legacy_configured()
-    if not resolved and not legacy_ok:
-        raise RouterUnavailable("no resolvable routes and no legacy gateway configured")
+    ladder_routes = _ladder_routes(req, env)
+    if not resolved and not legacy_ok and not ladder_routes:
+        raise RouterUnavailable("no resolvable routes and no gateway keys configured")
 
     attempts_log: list[tuple[str, str]] = []
     estimated = quota.estimate_tokens(req.messages, req.max_output_tokens)
 
-    if legacy_ok:
-        try:
-            for delta in _legacy_stream(req):
-                yield delta
-            quota.record_unmetered_request(
-                "eaon:legacy", req.purpose, estimated, success=True,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            reason, _ = _classify(exc)
-            quota.record_unmetered_request(
-                "eaon:legacy", req.purpose, estimated, success=False, reason=reason,
-            )
-            attempts_log.append(("eaon:legacy", reason))
-
-    candidates = _candidate_routes(req, resolved, estimated)
-    for route in candidates:
+    candidates: list[tuple[registry.Route, str, str]] = list(ladder_routes)
+    for route in _candidate_routes(req, resolved, estimated):
         api_key = env.get(route.env_key, "")
         if not api_key:
             attempts_log.append((route.id, "missing_key"))
             continue
-        base_url = registry.resolve_base_url(route, env)
+        candidates.append((route, api_key, registry.resolve_base_url(route, env)))
+
+    for route, api_key, base_url in candidates:
         try:
             reservation = quota.reserve(route, req.purpose, estimated)
         except sqlite3.OperationalError as exc:
@@ -434,6 +454,22 @@ def stream_complete(req: LLMRequest) -> Iterator[str]:
             attempts_log.append((route.id, reason))
             logger.info("stream route %s failed (%s); advancing", route.id, reason)
             continue
+
+    # Legacy env stream is the final tail.
+    if legacy_ok:
+        try:
+            for delta in _legacy_stream(req):
+                yield delta
+            quota.record_unmetered_request(
+                "eaon:legacy", req.purpose, estimated, success=True,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            reason, _ = _classify(exc)
+            quota.record_unmetered_request(
+                "eaon:legacy", req.purpose, estimated, success=False, reason=reason,
+            )
+            attempts_log.append(("eaon:legacy", reason))
 
     raise AllRoutesExhausted(attempts_log)
 
@@ -505,11 +541,28 @@ def _legacy_configured() -> bool:
 
 
 def _legacy_models() -> list[str]:
-    models = [settings.llm_model()]
-    for m in settings.llm_fallback_models():
-        if m not in models:
-            models.append(m)
-    return models
+    """Legacy tail model order: ladder-ranked eaon models first, env list after.
+
+    The env variable order no longer decides anything by itself — a model has
+    to earn its position through probes/traffic. Env entries not in the curated
+    ladder still work, appended as a neutral tail.
+    """
+    env_models: list[str] = []
+    try:
+        for m in [settings.llm_model(), *settings.llm_fallback_models()]:
+            if m and m not in env_models:
+                env_models.append(m)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ranked = [c.model for c in ladder.ordered("domain") if c.gateway == "eaon"]
+    except Exception:  # noqa: BLE001
+        ranked = []
+    merged: list[str] = []
+    for m in ranked + env_models:
+        if m and m not in merged:
+            merged.append(m)
+    return merged
 
 
 def _legacy_call(req: LLMRequest) -> tuple[str, int]:

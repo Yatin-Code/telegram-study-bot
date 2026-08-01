@@ -32,6 +32,12 @@ def _fast_sleep(monkeypatch):
     monkeypatch.setattr(router.time, "sleep", lambda s: None)
 
 
+# The real ladder function; the shared env fixture hides the (growing,
+# integration-sensitive) curated ladder from pool tests so they assert pool
+# behavior only. Ladder-first tests restore this via monkeypatch.
+_REAL_LADDER_ROUTES = router._ladder_routes
+
+
 @pytest.fixture()
 def env(monkeypatch, tmp_path):
     """Give every catalog route a key so resolve_routes returns them all."""
@@ -39,6 +45,9 @@ def env(monkeypatch, tmp_path):
     fake["CLOUDFLARE_ACCOUNT_ID"] = "acct"
     monkeypatch.setattr(router.env_loader, "load", lambda path=None: dict(fake))
     monkeypatch.setattr(quota, "DEFAULT_DB_PATH", tmp_path / "quota.db")
+    # Pool tests must not see the curated ladder: its contents/order change as
+    # candidates are added, which would make unrelated assertions count them.
+    monkeypatch.setattr(router, "_ladder_routes", lambda req, env_=None: [])
     return fake
 
 
@@ -62,8 +71,8 @@ def test_router_unavailable_when_no_routes_and_no_legacy(monkeypatch):
         router.complete(router.LLMRequest(messages=[], purpose="sql"))
 
 
-def test_eaon_is_primary_even_with_no_certified_pool(monkeypatch, env):
-    _certify(monkeypatch, {})  # nothing certified
+def test_legacy_tail_answers_when_pools_are_empty(monkeypatch, env):
+    _certify(monkeypatch, {})  # nothing certified; env fixture has no gateway keys
     monkeypatch.setattr(router, "_legacy_configured", lambda: True)
     monkeypatch.setattr(router, "_legacy_call", lambda req: ("legacy answer", 5))
     resp = router.complete(router.LLMRequest(messages=[{"role": "user", "content": "hi"}], purpose="sql"))
@@ -157,19 +166,32 @@ def test_all_routes_fail_and_no_legacy_raises_exhausted(monkeypatch, env):
         router.complete(router.LLMRequest(messages=[{"role": "user", "content": "x"}], purpose="sql"))
 
 
-def test_eaon_primary_wins_before_certified_routes(monkeypatch, env):
+def test_certified_routes_run_before_legacy_tail(monkeypatch, env):
+    _certify(monkeypatch, {"sql": {"groq:gpt-oss-120b"}})
+    monkeypatch.setattr(router, "_legacy_configured", lambda: True)
+    def _boom(req):
+        raise AssertionError("legacy tail must not run while a pool route succeeds")
+    monkeypatch.setattr(router, "_legacy_call", _boom)
+    monkeypatch.setattr(adapters, "_http_post", lambda *a, **k: _ok("pool answer"))
+    resp = router.complete(router.LLMRequest(messages=[{"role": "user", "content": "x"}], purpose="sql"))
+    assert resp.route_id == "groq:gpt-oss-120b" and resp.text == "pool answer"
+
+
+def test_pool_failures_fall_through_to_legacy_tail(monkeypatch, env):
     _certify(monkeypatch, {"sql": {"groq:gpt-oss-120b"}})
     monkeypatch.setattr(router, "_legacy_configured", lambda: True)
     monkeypatch.setattr(router, "_legacy_call", lambda req: ("legacy saved it", 3))
     monkeypatch.setattr(router.settings, "llm_model", lambda: "deepseek-v4-pro")
     def fake_post(url, *, headers, json, timeout):
-        pytest.fail("certified external route must not run while Eaon succeeds")
+        resp = _http_error(502)
+        resp.raise_for_status()
     monkeypatch.setattr(adapters, "_http_post", fake_post)
     resp = router.complete(router.LLMRequest(messages=[{"role": "user", "content": "x"}], purpose="sql"))
     assert resp.route_id == "eaon:legacy" and resp.text == "legacy saved it"
+    assert "groq:gpt-oss-120b:http_502" in (resp.fallback_reason or "")
 
 
-def test_eaon_failure_falls_back_to_certified_provider(monkeypatch, env):
+def test_legacy_tail_failure_then_exhausted(monkeypatch, env):
     _certify(monkeypatch, {"domain": {"groq:gpt-oss-120b"}})
     monkeypatch.setattr(router, "_legacy_configured", lambda: True)
     monkeypatch.setattr(router, "_legacy_call", lambda req: (_ for _ in ()).throw(
@@ -181,15 +203,15 @@ def test_eaon_failure_falls_back_to_certified_provider(monkeypatch, env):
     ))
     assert response.route_id == "groq:gpt-oss-120b"
     assert response.text == "external recovered"
-    assert response.attempts == 2
-    assert "eaon:legacy:network" in (response.fallback_reason or "")
+    assert response.attempts == 1
+    assert response.fallback_reason is None
 
 
-def test_eaon_validator_rejection_falls_back(monkeypatch, env):
+def test_validator_rejection_falls_through_to_legacy_tail(monkeypatch, env):
     _certify(monkeypatch, {"intent": {"groq:gpt-oss-120b"}})
     monkeypatch.setattr(router, "_legacy_configured", lambda: True)
-    monkeypatch.setattr(router, "_legacy_call", lambda req: ("bad", 1))
-    monkeypatch.setattr(adapters, "_http_post", lambda *a, **k: _ok("good"))
+    monkeypatch.setattr(router, "_legacy_call", lambda req: ("good", 1))
+    monkeypatch.setattr(adapters, "_http_post", lambda *a, **k: _ok("bad"))
 
     def validator(text):
         if text != "good":
@@ -200,8 +222,9 @@ def test_eaon_validator_rejection_falls_back(monkeypatch, env):
         messages=[{"role": "user", "content": "x"}], purpose="intent",
         validator=validator,
     ))
-    assert response.route_id == "groq:gpt-oss-120b"
+    assert response.route_id == "eaon:legacy"
     assert response.value == {"ok": True}
+    assert "validation_failed" in (response.fallback_reason or "")
 
 
 def test_auth_error_is_not_retried(monkeypatch, env):
@@ -300,6 +323,72 @@ def test_force_route_restores_previous_state(monkeypatch, env):
 
 
 # --- certify persistence + battery wiring -----------------------------------
+
+# --- ladder-first selection ---------------------------------------------------
+
+def test_ladder_candidates_run_before_catalog_and_legacy(monkeypatch, env, tmp_path):
+    from llm import ladder
+    monkeypatch.setattr(router, "_ladder_routes", _REAL_LADDER_ROUTES)
+    monkeypatch.setattr(quota, "DEFAULT_DB_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(ladder, "DEFAULT_DB_PATH", tmp_path / "m.db")
+    env["G4F_API_KEY"] = "g4fkey"
+    env["LLM_API_KEY"] = "eaonkey"
+    _certify(monkeypatch, {"sql": {"groq:gpt-oss-120b"}})
+    monkeypatch.setattr(router, "_legacy_configured", lambda: True)
+    monkeypatch.setattr(router, "_legacy_call", lambda req: (_ for _ in ()).throw(
+        AssertionError("legacy tail must not run while a pool route succeeds")))
+    seen: list[str] = []
+    def fake_post(url, *, headers, json, timeout):
+        seen.append(json["model"])
+        return _ok("ladder answer")
+    monkeypatch.setattr(adapters, "_http_post", fake_post)
+    resp = router.complete(router.LLMRequest(messages=[{"role": "user", "content": "x"}], purpose="sql"))
+    # best-seeded sql candidate with a key is kimi-k2.7 (eaon, seed 10)
+    assert resp.route_id == "eaon:kimi-k2.7"
+    assert resp.text == "ladder answer"
+    assert seen[0] == "kimi-k2.7"
+
+
+def test_ladder_capped_attempts_then_catalog(monkeypatch, env, tmp_path):
+    from llm import ladder
+    monkeypatch.setattr(router, "_ladder_routes", _REAL_LADDER_ROUTES)
+    monkeypatch.setattr(quota, "DEFAULT_DB_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(ladder, "DEFAULT_DB_PATH", tmp_path / "m.db")
+    env["G4F_API_KEY"] = "g4fkey"
+    env["LLM_API_KEY"] = "eaonkey"
+    _certify(monkeypatch, {"sql": {"ollama:gpt-oss-20b"}})
+    _no_legacy(monkeypatch)
+    calls: list[str] = []
+    def fake_post(url, *, headers, json, timeout):
+        calls.append(json["model"])
+        # Every ladder-across-gateway attempt dies; the certified catalog
+        # model is the only one that answers. (ollama only exists in the
+        # catalog — its model id cannot collide with any ladder candidate.)
+        if json["model"] != "gpt-oss:20b":
+            resp = _http_error(502)
+            resp.raise_for_status()
+        return _ok("catalog answer")
+    monkeypatch.setattr(adapters, "_http_post", fake_post)
+    resp = router.complete(router.LLMRequest(messages=[{"role": "user", "content": "x"}], purpose="sql"))
+    assert resp.route_id == "ollama:gpt-oss-20b"
+    ladder_calls = [m for m in calls if m != "gpt-oss:20b"]
+    assert 0 < len(ladder_calls) <= ladder.MAX_ATTEMPTS_PER_REQUEST
+
+
+def test_legacy_tail_model_order_follows_ladder(monkeypatch, env, tmp_path):
+    from llm import ladder
+    monkeypatch.setattr(quota, "DEFAULT_DB_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(ladder, "DEFAULT_DB_PATH", tmp_path / "m.db")
+    monkeypatch.setattr(router.settings, "llm_model", lambda: "zzz-custom")
+    monkeypatch.setattr(router.settings, "llm_fallback_models", lambda: ["gemini-3"])
+    monkeypatch.setattr(router, "_legacy_configured", lambda: True)
+    models = router._legacy_models()
+    # env model absent from ladder joins the tail; ranked eaon candidates lead
+    assert "zzz-custom" in models
+    assert "gemini-3" in models
+    assert models[0] == "kimi-k2.7"
+    assert models.index("gemini-3") < models.index("zzz-custom")
+
 
 def test_certify_persistence_roundtrip(tmp_path):
     p = str(tmp_path / "cert.json")

@@ -128,6 +128,8 @@ def test_router_switches_before_limit_not_after_429(db, monkeypatch):
     env["CLOUDFLARE_ACCOUNT_ID"] = "acct"
     monkeypatch.setattr(router.env_loader, "load", lambda path=None: dict(env))
     monkeypatch.setattr(router, "_legacy_configured", lambda: False)
+    # Isolate pool behavior: the growing curated ladder is not under test here.
+    monkeypatch.setattr(router, "_ladder_routes", lambda req, env_=None: [])
     monkeypatch.setattr(
         certify, "certified_route_ids",
         lambda purpose, path=None: {"openrouter:nemotron-3-ultra", "groq:gpt-oss-120b"},
@@ -155,6 +157,8 @@ def test_router_429_falls_back_and_skips_cooldown_next_call(db, monkeypatch):
     env["CLOUDFLARE_ACCOUNT_ID"] = "acct"
     monkeypatch.setattr(router.env_loader, "load", lambda path=None: dict(env))
     monkeypatch.setattr(router, "_legacy_configured", lambda: False)
+    # Isolate pool behavior: the growing curated ladder is not under test here.
+    monkeypatch.setattr(router, "_ladder_routes", lambda req, env_=None: [])
     monkeypatch.setattr(
         certify, "certified_route_ids",
         lambda purpose, path=None: {"openrouter:nemotron-3-ultra", "groq:gpt-oss-120b"},

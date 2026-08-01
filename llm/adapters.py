@@ -78,7 +78,11 @@ class OpenAICompatAdapter:
 
     def parse(self, resp: httpx.Response) -> AdapterResult:
         data = resp.json()
-        text = data["choices"][0]["message"]["content"]
+        # Google OpenAI-compat wraps thinking models: when the token budget is
+        # consumed by thoughts the message may carry NO "content" key at all.
+        # Treat that as an empty body (caller decides) instead of KeyError.
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        text = message.get("content") or ""
         usage = data.get("usage") or {}
         rate = {k: v for k, v in resp.headers.items() if k.lower().startswith("x-ratelimit-")}
         return AdapterResult(

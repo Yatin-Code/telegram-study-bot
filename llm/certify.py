@@ -254,6 +254,7 @@ def _infrastructure_only(failures: list[str]) -> bool:
 def run(
     purposes: Optional[list[str]] = None,
     only_route: Optional[str] = None,
+    only_candidate: Optional[str] = None,
     force: bool = False,
     path: str | None = None,
 ) -> dict[str, dict[str, bool]]:
@@ -262,13 +263,28 @@ def run(
     Returns {purpose: {route_id: passed}}. Resumable: a (route, purpose) already
     certified is skipped unless ``force``. Every router call inside a battery is
     pinned to the route under test via ``router.force_route``.
+
+    With ``only_candidate`` (e.g. "g4f:glm-5.2"), the target is a curated
+    ladder candidate instead of an ai.env catalog route, and results land in
+    the ladder health table (certified_purposes) instead of the sidecar.
     """
+    from . import ladder as ladder_mod
     from . import router  # lazy: router imports this module for reads
 
     purposes = purposes or list(PURPOSES)
-    routes = registry.resolve_routes()
-    if only_route:
-        routes = [r for r in routes if r.id == only_route]
+    candidate_targets: set[str] = set()
+    if only_candidate:
+        cand = ladder_mod.get(only_candidate)
+        if cand is None:
+            print(f"[certify] unknown candidate {only_candidate!r} — "
+                  f"options: {', '.join(sorted(c.id for c in ladder_mod.all_candidates()))}")
+            return {}
+        routes = [ladder_mod.to_route(cand)]
+        candidate_targets.add(cand.id)
+    else:
+        routes = registry.resolve_routes()
+        if only_route:
+            routes = [r for r in routes if r.id == only_route]
 
     if not routes:
         print("[certify] no resolvable routes (is ai.env populated?) — nothing to do")
@@ -278,11 +294,18 @@ def run(
     for route in routes:
         print(f"\n=== {route.id}  (model={route.model}) ===")
         for purpose in purposes:
-            already = certified_route_ids(purpose, path)
-            if route.id in already and not force:
-                print(f"  {purpose:6}: already certified, skipping")
-                results[purpose][route.id] = True
-                continue
+            if route.id in candidate_targets:
+                already = _candidate_certified(route.id, purpose)
+                if already and not force:
+                    print(f"  {purpose:6}: already certified, skipping")
+                    results[purpose][route.id] = True
+                    continue
+            else:
+                already = certified_route_ids(purpose, path)
+                if route.id in already and not force:
+                    print(f"  {purpose:6}: already certified, skipping")
+                    results[purpose][route.id] = True
+                    continue
             try:
                 with router.force_route(route):
                     passed, total, failures = _BATTERIES[purpose]()
@@ -292,7 +315,10 @@ def run(
             certified = total > 0 and passed == total
             incomplete = not certified and _infrastructure_only(failures)
             results[purpose][route.id] = certified
-            _mark(purpose, route.id, certified, path)
+            if route.id in candidate_targets:
+                ladder_mod.mark_certified(route.id, purpose, certified)
+            else:
+                _mark(purpose, route.id, certified, path)
             if certified:
                 status = f"CERTIFIED {passed}/{total} (100%)"
             elif incomplete:
@@ -307,15 +333,25 @@ def run(
     return results
 
 
+def _candidate_certified(candidate_id: str, purpose: str) -> bool:
+    from . import ladder as ladder_mod
+    rows = ladder_mod.health_rows()
+    row = rows.get(candidate_id)
+    return bool(row and purpose in (row.get("certified_purposes") or "").split(","))
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Certify LLM routes: run every AI battery per model, require 100%.")
     ap.add_argument("--purpose", choices=PURPOSES, action="append", dest="purposes",
                     help="limit to one or more purposes (default: all)")
-    ap.add_argument("--route", dest="route", help="limit to one route id")
+    ap.add_argument("--route", dest="route", help="limit to one catalog route id")
+    ap.add_argument("--candidate", dest="candidate",
+                    help="certify one curated ladder candidate (e.g. g4f:glm-5.2)")
     ap.add_argument("--force", action="store_true", help="re-certify even if already certified")
     args = ap.parse_args(argv)
-    results = run(purposes=args.purposes, only_route=args.route, force=args.force)
+    results = run(purposes=args.purposes, only_route=args.route,
+                  only_candidate=args.candidate, force=args.force)
     print("\n=== summary ===")
     for purpose, routemap in results.items():
         certified = [rid for rid, ok in routemap.items() if ok]
