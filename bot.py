@@ -3521,11 +3521,10 @@ async def on_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if payload.get("db_key") == "ledger":
             session_context.restart_timer(draft["chat_id"])
         if result["status"] == "saved":
-            keys = [draft["payload"].get("db_key")]
-            if result.get("cross_page_id"):
-                keys.append("doubts")
             try:
-                await sync.sync_once_locked(db_keys=tuple(k for k in keys if k))
+                # Full Notion sync at the exact second of the write — the
+                # mirror never lags a bot-initiated Notion write.
+                await sync.sync_once_locked()
             except Exception:
                 logger.exception("post-write locked sync failed")
             msg = "✅ Logged to Notion."

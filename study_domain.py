@@ -83,7 +83,10 @@ def _sync(keys: Iterable[str], db_path: str | Path = DEFAULT_DB_PATH) -> None:
     if not notion_keys:
         return
     try:
-        sync.sync_once_locked_sync(db_path=db_path, db_keys=notion_keys)
+        # A Notion write is never mirrored partially: sync ALL Notion-owned
+        # DBs immediately so cross-log relations, rollups and computed columns
+        # are queryable at the exact second the write lands.
+        sync.sync_all_notion(db_path=db_path)
     except Exception:
         # A successful Notion write remains durable; the normal mirror job will
         # catch up. Callers surface the write result, not a misleading failure.

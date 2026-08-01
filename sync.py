@@ -307,6 +307,18 @@ def sync_once_locked_sync(
         return sync_once(db_path=db_path, db_keys=db_keys)
 
 
+def sync_all_notion(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, int]:
+    """Instantly sync EVERY Notion-owned DB (ledger, doubts, revision).
+
+    Called the moment any Notion write lands (LLM log/doubt/revision writes,
+    debriefs, cross-logs) so relations, rollups and computed columns become
+    queryable at the exact same second — the mirror never lags a bot-initiated
+    write, even one that touched a single database.
+    """
+    with _sync_lock:
+        return sync_once(db_path=db_path)
+
+
 async def sync_once_locked(
     *,
     db_path: str | Path = DEFAULT_DB_PATH,

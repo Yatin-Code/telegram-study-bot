@@ -276,5 +276,28 @@ def run() -> bool:
     return ok
 
 
+# ---------------------------------------------------------------------------
+# sync_all_notion — a write-triggered sync must cover EVERY Notion-owned DB
+# ---------------------------------------------------------------------------
+
+def test_sync_all_notion_covers_every_notion_db(tmp_path, monkeypatch):
+    db_path = tmp_path / "sync_all.db"
+    with sync.connect(db_path) as conn:
+        sync.init_db(conn)
+
+    from config import settings
+    monkeypatch.setattr(
+        settings, "configured_db_keys", lambda: list(sync.NOTION_SOURCE_KEYS)
+    )
+    queried: list[str] = []
+    monkeypatch.setattr(
+        sync, "query_database_iter", lambda db_key, page_size=100: queried.append(db_key) or iter([])
+    )
+    counts = sync.sync_all_notion(db_path=db_path)
+    assert set(counts) == set(sync.NOTION_SOURCE_KEYS), counts
+    assert all(v == 0 for v in counts.values()), counts
+    assert set(queried) == set(sync.NOTION_SOURCE_KEYS), queried
+
+
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)

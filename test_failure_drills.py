@@ -108,6 +108,39 @@ def test_notion_down_queues_then_flushes(db, monkeypatch):
     assert created and created[0][0] == "ledger"
 
 
+def test_commit_write_triggers_full_notion_sync(db, monkeypatch):
+    """A Notion write must sync ALL Notion-owned DBs at that exact second,
+    never just the written key (relations/rollups touch every mirror table)."""
+    payload = {
+        "db_key": "ledger",
+        "properties": {"task": "full-sync drill", "subject": "Physics"},
+        "operation_id": "drill-op-sync",
+    }
+    created = []
+
+    def notion_up(db_key, props):
+        created.append((db_key, props))
+        return {"id": "page-sync", "url": "https://notion/x"}
+
+    monkeypatch.setattr(logging_flow.notion, "create_page", notion_up)
+    sync_calls = []
+
+    def record_sync_all(*, db_path=None):
+        sync_calls.append(("sync_all_notion", db_path))
+        return {}
+
+    def fail_partial(*a, **k):
+        raise AssertionError(f"partial sync must not be used after a write: {a} {k}")
+
+    monkeypatch.setattr(logging_flow.sync, "sync_all_notion", record_sync_all)
+    monkeypatch.setattr(logging_flow.sync, "sync_once_locked_sync", fail_partial)
+
+    result = logging_flow.commit_write(dict(payload), db_path=db, do_sync=True)
+    assert result["status"] == "saved"
+    assert created and created[0][0] == "ledger"
+    assert sync_calls == [("sync_all_notion", db)]
+
+
 def test_bug_report_roundtrip(tmp_path):
     db = tmp_path / "bugs.db"
     bug_id = draft_store.add_bug_report(5, "answer said 20 but I logged 10", db_path=db)

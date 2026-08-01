@@ -597,13 +597,10 @@ def commit_write(
             )
 
         if do_sync:
-            keys = ["ledger"] if db_key == "ledger" else [db_key]
-            if cross_url:
-                keys.append("doubts")
             try:
-                sync.sync_once_locked_sync(
-                    db_path=db_path, db_keys=tuple(dict.fromkeys(keys))
-                )
+                # Full Notion sync, not just the written DB: cross-logs and
+                # ledger relations make every mirror table potentially stale.
+                sync.sync_all_notion(db_path=db_path)
             except Exception:  # sync is best-effort; the write already succeeded
                 logger.exception("post-write sync failed (write already saved)")
 
@@ -631,9 +628,8 @@ def add_session_debrief_doubt(
     )
     if doubt_id:
         try:
-            sync.sync_once_locked_sync(
-                db_path=db_path, db_keys=("doubts", "ledger")
-            )
+            # Full Notion sync: the ledger relation was just rewritten.
+            sync.sync_all_notion(db_path=db_path)
         except Exception:
             logger.exception("debrief doubt sync failed (doubt already saved)")
     return doubt_id, url
@@ -645,7 +641,7 @@ def append_session_notes(
     """Block-close debrief: save key takeaways onto the ledger entry."""
     notion.update_page(ledger_page_id, {"key_points_notes": text})
     try:
-        sync.sync_once_locked_sync(db_path=db_path, db_keys=("ledger",))
+        sync.sync_all_notion(db_path=db_path)
     except Exception:
         logger.exception("debrief notes sync failed (notes already saved)")
 

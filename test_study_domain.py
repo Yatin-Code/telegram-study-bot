@@ -68,6 +68,29 @@ def _mock_writes(monkeypatch):
     return updates
 
 
+def test_sync_after_notion_write_covers_all_notion_dbs(db, monkeypatch):
+    """A Notion-owned write triggers a FULL Notion sync, never a partial one."""
+    calls = []
+
+    def record_sync_all(*, db_path=None):
+        calls.append(("sync_all_notion", db_path))
+        return {}
+
+    def fail_partial(*a, **k):
+        raise AssertionError(f"partial sync after a Notion write: {a} {k}")
+
+    monkeypatch.setattr(sd.sync, "sync_all_notion", record_sync_all)
+    monkeypatch.setattr(sd.sync, "sync_once_locked_sync", fail_partial)
+
+    sd._sync(("doubts", "ledger"), db_path=db)
+    assert calls == [("sync_all_notion", db)]
+
+    # Operational-only keys never reach Notion → no sync at all.
+    calls.clear()
+    sd._sync(("daily_plan",), db_path=db)
+    assert calls == []
+
+
 def test_second_separate_doubt_attempt_unlocks_teacher(db, monkeypatch):
     now = dt.datetime(2026, 7, 20, 12, 0, tzinfo=dt.timezone.utc)
     insert(db, "doubts", notion_page_id="d1", core_concept="relative velocity", status="Unresolved")
