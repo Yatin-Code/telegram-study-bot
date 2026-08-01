@@ -181,7 +181,8 @@ async def render(update_or_message, response: AgentResponse):
     reply_to = getattr(message, "message_id", None)
 
     if response.response_type == "poll":
-        await message.reply_text(text, parse_mode=parse_mode)
+        safe = rich_message.sanitize_markdown(text) if parse_mode else text
+        await message.reply_text(safe, parse_mode=parse_mode)
         return await message.chat.send_poll(
             question=response.poll_question or "Poll",
             options=response.poll_options or ["Yes", "No"],
@@ -201,6 +202,7 @@ async def render(update_or_message, response: AgentResponse):
     except Exception:
         logger.exception("rich agent render failed; falling back to plain reply_text")
         try:
-            return await message.reply_text(text, reply_markup=markup, parse_mode=parse_mode)
+            safe = rich_message.sanitize_markdown(text) if parse_mode else text
+            return await message.reply_text(safe, reply_markup=markup, parse_mode=parse_mode)
         except Exception:
             return await message.reply_text(text, reply_markup=markup)

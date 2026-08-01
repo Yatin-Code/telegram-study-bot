@@ -18,6 +18,7 @@ never goes silent if the API rejects the rich payload.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
@@ -83,7 +84,54 @@ def build_input_rich_message(text: str, parse_mode: str = "markdown") -> dict[st
     if mode in ("html",):
         return {"html": text or ""}
     # markdown, Markdown, MarkdownV2, plain → rich markdown field
-    return {"markdown": text or ""}
+    return {"markdown": sanitize_markdown(text or "")}
+
+
+# ---------------------------------------------------------------------------
+# Markdown sanitising
+#
+# Telegram's markdown parsers (both the Bot API rich markdown field and the
+# classic ParseMode.MARKDOWN) reject a message outright when a `_` or `*`
+# never closes, e.g. `accuracy_ratio` or `question_1` in LLM output. That used
+# to make the whole fallback chain degrade the message to plain text. We
+# preserve intentionally formed spans (code, bold, italic, links) and
+# backslash-escape every stray special so formatting survives.
+# ---------------------------------------------------------------------------
+
+_MARKDOWN_STRAY_SPECIAL = re.compile(r"(?<!\\)_|(?<!\\)\*|(?<!\\)`|(?<!\\)\[|(?<!\\)\]")
+
+_MARKDOWN_PROTECTED_SPAN = re.compile(
+    r"```[\s\S]*?```"               # fenced code block
+    r"|`[^`\n]+`"                   # inline code
+    r"|(?<![A-Za-z0-9])\*\*[^*\n]+\*\*(?![A-Za-z0-9])"  # bold
+    r"|(?<![A-Za-z0-9])\*[^*\n]+\*(?![A-Za-z0-9])"      # italic
+    r"|(?<![A-Za-z0-9])_[^_\n]+_(?![A-Za-z0-9])"        # italic _
+    r"|\[[^\]\n]+\]\([^)\n]+\)"                         # [text](url)
+)
+
+
+def _escape_markdown_strays(segment: str) -> str:
+    return _MARKDOWN_STRAY_SPECIAL.sub(lambda m: "\\" + m.group(0), segment)
+
+
+def sanitize_markdown(text: str) -> str:
+    """Escape markdown specials that would break Telegram's markdown parser.
+
+    Intentionally formed spans (fenced/inline code, ``**bold**``, ``*italic*``,
+    ``_italic_``, ``[text](url)``) are preserved verbatim. Stray specials —
+    e.g. the single ``_`` in ``accuracy_ratio`` or ``question_1`` — are
+    backslash-escaped so an unbalanced marker cannot destroy the formatting of
+    the whole message. Safe to call repeatedly (already-escaped markers are
+    left alone).
+    """
+    out: list[str] = []
+    pos = 0
+    for match in _MARKDOWN_PROTECTED_SPAN.finditer(text):
+        out.append(_escape_markdown_strays(text[pos : match.start()]))
+        out.append(match.group(0))
+        pos = match.end()
+    out.append(_escape_markdown_strays(text[pos:]))
+    return "".join(out)
 
 
 def _serialize_reply_markup(reply_markup: Any) -> Any:
@@ -196,7 +244,10 @@ async def _send_plain(
         "message_thread_id": message_thread_id,
     }
     if parse_mode:
-        payload["parse_mode"] = parse_mode
+        plain_mode = _ptb_parse_mode(parse_mode)
+        if plain_mode == "Markdown":
+            payload["text"] = sanitize_markdown(text)
+        payload["parse_mode"] = plain_mode
     if reply_to_message_id is not None:
         payload["reply_parameters"] = {"message_id": reply_to_message_id}
     if disable_web_page_preview is not None:
@@ -223,7 +274,10 @@ async def _edit_plain(
         "text": text,
     }
     if parse_mode:
-        payload["parse_mode"] = parse_mode
+        plain_mode = _ptb_parse_mode(parse_mode)
+        if plain_mode == "Markdown":
+            payload["text"] = sanitize_markdown(text)
+        payload["parse_mode"] = plain_mode
     if disable_web_page_preview is not None:
         payload["link_preview_options"] = {"is_disabled": bool(disable_web_page_preview)}
     markup = _serialize_reply_markup(reply_markup)

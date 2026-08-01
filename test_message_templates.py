@@ -57,7 +57,9 @@ def test_reply_markdown_falls_back_to_plain_text_when_parse_fails():
     message = Message()
     result = asyncio.run(bot._reply_markdown(message, "*broken"))
     assert result == "*broken"
+    # The markdown attempt is pre-escaped so a stray special cannot destroy
+    # the message; the plain fallback keeps the original text.
     assert message.calls == [
-        ("*broken", {"parse_mode": ParseMode.MARKDOWN}),
+        ("\\*broken", {"parse_mode": ParseMode.MARKDOWN}),
         ("*broken", {}),
     ]

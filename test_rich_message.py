@@ -63,6 +63,65 @@ def test_build_input_rich_message_markdown():
     assert rich_message.build_input_rich_message("hi", "plain") == {"markdown": "hi"}
 
 
+# ---------------------------------------------------------------------------
+# sanitize_markdown — stray specials must never break Telegram markdown
+# ---------------------------------------------------------------------------
+
+def test_sanitize_plain_text_unchanged():
+    assert rich_message.sanitize_markdown("Hello world") == "Hello world"
+
+
+def test_sanitize_escapes_stray_underscore():
+    # accuracy_ratio / question_1: a single unbalanced `_` destroys the message.
+    assert rich_message.sanitize_markdown("accuracy_ratio 0.5") == "accuracy\\_ratio 0.5"
+    assert "\\_" in rich_message.sanitize_markdown("question_1 done")
+
+
+def test_sanitize_escapes_stray_asterisk_and_backtick():
+    assert rich_message.sanitize_markdown("5 * 3") == "5 \\* 3"
+    assert rich_message.sanitize_markdown("not ` code") == "not \\` code"
+
+
+def test_sanitize_preserves_intentional_italic_pairs():
+    out = rich_message.sanitize_markdown("Read _kinematics_ again")
+    assert out == "Read _kinematics_ again"
+
+
+def test_sanitize_preserves_bold_and_code_spans():
+    text = "**Top subject**: `accuracy_ratio` stayed flat"
+    out = rich_message.sanitize_markdown(text)
+    assert "**Top subject**" in out
+    assert "`accuracy_ratio`" in out
+
+
+def test_sanitize_preserves_link_syntax():
+    assert rich_message.sanitize_markdown("[docs](https://example.com/a_b)") == "[docs](https://example.com/a_b)"
+
+
+def test_sanitize_does_not_italicize_mid_word():
+    # foo_bar_baz is an identifier, not intentional italics.
+    assert rich_message.sanitize_markdown("foo_bar_baz") == "foo\\_bar\\_baz"
+
+
+def test_sanitize_is_idempotent():
+    once = rich_message.sanitize_markdown("accuracy_ratio * 2")
+    assert rich_message.sanitize_markdown(once) == once
+
+
+def test_sanitize_preserves_fenced_code_block():
+    text = "```\nfor i in range(3):\n    print(i)\n```"
+    assert rich_message.sanitize_markdown(text) == text
+
+
+@pytest.mark.asyncio
+async def test_send_rich_sanitizes_stray_underscores(monkeypatch):
+    monkeypatch.setenv("RICH_MESSAGES", "1")
+    client = _FakeAsyncClient()
+    with _patch_client(client):
+        await rich_message.send_rich("tok", 123, "accuracy_ratio 0.5", parse_mode="markdown")
+    assert client.calls[0][1]["rich_message"] == {"markdown": "accuracy\\_ratio 0.5"}
+
+
 @pytest.mark.asyncio
 async def test_send_rich_calls_sendRichMessage(monkeypatch):
     monkeypatch.setenv("RICH_MESSAGES", "1")

@@ -31,7 +31,7 @@ from typing import Any, Iterable, Sequence
 
 import formulas
 from config import notion_schema
-from config.ownership import NOTION_OWNED_KEYS
+from config.ownership import NOTION_OWNED_KEYS, SQL_OWNED_KEYS
 from notion_client_wrapper import page_plain_text, parse_page, query_database_iter
 
 
@@ -48,8 +48,20 @@ SYNC_META_TABLE = "sync_meta"
 # RLock keeps the public sync_once() safe even when a locked wrapper calls it.
 _sync_lock = threading.RLock()
 
-DB_TABLES = {key: key for key in notion_schema.PROPERTIES_BY_DB}
+# SQLite-owned domains (goals, work_items, exams, exam_questions, doubt_attempts,
+# timetable, daily_plan) live ONLY in op_* tables; Notion never mirrors them.
+# Restricting DB_TABLES to NOTION_OWNED_KEYS prevents sync.init_db from creating
+# empty bare mirror tables for SQLite-owned keys, which used to confuse the agent
+# into querying "goals" instead of "op_goals".
+DB_TABLES: dict[str, str] = {key: key for key in NOTION_OWNED_KEYS}
 NOTION_SOURCE_KEYS = NOTION_OWNED_KEYS
+
+# Legacy bare mirror tables for SQLite-owned domains that older versions of this
+# bot created as Notion mirrors. These were emptied once the operational data
+# moved to op_* tables (see operational_store._import_legacy_notion_rows).
+# init_db() now drops them when they are empty so the agent cannot be confused
+# into querying the wrong table.
+_LEGACY_BARE_SQL_KEYS: tuple[str, ...] = SQL_OWNED_KEYS
 
 
 SQLITE_TYPE_BY_NOTION_TYPE = {
@@ -134,6 +146,44 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+    # Drop legacy bare mirror tables for SQLite-owned domains when they are
+    # empty, or when every row has already been copied into the op_* table by
+    # operational_store._import_legacy_notion_rows. Rows that have NOT been
+    # migrated are left in place so the import can still pick them up — this
+    # drop can never lose data.
+    for legacy_key in _LEGACY_BARE_SQL_KEYS:
+        if not _table_exists(conn, legacy_key):
+            continue
+        try:
+            n = conn.execute(
+                f'SELECT COUNT(*) FROM {_quote_ident(legacy_key)}'
+            ).fetchone()[0]
+        except Exception:
+            continue
+        if n == 0:
+            conn.execute(f'DROP TABLE {_quote_ident(legacy_key)}')
+            continue
+        op_table = f"op_{legacy_key}"
+        if not _table_exists(conn, op_table):
+            continue
+        op_cols = {str(r[1]) for r in conn.execute(
+            f'PRAGMA table_info({_quote_ident(op_table)})'
+        ).fetchall()}
+        if "notion_page_id" not in op_cols:
+            continue
+        try:
+            unmigrated = conn.execute(
+                f'SELECT COUNT(*) FROM {_quote_ident(legacy_key)} l '
+                f"WHERE l.notion_page_id IS NOT NULL AND NOT EXISTS ("
+                f'SELECT 1 FROM {_quote_ident(op_table)} o '
+                f"WHERE o.notion_page_id = l.notion_page_id)"
+            ).fetchone()[0]
+        except Exception:
+            continue
+        if unmigrated == 0:
+            conn.execute(f'DROP TABLE {_quote_ident(legacy_key)}')
+
     conn.commit()
 
 
@@ -159,6 +209,13 @@ def _create_table_sql(db_key: str, table: str) -> str:
 
 def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
 
 
 def _ensure_column(

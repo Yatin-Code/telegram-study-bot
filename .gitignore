@@ -12,6 +12,7 @@ __pycache__/
 *.pyo
 *.pyd
 .venv/
+.venv-test/
 venv/
 *.egg-info/
 

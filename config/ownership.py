@@ -76,8 +76,13 @@ def ownership_prompt_block() -> str:
     return (
         "## Data ownership (do not dual-write)\n"
         f"- Notion-owned (mirror tables, human-editable in Notion): {notion}.\n"
-        f"  Prefer Notion API for writes to these; SQLite mirror is read-mostly.\n"
-        f"- SQLite-owned operational tables: {sql}.\n"
-        f"  Write via sqlite_execute / domain tools — never invent bare names like `goals`.\n"
+        "  These are the ONLY tables that mirror Notion; write them via the "
+        "log_*/doubt write tools (they sync back to Notion).\n"
+        f"- SQLite-owned operational tables (NOTION NEVER MIRRORS THESE): {sql}.\n"
+        "  There are NO bare mirror tables for these domains — data lives ONLY in "
+        "the op_* tables above. Never query `goals`, `work_items`, `exams`, "
+        "`daily_plan`, or `timetable`; query `op_goals`, `op_work_items`, etc.\n"
+        "  Write via the named domain tools (create_goal, create_exam, ...).\n"
+        "  sql_select reads from all of these; raw writes are not possible.\n"
         f"- Local memory/schedule only: {local}."
     )
