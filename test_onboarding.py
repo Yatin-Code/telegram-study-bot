@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
+import coaching_syllabus
 import commitments
+import ntsc_coaching
 import onboarding
+import session_context
 import study_domain as sd
 import sync
 from config import settings
@@ -151,3 +156,84 @@ def test_next_mock_line(db):
     assert row["kind"] == "Coaching Test" and str(row["exam_date"])[:10] == "2026-08-10"
     ok, _, _ = onboarding.apply_answer(CHAT, "next_mock", "just a title", db_path=db)
     assert ok is False
+
+
+def test_status_baseline_bare_db(db, monkeypatch):
+    """Bare mirror: no portal ok, and next_mock/timetable fall back to op_* rows.
+
+    Baseline pin of the CURRENT status() behavior before portal awareness: a
+    mirror with zero coaching rows must not raise, portal must not be ok, and
+    the wizard detectors keep their old op_* sources. The portal assertion is
+    written so it holds both before the key exists and after it is added.
+    """
+    monkeypatch.setenv("USER_TIMEZONE", "UTC")
+    stats = onboarding.status(db_path=db)
+    assert stats.get("portal", {}).get("ok") is not True
+    assert stats["next_mock"]["ok"] is False
+    assert stats["timetable"]["ok"] is False
+    assert stats["chapters"]["ok"] is False
+    assert stats["chapters"]["missing_subjects"] == onboarding.SUBJECTS
+    assert not stats["chapters"].get("suggested_topics")
+    sd.create_exam({"title": "Coaching major test", "kind": "Coaching Test",
+                    "exam_date": "2026-08-10"}, db_path=db)
+    sd.create_timetable_entry({"subject": "Physics", "weekday": "Monday",
+                               "start_time": "17:00", "end_time": "19:00"}, db_path=db)
+    stats = onboarding.status(db_path=db)
+    assert stats["next_mock"]["ok"] is True
+    assert "Coaching major test" in stats["next_mock"]["detail"]
+    assert stats["timetable"]["ok"] is True
+    assert "entr(ies)" in stats["timetable"]["detail"]
+    assert stats.get("portal", {}).get("ok") is not True
+
+
+def _seed_success_portal(db):
+    """Seed the NTSC mirror: success sync run + classes + tests + parsed syllabus."""
+    stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    with ntsc_coaching._connect(db) as conn:
+        conn.execute(
+            "INSERT INTO coaching_sync_runs (started_at, finished_at, status, datasets, error) "
+            "VALUES (?,?,?,?,?)",
+            (stamp, stamp, "success", '["classes"]', None))
+    today = session_context.local_today_iso()
+    ntsc_coaching.replace_classes([
+        {"classDate": today, "startTime": "08:00", "duration": 60,
+         "classType": "Class", "subjects": "Physics"},
+        {"classDate": today, "startTime": "10:00", "duration": 60,
+         "classType": "Class", "subjects": "Maths"},
+    ], db_path=db)
+    ntsc_coaching.replace_tests([
+        {"id": "t1", "testName": "Major Test 1", "testDateTime": f"{today}T09:00:00"},
+    ], db_path=db)
+    coaching_syllabus.replace_syllabi([
+        {"id": "t1", "syllabus": "Physics: Kinematics, Rotational Motion\n"
+         "Chem: Mole Concept\nMaths: Limits"},
+    ], db_path=db)
+    return today
+
+
+def test_status_portal_seeded_success(db, monkeypatch):
+    """Seeded success mirror: portal ✅, timetable/next_mock portal-derived, pre-filled topics."""
+    monkeypatch.setenv("USER_TIMEZONE", "UTC")
+    today = _seed_success_portal(db)
+    stats = onboarding.status(db_path=db)
+    assert stats["portal"]["ok"] is True
+    assert "2 classes" in stats["portal"]["detail"]
+    assert stats["timetable"]["ok"] is True
+    assert stats["timetable"]["detail"] == "from portal: 2 classes cached"
+    assert stats["next_mock"]["ok"] is True
+    assert "Major Test 1" in stats["next_mock"]["detail"]
+    assert today in stats["next_mock"]["detail"]
+    assert stats["chapters"]["suggested_topics"]["Physics"] == [
+        "Kinematics", "Rotational Motion"]
+    assert stats["chapters"]["suggested_topics"]["Chem"] == ["Mole Concept"]
+    assert stats["chapters"]["suggested_topics"]["Maths"] == ["Limits"]
+
+
+def test_status_portal_never_synced(db, monkeypatch):
+    """Zero coaching rows: portal ok=False with never-synced detail, no exception."""
+    monkeypatch.setenv("USER_TIMEZONE", "UTC")
+    stats = onboarding.status(db_path=db)
+    assert stats["portal"]["ok"] is False
+    assert "never synced" in stats["portal"]["detail"]
+    assert stats["timetable"]["ok"] is False
+    assert stats["next_mock"]["ok"] is False

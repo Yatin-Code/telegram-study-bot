@@ -20,7 +20,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import coaching_lifecycle
+import coaching_syllabus
 import commitments
+import ntsc_coaching
 import session_context
 import study_domain
 from config import settings
@@ -265,8 +268,68 @@ def advance(
 # Status detectors (✅ / ⚠️ per section)
 # ---------------------------------------------------------------------------
 
+# coaching_syllabus canonical subject labels -> onboarding.SUBJECTS labels.
+_SUBJECT_TO_PORTAL_SUBJECT = {
+    "Physics": "Physics",
+    "Chem": "Chemistry",
+    "Maths": "Mathematics",
+}
+
+
+def _portal_snapshot(*, today: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
+    """Best-effort read of the NTSC mirror.
+
+    An empty / never-synced mirror must never raise: every read is guarded and
+    the snapshot falls back to empty counts.  ``ok`` requires at least one
+    successful sync run AND a still-fresh cache (``coaching_lifecycle.fresh``).
+    """
+    snapshot: dict[str, Any] = {
+        "ok": False,
+        "classes": 0,
+        "tests": 0,
+        "results": 0,
+        "class_count": 0,
+        "next_test": None,
+        "course_name": None,
+        "syllabus_records": [],
+    }
+    try:
+        with ntsc_coaching._connect(db_path) as conn:
+            success = int(conn.execute(
+                "SELECT COUNT(*) FROM coaching_sync_runs WHERE status='success'"
+            ).fetchone()[0])
+            snapshot["classes"] = int(conn.execute(
+                "SELECT COUNT(*) FROM coaching_classes").fetchone()[0])
+            snapshot["tests"] = int(conn.execute(
+                "SELECT COUNT(*) FROM coaching_tests").fetchone()[0])
+            snapshot["results"] = int(conn.execute(
+                "SELECT COUNT(*) FROM coaching_results").fetchone()[0])
+            snapshot["class_count"] = int(conn.execute(
+                "SELECT COUNT(*) FROM coaching_classes WHERE class_date>=?",
+                (today,),
+            ).fetchone()[0])
+            profile = conn.execute(
+                "SELECT course_name FROM coaching_profile WHERE singleton=1"
+            ).fetchone()
+            if profile and profile["course_name"]:
+                snapshot["course_name"] = str(profile["course_name"])
+        snapshot["ok"] = bool(success) and coaching_lifecycle.fresh(
+            now=session_context.local_now(), db_path=db_path
+        )
+        tests = ntsc_coaching.next_tests(today=today, limit=1, db_path=db_path)
+        snapshot["next_test"] = tests[0] if tests else None
+        records: list[dict[str, Any]] = []
+        for test in coaching_syllabus.upcoming_syllabus(today=today, limit=5, db_path=db_path):
+            records.extend(test.get("syllabus_records") or [])
+        snapshot["syllabus_records"] = records
+    except Exception:
+        pass
+    return snapshot
+
+
 def status(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, dict[str, Any]]:
     today = session_context.local_today_iso()
+    portal = _portal_snapshot(today=today, db_path=db_path)
     result: dict[str, dict[str, Any]] = {}
 
     tz = settings.user_timezone()
@@ -274,6 +337,20 @@ def status(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, dict[str, Any]
         "ok": tz != "UTC",
         "detail": tz if tz != "UTC" else "UTC — almost certainly wrong for you",
     }
+    result["portal"] = (
+        {
+            "ok": True,
+            "detail": (
+                f"synced {portal['classes']} classes · {portal['tests']} tests · "
+                f"{portal['results']} results"
+            ),
+        }
+        if portal["ok"]
+        else {
+            "ok": False,
+            "detail": "⚠️ never synced — check NTSC credentials in /settings",
+        }
+    )
 
     exams = study_domain._rows(
         "exams",
@@ -289,20 +366,37 @@ def status(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, dict[str, Any]
             else "no JEE date — planner stays in Foundation phase"
         ),
     }
+    if portal["course_name"]:
+        result["target_exam"]["course_hint"] = portal["course_name"]
     mocks = [e for e in exams if e not in jee]
-    result["next_mock"] = {
-        "ok": bool(mocks),
-        "detail": (
-            f"{mocks[0].get('title')} on {str(mocks[0].get('exam_date'))[:10]}" if mocks
-            else "no upcoming mock recorded (optional)"
-        ),
-    }
+    portal_test = portal["next_test"]
+    if portal_test and portal_test.get("title"):
+        title = str(portal_test.get("title"))
+        test_date = str(portal_test.get("test_date") or "")[:10]
+        result["next_mock"] = {
+            "ok": True,
+            "detail": f"{title} on {test_date}" if test_date else title,
+        }
+    else:
+        result["next_mock"] = {
+            "ok": bool(mocks),
+            "detail": (
+                f"{mocks[0].get('title')} on {str(mocks[0].get('exam_date'))[:10]}" if mocks
+                else "no upcoming mock recorded (optional)"
+            ),
+        }
 
     timetable = study_domain._rows("timetable", "archived=0 AND active=1", db_path=db_path)
-    result["timetable"] = {
-        "ok": bool(timetable),
-        "detail": f"{len(timetable)} entr(ies)" if timetable else "empty — teacher alerts can't fire",
-    }
+    if not timetable and portal["class_count"]:
+        result["timetable"] = {
+            "ok": True,
+            "detail": f"from portal: {portal['class_count']} classes cached",
+        }
+    else:
+        result["timetable"] = {
+            "ok": bool(timetable),
+            "detail": f"{len(timetable)} entr(ies)" if timetable else "empty — teacher alerts can't fire",
+        }
 
     syllabus = study_domain._rows(
         "work_items",
@@ -311,6 +405,23 @@ def status(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, dict[str, Any]
     )
     covered = {str(r.get("subject") or "") for r in syllabus}
     missing = [s for s in SUBJECTS if s not in covered]
+    suggested_topics: dict[str, list[str]] = {}
+    if missing:
+        for subject in missing:
+            target = _SUBJECT_TO_PORTAL_SUBJECT.get(subject)
+            topics: list[str] = []
+            for record in portal["syllabus_records"]:
+                if target is not None and str(record.get("subject") or "") != target:
+                    continue
+                topic = (
+                    record.get("topic")
+                    or record.get("normalized_text")
+                    or record.get("chapter")
+                )
+                if topic and str(topic) not in topics:
+                    topics.append(str(topic))
+            if topics:
+                suggested_topics[subject] = topics[:10]
     result["chapters"] = {
         "ok": not missing,
         "detail": (
@@ -318,6 +429,7 @@ def status(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, dict[str, Any]
             else f"missing: {', '.join(missing)}"
         ),
         "missing_subjects": missing,
+        "suggested_topics": suggested_topics,
     }
 
     backlog = study_domain._rows(
