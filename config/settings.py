@@ -250,6 +250,20 @@ def sync_interval_seconds() -> int:
     return _get_int("SYNC_INTERVAL_SECONDS", 240, lo=60, hi=3600)
 
 
+def ntsc_username() -> str:
+    """Portal username. Secret: env-only, never settings.json."""
+    return os.environ.get("NTSC_USERNAME", "").strip()
+
+
+def ntsc_password() -> str:
+    """Portal password. Secret: env-only, never settings.json or LLM context."""
+    return os.environ.get("NTSC_PASSWORD", "")
+
+
+def ntsc_sync_interval_seconds() -> int:
+    return _get_int("NTSC_SYNC_INTERVAL_SECONDS", 1800, lo=300, hi=21600)
+
+
 def draft_ttl_minutes() -> int:
     """How long a Confirm/Edit/Cancel preview stays alive."""
     return _get_int("DRAFT_TTL_MINUTES", 15, lo=1, hi=120)

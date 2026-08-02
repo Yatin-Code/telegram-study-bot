@@ -539,6 +539,63 @@ def _run_dismiss_doubt(run: dict[str, Any], chat_id: int | str, db_path: str | P
     return _run_domain(study_domain.dismiss_doubt, run["doubt"], run["reason"], db_path=db_path)
 
 
+def _prep_record_doubt_attempt(args: dict[str, Any], chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    """Preview a durable doubt-attempt write (confirmed before it runs)."""
+    import study_domain
+    doubt = _req_str(args, "doubt")
+    _check_doubt_match(doubt, db_path)
+    duration = _number("duration_min", args.get("duration_min"), required=True)
+    if duration is None or duration < 1:
+        raise ToolArgError("duration_min must be at least 1")
+    data = {
+        "duration_min": int(duration),
+        "approach": _req_str(args, "approach"),
+        "stuck_point": _req_str(args, "stuck_point"),
+        "outcome": _enum("outcome", args.get("outcome"), notion_schema.ATTEMPT_OUTCOME_OPTIONS, default="Unsolved"),
+    }
+    preview = _preview(f"Record doubt attempt — {doubt}", data)
+    return {"ok": True, "preview": preview, "run": {"doubt": doubt, **data}}
+
+
+def _run_record_doubt_attempt(run: dict[str, Any], chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    import study_domain
+    return _run_domain(
+        study_domain.record_doubt_attempt,
+        run["doubt"],
+        duration_min=run["duration_min"],
+        approach=run["approach"],
+        stuck_point=run["stuck_point"],
+        outcome=run["outcome"],
+        db_path=db_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Write tool: update_progress (coaching_progress — evidence-aware chapter/topic
+# progress). Preview via prepare_progress_write, confirm via run_progress_write.
+# ---------------------------------------------------------------------------
+
+def _prep_update_progress(args: dict[str, Any], chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    import coaching_progress
+    record = {k: v for k, v in (args or {}).items() if v is not None and v != ""}
+    result = coaching_progress.prepare_progress_write(record, db_path=db_path)
+    if not result.get("ok"):
+        return {"ok": False, "error": "; ".join(result.get("errors") or ["invalid progress record"])}
+    return {
+        "ok": True,
+        "preview": result["preview"],
+        "run": {"record": result["run"]["record"]},
+    }
+
+
+def _run_update_progress(run: dict[str, Any], chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    import coaching_progress
+    result = coaching_progress.run_progress_write(run, db_path=db_path)
+    if not result.get("ok"):
+        return {"error": True, "message": "; ".join(result.get("errors") or ["progress write failed"])}
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Write tool: schedule_reminder (user_jobs)
 # ---------------------------------------------------------------------------
@@ -601,6 +658,8 @@ _PREP_HANDLERS = {
     "create_timetable_entry": _prep_create_timetable_entry,
     "resolve_doubt": _prep_resolve_doubt,
     "dismiss_doubt": _prep_dismiss_doubt,
+    "record_doubt_attempt": _prep_record_doubt_attempt,
+    "update_progress": _prep_update_progress,
     "schedule_reminder": _prep_schedule_reminder,
 }
 
@@ -617,11 +676,18 @@ _RUN_HANDLERS = {
     "create_timetable_entry": _run_create_timetable_entry,
     "resolve_doubt": _run_resolve_doubt,
     "dismiss_doubt": _run_dismiss_doubt,
+    "record_doubt_attempt": _run_record_doubt_attempt,
+    "update_progress": _run_update_progress,
     "schedule_reminder": _run_schedule_reminder,
 }
 
 WRITE_TOOLS = frozenset(_PREP_HANDLERS)
-READ_TOOLS = frozenset({"get_context", "get_schema", "sql_select"})
+READ_TOOLS = frozenset({
+    "get_context", "get_schema", "sql_select", "get_coaching_schedule",
+    "get_coaching_snapshot", "get_upcoming_syllabus", "get_next_class",
+    "get_plan_suggestions", "get_chapter_progress", "get_next_doubt",
+    "get_doubt_interaction", "get_score_prediction", "get_backlog_status",
+})
 
 
 def prepare_write(
@@ -708,6 +774,139 @@ TOOL_SPECS = [
             },
             "required": ["sql"],
         },
+    },
+    {
+        "name": "get_coaching_schedule",
+        "description": (
+            "Read the synced Narayana coaching timetable for an exact ISO date. "
+            "Use this for today, tomorrow, or relative-date class questions after "
+            "resolving the date. Returns freshness and class times."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Target date, YYYY-MM-DD"},
+            },
+            "required": ["date"],
+        },
+    },
+    {
+        "name": "get_coaching_snapshot",
+        "description": (
+            "Read the compact current Narayana coaching snapshot: profile, today's "
+            "and tomorrow's classes, next tests, latest result, and sync freshness."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_upcoming_syllabus",
+        "description": (
+            "Read upcoming coaching tests with their normalized syllabus topics and "
+            "per-topic coverage flags (covered / has_doubt) matched against the ledger "
+            "and doubts mirror. Use for 'what is in the next test', coverage, or "
+            "progress-on-syllabus questions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "How many upcoming tests to include (default 5)"},
+            },
+        },
+    },
+    {
+        "name": "get_next_class",
+        "description": (
+            "Read the next upcoming coaching classes (and their times) from the synced "
+            "timetable. Use for 'when is the next class / what is next on the schedule'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "How many upcoming classes to include (default 3)"},
+            },
+        },
+    },
+    {
+        "name": "get_plan_suggestions",
+        "description": (
+            "Build deterministic read-only coaching plan suggestions for tomorrow (or a "
+            "wider window): fixed classes, pre/post-class prep, revision, homework, test "
+            "prep, and doubt work placed into free time. Returns blocks, unplaced items "
+            "with reasons, per-day capacity, and warnings. Use for 'plan my day/week' or "
+            "'what should I do tomorrow'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Number of days to plan (default 1 = tomorrow)"},
+                "start_date": {"type": "string", "description": "Optional start date YYYY-MM-DD (default tomorrow)"},
+            },
+        },
+    },
+    {
+        "name": "get_chapter_progress",
+        "description": (
+            "Read deterministic chapter/topic coverage across upcoming coaching tests "
+            "and the evidence-aware progress rows (coverage summary + missing questions). "
+            "Use for 'how much of the syllabus have I covered', progress gaps, or what "
+            "progress data is still missing. Read-only; nothing is written."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "How many upcoming tests to include (default 5)"},
+            },
+        },
+    },
+    {
+        "name": "get_next_doubt",
+        "description": (
+            "Read the deterministic next-doubt ranking: the highest-priority open doubt "
+            "plus a short queue, each with its bucket, reason and confidence. Use for "
+            "'which doubt should I work on next'. Read-only."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_doubt_interaction",
+        "description": (
+            "Begin (or resume) a local doubt-attempt interaction session for one open "
+            "doubt_id (from get_next_doubt). Returns the session state and prompt. This "
+            "starts a local interaction only — durable attempt/resolution writes use the "
+            "confirmed write tools record_doubt_attempt / resolve_doubt / dismiss_doubt."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doubt_id": {"type": "string", "description": "Doubt id from get_next_doubt"},
+            },
+            "required": ["doubt_id"],
+        },
+    },
+    {
+        "name": "get_score_prediction",
+        "description": (
+            "Read a deterministic bounded score-range projection for the nearest upcoming "
+            "coaching test (normalized to percentages, with conservative/likely/stretch "
+            "bands, confidence and bounded actions). Never claims a rank/AIR. Read-only; "
+            "nothing is stored."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "test_id": {"type": "string", "description": "Optional specific upcoming test id to project"},
+            },
+        },
+    },
+    {
+        "name": "get_backlog_status",
+        "description": (
+            "Read the deterministic backlog escalation verdict (normal/growing/critical/"
+            "impossible), its metrics, plan adherence/headroom, and per-dataset data "
+            "freshness. Use for 'is my backlog out of control' or 'should I add more time'. "
+            "Read-only; never writes a plan."
+        ),
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": "set_context",
@@ -916,6 +1115,54 @@ TOOL_SPECS = [
         },
     },
     {
+        "name": "record_doubt_attempt",
+        "description": (
+            "Record a durable attempt on an existing open doubt (fuzzy name match). "
+            "Requires duration_min>=1, the approach you tried and the exact stuck point. "
+            "Confirmed before saving."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doubt": {"type": "string", "description": "Doubt title (fuzzy matched)"},
+                "duration_min": {"type": "integer", "description": "Minutes spent (>=1)"},
+                "approach": {"type": "string", "description": "What you tried"},
+                "stuck_point": {"type": "string", "description": "Exactly where you got stuck"},
+                "outcome": {"type": "string", "enum": sorted(notion_schema.ATTEMPT_OUTCOME_OPTIONS), "description": "Attempt outcome"},
+            },
+            "required": ["doubt", "duration_min", "approach", "stuck_point"],
+        },
+    },
+    {
+        "name": "update_progress",
+        "description": (
+            "Record evidence-aware chapter/topic progress for an upcoming-syllabus item "
+            "(subject + topic required, chapter optional): exercise/mle/pyq done+total, "
+            "confidence 0-100, mastery, verification_source, last_verified, notes. Weaker "
+            "evidence never overrides stronger stored evidence. Confirmed before saving."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Canonical subject, e.g. Physics"},
+                "topic": {"type": "string", "description": "Topic name"},
+                "chapter": {"type": "string", "description": "Optional chapter name"},
+                "exercise_done": {"type": "integer"},
+                "exercise_total": {"type": "integer"},
+                "mle_done": {"type": "integer"},
+                "mle_total": {"type": "integer"},
+                "pyq_done": {"type": "integer"},
+                "pyq_total": {"type": "integer"},
+                "confidence": {"type": "integer", "description": "0-100"},
+                "mastery": {"type": "string", "enum": sorted(notion_schema.MASTERY_STATUS_OPTIONS)},
+                "verification_source": {"type": "string", "enum": ["unknown", "self_reported", "partially_evidenced", "evidence_backed"]},
+                "last_verified": {"type": "string", "description": "YYYY-MM-DD"},
+                "notes": {"type": "string"},
+            },
+            "required": ["subject", "topic"],
+        },
+    },
+    {
         "name": "schedule_reminder",
         "description": (
             "Schedule a reminder/job: a message at a time ('message') or a question the bot asks "
@@ -938,6 +1185,32 @@ TOOL_SPECS = [
 ]
 
 
+def _compact_doubt(entry: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Reduce one ranked-doubt entry to its privacy-safe, compact shape."""
+    if entry is None:
+        return None
+    doubt = entry.get("doubt") or {}
+    return {
+        "doubt_id": entry.get("doubt_id") or doubt.get("notion_page_id"),
+        "concept": entry.get("concept"),
+        "subject": entry.get("subject"),
+        "bucket": entry.get("bucket_label"),
+        "score": entry.get("score"),
+        "confidence": entry.get("confidence"),
+        "reason": entry.get("reason"),
+    }
+
+
+def coaching_progress_relevant_freshness(db_path: str | Path) -> dict[str, Any]:
+    """Compact freshness of the datasets chapter-progress reads depend on."""
+    try:
+        import coaching_policy
+        fresh = coaching_policy.classify_freshness(db_path=db_path)
+        return {k: fresh[k]["status"] for k in ("coaching", "ledger", "doubts")}
+    except Exception:
+        return {}
+
+
 def execute_tool(
     name: str,
     arguments: dict[str, Any],
@@ -953,6 +1226,193 @@ def execute_tool(
             return get_schema(db_path=db_path, **dict(arguments or {}))
         if name == "sql_select":
             return sql_select(db_path=db_path, **dict(arguments or {}))
+        if name == "get_coaching_schedule":
+            import ntsc_coaching
+            date = str((arguments or {}).get("date") or "")[:10]
+            if len(date) != 10:
+                return {"error": True, "message": "date must be YYYY-MM-DD"}
+            return {
+                "date": date,
+                "classes": ntsc_coaching.classes_for_date(date, db_path=db_path),
+                "freshness": ntsc_coaching.freshness(db_path=db_path),
+            }
+        if name == "get_coaching_snapshot":
+            import ntsc_coaching
+            return ntsc_coaching.context_snapshot(db_path=db_path)
+        if name == "get_upcoming_syllabus":
+            import coaching_syllabus
+            import ntsc_coaching
+            try:
+                limit = max(1, min(int((arguments or {}).get("limit") or 5), 20))
+            except (TypeError, ValueError):
+                limit = 5
+            tests = coaching_syllabus.coverage_snapshot(limit=limit, db_path=db_path)
+            return {
+                "tests": [
+                    {
+                        "source_id": t.get("source_id"),
+                        "title": t.get("title"),
+                        "test_date": t.get("test_date"),
+                        "coverage": t.get("coverage"),
+                        "topics": [
+                            {
+                                "subject": r.get("subject"),
+                                "chapter": r.get("chapter"),
+                                "topic": r.get("topic"),
+                                "covered": r.get("covered"),
+                                "has_doubt": r.get("has_doubt"),
+                            }
+                            for r in (t.get("syllabus_records") or [])
+                        ],
+                    }
+                    for t in tests
+                ],
+                "freshness": ntsc_coaching.freshness(db_path=db_path),
+            }
+        if name == "get_next_class":
+            import ntsc_coaching
+            try:
+                limit = max(1, min(int((arguments or {}).get("limit") or 3), 10))
+            except (TypeError, ValueError):
+                limit = 3
+            return {
+                "classes": ntsc_coaching.next_classes(limit=limit, db_path=db_path),
+                "freshness": ntsc_coaching.freshness(db_path=db_path),
+            }
+        if name == "get_plan_suggestions":
+            import coaching_planner
+            try:
+                days = max(1, min(int((arguments or {}).get("days") or 1), 14))
+            except (TypeError, ValueError):
+                days = 1
+            start_date = (arguments or {}).get("start_date")
+            if start_date not in (None, ""):
+                start_date = str(start_date)[:10]
+                try:
+                    dt.date.fromisoformat(start_date)
+                except ValueError:
+                    return {
+                        "error": True,
+                        "message": "start_date must be YYYY-MM-DD",
+                    }
+            plan = coaching_planner.build_plan(
+                target_date=start_date,
+                days=days,
+                db_path=db_path,
+            )
+            return {
+                "plan_type": plan["plan_type"],
+                "start_date": plan["start_date"],
+                "end_date": plan["end_date"],
+                "blocks": [
+                    {
+                        "kind": b["kind"],
+                        "title": b["title"],
+                        "date": b["date"],
+                        "start": b.get("start"),
+                        "end": b.get("end"),
+                        "duration_min": b.get("duration_min"),
+                        "priority": b.get("priority"),
+                        "reason": b.get("reason"),
+                    }
+                    for b in plan["blocks"] if b.get("placed")
+                ],
+                "unplaced": [
+                    {
+                        "kind": u["kind"],
+                        "title": u["title"],
+                        "date": u["date"],
+                        "skip_reason": u.get("skip_reason"),
+                    }
+                    for u in plan["unplaced"]
+                ],
+                "capacity": plan["capacity"],
+                "warnings": plan["warnings"],
+            }
+        if name == "get_chapter_progress":
+            import coaching_progress
+            try:
+                limit = max(1, min(int((arguments or {}).get("limit") or 5), 20))
+            except (TypeError, ValueError):
+                limit = 5
+            return {
+                "coverage": coaching_progress.coverage_summary(limit=limit, db_path=db_path),
+                "missing_questions": coaching_progress.missing_data_questions(
+                    limit=limit, db_path=db_path
+                ),
+                "freshness": coaching_progress_relevant_freshness(db_path),
+                "generated_with": "deterministic",
+            }
+        if name == "get_next_doubt":
+            import coaching_doubts
+            ranked = coaching_doubts.ranked_doubts(db_path=db_path)
+            top = ranked[0] if ranked else None
+            return {
+                "open_doubt_count": len(ranked),
+                "next": _compact_doubt(top),
+                "queue": [_compact_doubt(d) for d in ranked[:5]],
+                "generated_with": "deterministic",
+            }
+        if name == "get_doubt_interaction":
+            import coaching_doubts
+            doubt_id = str((arguments or {}).get("doubt_id") or "")
+            if not doubt_id:
+                return {"error": True, "message": "doubt_id is required (see get_next_doubt)"}
+            try:
+                session = coaching_doubts.begin_doubt(chat_id, doubt_id, db_path=db_path)
+            except ValueError as exc:
+                return {"error": True, "message": str(exc)}
+            return {
+                "session_id": session["id"],
+                "state": session["state"],
+                "doubt_id": session["doubt_id"],
+                "doubt_concept": session.get("doubt_concept"),
+                "subject": session.get("subject"),
+                "message": session["message"],
+                "write_plan": session.get("write_plan"),
+                "note": (
+                    "This begins a local interaction state only. Durable doubt "
+                    "attempt/resolution writes require the confirmed write tools "
+                    "(record_doubt_attempt / resolve_doubt / dismiss_doubt)."
+                ),
+                "generated_with": "deterministic",
+            }
+        if name == "get_score_prediction":
+            import coaching_prediction
+            test_id = (arguments or {}).get("test_id")
+            snapshot = coaching_prediction.project_coaching_score(
+                test_id=test_id or None, db_path=db_path, store=False,
+            )
+            return {
+                "status": snapshot["status"],
+                "test_title": snapshot.get("test_title"),
+                "test_date": snapshot.get("test_date"),
+                "days_to_test": snapshot.get("days_to_test"),
+                "confidence": snapshot.get("confidence"),
+                "total": snapshot.get("total"),
+                "subjects": [
+                    {k: s.get(k) for k in ("subject", "status", "mean_pct", "pct", "trend_direction")}
+                    for s in (snapshot.get("subjects") or [])
+                ],
+                "risks": (snapshot.get("risks") or [])[:6],
+                "actions": (snapshot.get("actions") or [])[:6],
+                "missing": snapshot.get("missing", []),
+                "rank_statement": snapshot.get("rank_statement"),
+                "generated_with": "deterministic",
+            }
+        if name == "get_backlog_status":
+            import coaching_policy
+            escalation = coaching_policy.backlog_escalation(db_path=db_path)
+            return {
+                "level": escalation["level"],
+                "metrics": escalation["metrics"],
+                "plan": escalation["plan"],
+                "escalation": escalation["escalation"],
+                "reasons": escalation["reasons"],
+                "recommendation": escalation["recommendation"],
+                "freshness": coaching_policy.classify_freshness(db_path=db_path),
+                "generated_with": "deterministic",
+            }
         if name in WRITE_TOOLS:
             return {
                 "error": True,

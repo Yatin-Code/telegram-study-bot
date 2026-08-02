@@ -3,4 +3,5 @@ python-dotenv>=1.0
 python-telegram-bot[job-queue]>=21.0
 pydantic>=1.10
 tzdata>=2024.1
+cryptography>=41.0
 pytest>=8.0

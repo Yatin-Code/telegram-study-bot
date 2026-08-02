@@ -246,6 +246,11 @@ below, never through raw API calls.
 ## Current session context
 {session_context}
 
+## Current coaching snapshot
+{coaching_snapshot}
+
+{privacy_block}
+
 ## Recent activity (last 7 days)
 {recent_activity}
 
@@ -508,6 +513,18 @@ def _build_system_prompt(chat_id: int | str, user_text: str = "") -> str:
     identity = bot_identity.identity_prompt(role="agentic study coach")
     tool_specs = json.dumps(agent_tools.TOOL_SPECS, indent=2)
     historical = ""
+    privacy_block = ""
+    try:
+        import coaching_policy
+        privacy_block = coaching_policy.privacy_policy_block()
+    except Exception:
+        logger.debug("privacy policy block unavailable", exc_info=True)
+    try:
+        import coaching_context
+        coaching_snapshot = coaching_context.render_compact(chat_id, user_text=user_text)
+    except Exception:
+        logger.exception("failed to load coaching snapshot")
+        coaching_snapshot = "  (coaching snapshot unavailable)"
     if user_text:
         refs = _detect_temporal_references(user_text)
         historical = _load_historical_samples(refs) or "  (none — user did not request historical data)"
@@ -515,6 +532,8 @@ def _build_system_prompt(chat_id: int | str, user_text: str = "") -> str:
         identity=identity,
         ownership_block=ownership_prompt_block(),
         session_context=_load_session_context(chat_id),
+        coaching_snapshot=coaching_snapshot,
+        privacy_block=privacy_block,
         recent_activity=_load_recent_activity(),
         historical_samples=historical,
         learner_profile=_load_learner_profile(chat_id),

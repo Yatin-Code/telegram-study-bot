@@ -49,6 +49,7 @@ import operational_store
 import query_flow
 import session_context
 import sync
+import ntsc_sync
 import study_domain
 import domain_parser
 import planner
@@ -80,9 +81,24 @@ def _assistant_system_prompt(chat_id: int) -> str:
     context_text = _format_context(context)
     import actions
     identity = actions.identity_with_actions(role="conversational fallback", context="any")
+    try:
+        import coaching_context
+        coaching = coaching_context.render_compact(chat_id)
+    except Exception:
+        coaching = "(coaching snapshot unavailable)"
+    try:
+        import coaching_policy
+        privacy = coaching_policy.privacy_policy_block()
+    except Exception:
+        privacy = ""
     return f"""{identity}
 
 Current study context: {context_text}
+
+Current coaching snapshot:
+{coaching}
+
+{privacy}
 
 Answer normal study questions, explain strategy, explain what the bot can do,
 and guide the user to the right command. Keep the response concise and suitable
@@ -3585,6 +3601,83 @@ async def _periodic_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("periodic sync failed")
 
 
+async def _periodic_ntsc_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Refresh the portal-backed coaching cache without blocking bot updates."""
+    if not config_settings.ntsc_username() or not config_settings.ntsc_password():
+        return
+    try:
+        result = await asyncio.to_thread(ntsc_sync.sync_once)
+        if result.get("status") == "failed":
+            logger.warning("NTSC sync failed: %s", result.get("error"))
+        else:
+            logger.info("NTSC sync: %s", result)
+    except Exception:
+        logger.exception("periodic NTSC sync failed")
+
+
+async def _coaching_lifecycle_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send due pre/post-class coaching nudges when the cache is fresh.
+
+    ``coaching_lifecycle.scan_candidates`` returns [] unless the coaching cache
+    had a recent successful sync, so this never nudges on stale or missing data.
+    Each candidate is claimed via ``reminders.claim`` before sending so a later
+    scan cannot double-send the same logical class; a failed send releases the
+    claim so the next scan can retry.
+    """
+    try:
+        import coaching_lifecycle
+        candidates = await asyncio.to_thread(
+            coaching_lifecycle.scan_candidates
+        )
+        for candidate in candidates:
+            if not reminders.claim(candidate["event_key"]):
+                continue
+            try:
+                await _send_markdown(
+                    context.bot,
+                    telegram_allowed_user_id(),
+                    candidate["message"],
+                )
+            except Exception:
+                reminders.release(candidate["event_key"])
+                logger.exception("coaching lifecycle send failed for %s", candidate["event_key"])
+    except Exception:
+        logger.exception("coaching lifecycle scan failed")
+
+
+async def _coaching_proactive_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send policy-approved Phase 13 proactive coaching notifications.
+
+    ``coaching_proactive.scan_candidates`` runs every deterministic source
+    through ``coaching_policy.decide_notification`` and records each decision;
+    only candidates whose decision allows a send are returned.  Each approved
+    candidate is claimed via ``reminders.claim`` before sending so a later scan
+    cannot double-send the same event; a failed send releases the claim so the
+    next scan can retry.  Quiet hours, cooldowns, the daily budget and data
+    freshness are all enforced inside the policy, so nothing here can spam.
+    """
+    try:
+        import coaching_proactive
+        chat_id = telegram_allowed_user_id()
+        candidates = await asyncio.to_thread(
+            coaching_proactive.scan_candidates, chat_id=chat_id
+        )
+        for candidate in candidates:
+            if not candidate.get("allow"):
+                continue
+            if not reminders.claim(candidate["event_key"]):
+                continue
+            try:
+                await _send_markdown(context.bot, chat_id, candidate["message"])
+            except Exception:
+                reminders.release(candidate["event_key"])
+                logger.exception(
+                    "coaching proactive send failed for %s", candidate["event_key"]
+                )
+    except Exception:
+        logger.exception("coaching proactive scan failed")
+
+
 async def _expire_drafts(context: ContextTypes.DEFAULT_TYPE) -> None:
     expired = await asyncio.to_thread(draft_store.expire_stale_drafts)
     for item in expired:
@@ -3848,6 +3941,29 @@ async def post_init(application: Application) -> None:
             interval=sync_secs,
             first=sync_secs,
             name="periodic_sync",
+        )
+        if config_settings.ntsc_username() and config_settings.ntsc_password():
+            application.job_queue.run_repeating(
+                _guard_scheduled(_periodic_ntsc_sync),
+                interval=config_settings.ntsc_sync_interval_seconds(),
+                first=10,
+                name="periodic_ntsc_sync",
+            )
+        # Pre/post-class coaching nudges only fire when the coaching cache is
+        # fresh; scan_candidates guards that internally.
+        application.job_queue.run_repeating(
+            _guard_scheduled(_coaching_lifecycle_scan),
+            interval=60,
+            first=90,
+            name="coaching_lifecycle_scan",
+        )
+        # Phase 13 proactive jobs (progress prompts, due doubt reattempts,
+        # readiness changes, backlog escalation) — policy-decided, no spam.
+        application.job_queue.run_repeating(
+            _guard_scheduled(_coaching_proactive_scan),
+            interval=300,
+            first=180,
+            name="coaching_proactive_scan",
         )
         application.job_queue.run_repeating(
             _guard_scheduled(_expire_drafts), interval=60, first=60, name="expire_drafts"

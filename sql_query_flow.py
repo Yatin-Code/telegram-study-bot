@@ -188,6 +188,12 @@ RULES
 
 {now_block}
 
+CURRENT COACHING SNAPSHOT
+-------------------------
+{coaching_snapshot}
+
+{privacy_block}
+
 SCHEMA
 ------
 {schema}
@@ -205,12 +211,25 @@ def _build_system_prompt(
     except Exception:
         now_block = ""
     import actions
+    try:
+        import coaching_context
+        coaching_snapshot = coaching_context.render_compact(chat_id, db_path=db_path)
+    except Exception:
+        coaching_snapshot = "  (coaching snapshot unavailable)"
+    privacy_block = ""
+    try:
+        import coaching_policy
+        privacy_block = coaching_policy.privacy_policy_block()
+    except Exception:
+        logger.debug("privacy policy block unavailable", exc_info=True)
     identity = actions.identity_with_actions(role="study-data SQL analyst", context="any")
     prompt = SYSTEM_PROMPT.format(
         bot_identity=identity,
         max_iter=MAX_ITERATIONS,
         local_date=session_context.local_today_iso(),
         now_block=now_block,
+        coaching_snapshot=coaching_snapshot,
+        privacy_block=privacy_block,
         schema=sql_tool.schema_digest(db_path),
     )
     # Persistent memory: active commitments (with deterministic adherence
