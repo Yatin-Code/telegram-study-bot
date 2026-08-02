@@ -470,3 +470,103 @@ def mark_completed(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_
         return get_state(local_date, block_key, db_path=db_path)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Escalation timing + pending-only auto-skip (pure, no sends)
+# ---------------------------------------------------------------------------
+
+ESCALATION_MINUTES = {"start": 0, "push": 10, "shame": 20, "auto_skip": 25}
+
+
+def _combine_hhmm(date_text: str, hhmm: str) -> dt.datetime:
+    """Aware local datetime for an HH:MM wall-clock on a given local date."""
+    day = dt.date.fromisoformat(date_text)
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    return dt.datetime.combine(day, dt.time(hour, minute), tzinfo=_tz())
+
+
+def _elapsed_minutes(now: dt.datetime, block: dict) -> float:
+    """Minutes since the block's actual start (its local_date + start_hhmm).
+
+    A crossing block's local_date IS its start date, so 22:15-01:00 started at
+    22:15 on local_date and the tail is handled correctly.
+    """
+    start = _combine_hhmm(block["local_date"], block["start_hhmm"])
+    return (now - start).total_seconds() / 60.0
+
+
+def _block_end(block: dict) -> dt.datetime:
+    """The block's end as an aware local datetime (next day when crossing)."""
+    date_text = block["local_date"]
+    if block["crosses_midnight"]:
+        date_text = (dt.date.fromisoformat(date_text) + dt.timedelta(days=1)).isoformat()
+    return _combine_hhmm(date_text, block["end_hhmm"])
+
+
+def due_escalation_candidates(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    """Due escalation tiers for the current study block, pending blocks only.
+
+    One candidate per tier whose threshold (ESCALATION_MINUTES) is reached —
+    several may be due at once (start+11 → start AND push) because the scan
+    claims each event_key independently, so only new tiers actually send.
+    Nothing fires for sleep/break/class blocks, for started blocks, or when
+    there is no current study block; a missing confirmation row counts as
+    pending. Pure candidate generation — nothing is sent here.
+    """
+    now = _as_local(now)
+    block = current_block(now, db_path=db_path)
+    if block is None or block["kind"] != "study":
+        return []
+    state = get_state(block["local_date"], block["block_key"], db_path=db_path)
+    if state is not None and state["status"] != "pending":
+        return []
+    elapsed = _elapsed_minutes(now, block)
+    candidates: list[dict] = []
+    for tier, threshold in ESCALATION_MINUTES.items():
+        if tier == "auto_skip":
+            continue
+        if elapsed >= threshold:
+            candidates.append({
+                "tier": tier,
+                "kind": f"discipline_{tier}",
+                "event_key": (
+                    f"discipline:{block['local_date']}:{block['block_key']}:{tier}"
+                ),
+                "date": block["local_date"],
+                "block_key": block["block_key"],
+                "title": block["title"],
+                "window": f"{block['start_hhmm']}-{block['end_hhmm']}",
+                "block": block,
+            })
+    return candidates
+
+
+def run_auto_skip(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """Auto-skip a never-started study block at start+25 or block end (first wins).
+
+    Pending-only (C1 finding): a started block is never auto-skipped and never
+    produces push/shame — it is handled by the later check-in instead. Returns
+    a small record of the skip, or None when nothing was auto-skipped. This is
+    not a message candidate.
+    """
+    now = _as_local(now)
+    block = current_block(now, db_path=db_path)
+    if block is None or block["kind"] != "study":
+        return None
+    state = get_state(block["local_date"], block["block_key"], db_path=db_path)
+    if state is not None and state["status"] != "pending":
+        return None
+    elapsed = _elapsed_minutes(now, block)
+    if elapsed < ESCALATION_MINUTES["auto_skip"] and now < _block_end(block):
+        return None
+    skipped = confirm_skip(block["local_date"], block["block_key"], db_path=db_path)
+    if skipped is None or skipped["status"] != "skipped":
+        return None
+    return {
+        "date": block["local_date"],
+        "block_key": block["block_key"],
+        "title": block["title"],
+        "skipped": True,
+        "auto": True,
+    }

@@ -547,3 +547,84 @@ def test_full_lifecycle_leaves_one_completed_row(db):
     assert len(rows) == 1
     assert rows[0]["status"] == "completed"
     assert rows[0]["completed_at"]
+
+
+# ---------------------------------------------------------------------------
+# Escalation candidates + pending-only auto-skip
+# ---------------------------------------------------------------------------
+
+def test_at_start_plus_1_only_start_candidate(db):
+    _coaching_window(db)
+    candidates = ed.due_escalation_candidates(_at(8, 31), db)
+    assert [c["tier"] for c in candidates] == ["start"]
+    assert candidates[0]["kind"] == "discipline_start"
+
+
+def test_at_start_plus_11_start_and_push(db):
+    _coaching_window(db)
+    candidates = ed.due_escalation_candidates(_at(8, 41), db)
+    assert {c["tier"] for c in candidates} == {"start", "push"}
+
+
+def test_at_start_plus_21_all_tiers(db):
+    _coaching_window(db)
+    candidates = ed.due_escalation_candidates(_at(8, 51), db)
+    assert {c["tier"] for c in candidates} == {"start", "push", "shame"}
+
+
+def test_no_shame_before_start_plus_20(db):
+    _coaching_window(db)
+    tiers = {c["tier"] for c in ed.due_escalation_candidates(_at(8, 49), db)}
+    assert tiers == {"start", "push"}
+    assert "shame" not in tiers
+
+
+def test_event_key_format(db):
+    _coaching_window(db)
+    by_tier = {c["tier"]: c for c in ed.due_escalation_candidates(_at(8, 41), db)}
+    assert by_tier["start"]["event_key"] == "discipline:2026-08-02:coach_b02_exec_a:start"
+    assert by_tier["push"]["event_key"] == "discipline:2026-08-02:coach_b02_exec_a:push"
+    assert by_tier["start"]["date"] == "2026-08-02"
+    assert by_tier["start"]["window"] == "08:30-10:00"
+    assert by_tier["start"]["block"]["seq"] == 2
+
+
+def test_auto_skip_at_start_plus_26(db):
+    _coaching_window(db)
+    record = ed.run_auto_skip(_at(8, 56), db)
+    assert record == {
+        "date": "2026-08-02", "block_key": "coach_b02_exec_a",
+        "title": "Execution Block A", "skipped": True, "auto": True,
+    }
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "skipped"
+    assert ed.due_escalation_candidates(_at(8, 56), db) == []
+
+
+def test_auto_skip_crossing_block(db):
+    _coaching_window(db)
+    record = ed.run_auto_skip(_at(23, 0), db)
+    assert record is not None
+    assert record["block_key"] == "coach_b10_exec_c"
+    assert ed.get_state("2026-08-02", "coach_b10_exec_c", db)["status"] == "skipped"
+
+
+def test_auto_skip_never_touches_started(db):
+    _coaching_window(db)
+    ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    assert ed.run_auto_skip(_at(9, 0), db) is None
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
+
+
+def test_started_block_has_no_candidates(db):
+    _coaching_window(db)
+    ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    assert ed.due_escalation_candidates(_at(8, 41), db) == []
+
+
+def test_no_candidates_for_sleep_break_class(db):
+    _coaching_window(db)
+    assert ed.due_escalation_candidates(_at(2, 0), db) == []
+    assert ed.due_escalation_candidates(_at(10, 15), db) == []
+    assert ed.due_escalation_candidates(_at(16, 0), db) == []
+    assert ed.run_auto_skip(_at(2, 0), db) is None
+    assert ed.run_auto_skip(_at(16, 0), db) is None
