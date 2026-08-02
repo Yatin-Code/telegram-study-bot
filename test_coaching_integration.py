@@ -38,6 +38,7 @@ import ntsc_coaching
 import operational_store
 import reminders
 import session_context
+import study_domain
 import sync
 
 UTC = dt.timezone.utc
@@ -698,6 +699,210 @@ def test_discipline_callback_registered_once_and_agent_preserved():
         'CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:")'
     )
     assert discipline_site > agent_site
+
+
+# ---------------------------------------------------------------------------
+# C6 mock-prep proposal + confirm-to-write (todo 8)
+# ---------------------------------------------------------------------------
+
+
+def _readiness_snapshot():
+    """Minimal exam-readiness snapshot; enough for the message template."""
+    return {
+        "exam": {"notion_page_id": "exam-x", "title": "Mock X",
+                 "exam_date": "2026-08-04T09:00:00+00:00", "status": "Planned"},
+        "phase": "t3", "days_until": 2,
+        "doubts": [], "revision": [], "key_points": [],
+        "syllabus_known": False, "excluded_doubts": [],
+        "zero_attempt_count": 0, "teacher_ready_count": 0,
+        "scope_uncertain_count": 0, "exam_id": "exam-x",
+    }
+
+
+def test_exam_reminder_scan_still_sends_readiness_reviews(db, monkeypatch):
+    """Baseline (todo 8): the scan still fires readiness reviews unchanged.
+
+    ``_exam_reminder_scan`` must keep driving ``_send_current_readiness_reviews``
+    (the readiness review still sends once through ``_send_markdown``) even after
+    the mock-prep proposal is added after it.
+    """
+    import exam_readiness
+    sent = []
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text))
+
+    async def noop_sync(**_kw):
+        return {}
+
+    exam = {"notion_page_id": "exam-x", "title": "Mock X",
+            "exam_date": "2026-08-04T09:00:00+00:00", "status": "Planned"}
+    snapshot = _readiness_snapshot()
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot, "_sync_domain", noop_sync)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(bot.reminders, "claim", lambda key, **kw: True)
+    monkeypatch.setattr(bot.reminders, "due_exams", lambda: [])
+    monkeypatch.setattr(exam_readiness, "scheduled_reviews", lambda: [(exam, "t3")])
+    monkeypatch.setattr(exam_readiness, "collect", lambda exam, phase: snapshot)
+    context = types.SimpleNamespace(bot=types.SimpleNamespace())
+    asyncio.run(bot._exam_reminder_scan(context))
+    assert sent, "readiness reviews still fire through the scan"
+    assert "Exam readiness" in sent[0][1] or "readiness" in sent[0][1].lower()
+
+
+def test_mockprep_proposal_wired_into_scan():
+    """_mock_prep_proposal is invoked from _exam_reminder_scan after readiness."""
+    assert "async def _mock_prep_proposal(" in _BOT_SOURCE
+    assert "await _mock_prep_proposal(context)" in _BOT_SOURCE
+    scan_site = _BOT_SOURCE.index("async def _exam_reminder_scan")
+    call_site = _BOT_SOURCE.index("await _mock_prep_proposal(context)")
+    assert call_site > scan_site
+
+
+def _button_data(markup):
+    if markup is None:
+        return []
+    return [btn.callback_data for row in markup.inline_keyboard for btn in row]
+
+
+def _two_day_plan():
+    """Deterministic 2-day plan dict matching the planner's block shape."""
+    return {
+        "plan_type": "weekly", "start_date": "2026-08-03", "end_date": "2026-08-04",
+        "dates": ["2026-08-03", "2026-08-04"],
+        "blocks": [
+            {"kind": "Mock Prep", "title": "Mock Prep: Weekly Test", "date": "2026-08-03",
+             "start": "08:00", "end": "09:00", "duration_min": 60, "priority": 90,
+             "placed": True, "reason": "Mock prep for Weekly Test on 2026-08-04",
+             "evidence": {}, "id": "mock1", "source": "mock-prep:portal:t1:2026-08-03"},
+            {"kind": "Test Prep", "title": "Test prep: Weekly Test", "date": "2026-08-04",
+             "start": "08:00", "end": "08:45", "duration_min": 45, "priority": 78,
+             "placed": True, "reason": "Prepare for Weekly Test on 2026-08-04",
+             "evidence": {}, "id": "tp1", "source": "test-prep:portal:t1:2026-08-04"},
+        ],
+        "unplaced": [], "warnings": [], "capacity": {},
+        "sources": {"mock_prep_blocks": 1, "test_prep_blocks": 1},
+        "generated_with": "deterministic", "llm_involved": False,
+    }
+
+
+async def _run_mockprep_proposal(db, monkeypatch, *, fresh=True, score=None,
+                                 coverage=None, plan_outcome="ready"):
+    sent = []
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text, _kw.get("reply_markup")))
+
+    import coaching_lifecycle
+    import coaching_prediction
+    import study_domain
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(session_context, "local_now", lambda: DAY)
+    monkeypatch.setattr(session_context, "local_today_iso", lambda: "2026-08-02")
+    monkeypatch.setattr(coaching_lifecycle, "fresh", lambda **kw: fresh)
+    monkeypatch.setattr(
+        coaching_prediction, "project_coaching_score",
+        lambda **kw: score if score is not None
+        else {"confidence": "high", "evidence_count": 4},
+    )
+    monkeypatch.setattr(
+        coaching_syllabus, "coverage_snapshot",
+        lambda **kw: coverage if coverage is not None
+        else [{"test_date": "2026-08-04", "coverage": {"known": True}}],
+    )
+    monkeypatch.setattr(
+        study_domain, "plan_facts",
+        lambda date, **kw: {"outcome": plan_outcome},
+    )
+    monkeypatch.setattr(ed, "day_type_for", lambda date, **kw: "coaching")
+    context = types.SimpleNamespace(bot=types.SimpleNamespace())
+    await bot._mock_prep_proposal(context)
+    return sent
+
+
+def test_mockprep_gate_pass_sends_one_proposal_claimed_once(db, monkeypatch):
+    seed_coaching(db, test_date="2026-08-04")
+    sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch))
+    assert len(sent) == 1
+    assert "2-day Mock Prep" in sent[0][1]
+    data = _button_data(sent[0][2])
+    assert any(d.startswith("mockprep:confirm:") for d in data)
+    assert "mockprep:dismiss" in data
+    sent2 = asyncio.run(_run_mockprep_proposal(db, monkeypatch))
+    assert sent2 == []
+
+
+def test_mockprep_gate_fail_missing_chapters_sends_still_need(db, monkeypatch):
+    seed_coaching(db, test_date="2026-08-04")
+    sent = asyncio.run(_run_mockprep_proposal(
+        db, monkeypatch,
+        coverage=[{"test_date": "2026-08-04", "coverage": {"known": False}}],
+    ))
+    assert len(sent) == 1
+    assert "I want to plan your 2 days before" in sent[0][1]
+    assert "chapters" in sent[0][1]
+    assert not _button_data(sent[0][2])
+    sent2 = asyncio.run(_run_mockprep_proposal(
+        db, monkeypatch,
+        coverage=[{"test_date": "2026-08-04", "coverage": {"known": False}}],
+    ))
+    assert sent2 == []
+
+
+def test_mockprep_gate_fail_stale_portal_lists_portal(db, monkeypatch):
+    seed_coaching(db, test_date="2026-08-04")
+    sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch, fresh=False))
+    assert len(sent) == 1
+    assert "I want to plan your 2 days before" in sent[0][1]
+    assert "portal" in sent[0][1].lower()
+
+
+def test_mockprep_confirm_writes_daily_plan_rows(db, monkeypatch):
+    seed_coaching(db, test_date="2026-08-04")
+    import coaching_planner
+    monkeypatch.setattr(coaching_planner, "build_plan", lambda **kw: _two_day_plan())
+    sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch))
+    assert len(sent) == 1
+    edits = []
+    query = _fake_query("mockprep:confirm:2026-08-03:2026-08-04", edits)
+    update = types.SimpleNamespace(callback_query=query)
+    asyncio.run(bot.on_mockprep_callback(update, types.SimpleNamespace()))
+    rows = study_domain._rows("daily_plan", "archived=0", db_path=db)
+    assert len(rows) == 2
+    assert edits and "2-day mock plan written" in edits[0]
+
+
+def test_mockprep_dismiss_no_rows_and_reply(db, monkeypatch):
+    seed_coaching(db, test_date="2026-08-04")
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    edits = []
+    query = _fake_query("mockprep:dismiss", edits)
+    update = types.SimpleNamespace(callback_query=query)
+    asyncio.run(bot.on_mockprep_callback(update, types.SimpleNamespace()))
+    assert study_domain._rows("daily_plan", "archived=0", db_path=db) == []
+    assert edits and "Okay, skipping the pre-mock plan." in edits[0]
+
+
+def test_mockprep_non_t2_sends_nothing(db, monkeypatch):
+    seed_coaching(db, test_date="2026-08-10")
+    sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch))
+    assert sent == []
+
+
+def test_mockprep_callback_registered_once_near_discipline():
+    assert _BOT_SOURCE.count(
+        'CallbackQueryHandler(on_mockprep_callback, pattern=r"^mockprep:")'
+    ) == 1
+    discipline_site = _BOT_SOURCE.index(
+        'CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:")'
+    )
+    mockprep_site = _BOT_SOURCE.index(
+        'CallbackQueryHandler(on_mockprep_callback, pattern=r"^mockprep:")'
+    )
+    assert mockprep_site > discipline_site
 
 
 def main() -> int:

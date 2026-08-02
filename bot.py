@@ -3093,6 +3093,38 @@ async def on_discipline_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text(text)
 
 
+async def on_classify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Confirm/Dismiss on chapter-classification proposals.
+
+    ``classify:confirm:<chapter_key>`` writes the proposed tag as confirmed;
+    ``classify:dismiss:<chapter_key>`` leaves the chapter untagged. The
+    buttons are removed by editing the message.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    _, action, chapter_key = parts
+    import chapter_classification
+    db_path = chapter_classification.DEFAULT_DB_PATH
+    if action == "confirm":
+        row = chapter_classification.confirm_classification(chapter_key, db_path=db_path)
+        if row is None:
+            await query.edit_message_text("Unknown chapter.")
+            return
+        await query.edit_message_text(f"✅ {row['chapter']} tagged {row['tag']}.")
+    elif action == "dismiss":
+        row = chapter_classification.dismiss_classification(chapter_key, db_path=db_path)
+        if row is None:
+            await query.edit_message_text("Unknown chapter.")
+            return
+        await query.edit_message_text(f"Okay, {row['chapter']} left untagged.")
+    else:
+        return
+
+
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -3772,6 +3804,66 @@ async def _execution_discipline_scan(context: ContextTypes.DEFAULT_TYPE) -> None
         logger.exception("execution discipline scan failed")
 
 
+async def _chapter_classify_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Chapter auto-classification: propose mastery/revision/hard tags.
+
+    Runs every 600s. The lifecycle activation timestamp is written on the
+    first run (INSERT OR IGNORE), so only chapters first tracked on/after
+    activation are ever eligible (no retroactive tagging). For each eligible
+    completed chapter the LLM proposes ONE tag from the redacted chapter
+    metrics; the proposal is claimed via ``reminders.claim`` BEFORE sending so
+    a later scan cannot double-send the same chapter, and a failed send
+    releases the claim so the next scan can retry. The message carries
+    Confirm/Dismiss buttons; the row stays 'proposed' until confirmed.
+    """
+    try:
+        import chapter_classification
+        db_path = chapter_classification.DEFAULT_DB_PATH
+        now = session_context.local_now()
+        await asyncio.to_thread(
+            chapter_classification.ensure_activated, now, db_path
+        )
+        candidates = await asyncio.to_thread(
+            chapter_classification.classify_candidates, now, db_path
+        )
+        chat_id = telegram_allowed_user_id()
+        for candidate in candidates:
+            proposal = chapter_classification.propose_chapter_classification(
+                candidate, db_path=db_path
+            )
+            if not reminders.claim(
+                f"classify:{candidate['chapter_key']}", db_path=db_path
+            ):
+                continue
+            try:
+                accuracy = round(float(proposal.get("accuracy_ratio") or 0) * 100)
+                cy = round(float(proposal.get("cognitive_yield") or 0))
+                text = (
+                    f"Finished {candidate['chapter']}: accuracy {accuracy}% · CY {cy} — "
+                    f"propose: **{proposal['tag']}** — {proposal.get('reason') or ''}"
+                ).strip()
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Confirm",
+                        callback_data=f"classify:confirm:{candidate['chapter_key']}",
+                    ),
+                    InlineKeyboardButton(
+                        "Dismiss",
+                        callback_data=f"classify:dismiss:{candidate['chapter_key']}",
+                    ),
+                ]])
+                await _send_markdown(context.bot, chat_id, text, reply_markup=keyboard)
+            except Exception:
+                reminders.release(
+                    f"classify:{candidate['chapter_key']}", db_path=db_path
+                )
+                logger.exception(
+                    "chapter classification send failed for %s", candidate["chapter_key"]
+                )
+    except Exception:
+        logger.exception("chapter classification scan failed")
+
+
 async def _expire_drafts(context: ContextTypes.DEFAULT_TYPE) -> None:
     expired = await asyncio.to_thread(draft_store.expire_stale_drafts)
     for item in expired:
@@ -3890,8 +3982,261 @@ async def _exam_reminder_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                     text=(f"Has {exam.get('title')} finished? When it has, run "
                           f"/finish_exam {exam.get('title')} to put full-paper analysis first."),
                 )
+        await _mock_prep_proposal(context)
     except Exception:
         logger.exception("exam reminder scan failed")
+
+
+_MOCKPREP_PROPOSALS: dict[str, list[dict]] = {}
+_MOCKPREP_FIXED_KINDS = frozenset({
+    "Coaching Class", "Doubt Window", "Pre-Class Prep", "Post-Class Consolidation",
+})
+_MOCKPREP_PLAN_KIND = {
+    "Revision": "Revision",
+    "Backlog": "Backlog",
+    "Coaching Homework": "Coaching Homework",
+    "Doubt Reattempt": "Doubt Reattempt",
+}
+_MOCKPREP_SUBJECTS = frozenset({"Chem", "Maths", "Physics"})
+
+
+def _daily_plan_rows_from_blocks(blocks: list[dict]) -> list[dict]:
+    """Map placed, writable planner blocks to confirmed daily-plan rows."""
+    by_date: dict[str, list[dict]] = {}
+    for block in blocks:
+        if not block.get("placed"):
+            continue
+        if block.get("kind") in _MOCKPREP_FIXED_KINDS:
+            continue
+        by_date.setdefault(str(block.get("date") or ""), []).append(block)
+    rows: list[dict] = []
+    for date in sorted(by_date):
+        day_blocks = sorted(
+            by_date[date], key=lambda b: str(b.get("start") or "00:00")
+        )
+        for seq, block in enumerate(day_blocks, start=1):
+            subject = (block.get("evidence") or {}).get("subject")
+            if subject not in _MOCKPREP_SUBJECTS:
+                subject = None
+            rows.append({
+                "title": str(block.get("title") or f"{block.get('kind')} block"),
+                "plan_date": date,
+                "sequence": seq,
+                "subject": subject,
+                "kind": _MOCKPREP_PLAN_KIND.get(block.get("kind"), "Other"),
+                "expected_cy": int(block.get("expected_cy") or 0),
+                "estimated_min": int(block.get("duration_min") or 45),
+                "status": "Planned",
+                "priority": int(block.get("priority") or 50),
+                "interruptible": True,
+                "exit_condition": None,
+                "planner_note": None,
+                "operation_id": f"mockprep-confirm:{uuid.uuid4().hex}",
+            })
+    return rows
+
+
+def _render_mockprep_proposal(nearest: dict, plan: dict) -> str:
+    title = str(nearest.get("title") or "Coaching test")
+    test_date = str(nearest.get("test_date") or "")[:10]
+    lines = [f"📋 *2-day Mock Prep plan* before *{title}* ({test_date})"]
+    for date in plan.get("dates") or []:
+        day_blocks = [
+            b for b in (plan.get("blocks") or [])
+            if b.get("date") == date and b.get("placed")
+        ]
+        if not day_blocks:
+            continue
+        try:
+            weekday = dt.date.fromisoformat(str(date)[:10]).strftime("%A")
+        except ValueError:
+            weekday = ""
+        lines.append(f"\n*{date}* ({weekday})" if weekday else f"\n*{date}*")
+        for block in day_blocks:
+            start = str(block.get("start") or "").strip()
+            duration = int(block.get("duration_min") or 0)
+            title_text = str(block.get("title") or block.get("kind"))
+            if start and duration:
+                end = str(block.get("end") or "").strip()
+                lines.append(f"• {start}–{end} {title_text} ({duration} min)")
+            else:
+                lines.append(f"• {title_text}" + (f" ({duration} min)" if duration else ""))
+    lines.append("\nReady to lock it in? Confirm writes it to your daily plan.")
+    return "\n".join(lines)
+
+
+async def _mockprep_reply(query, text: str) -> None:
+    try:
+        await query.edit_message_text(text)
+    except Exception:
+        try:
+            await query.message.reply_text(text)
+        except Exception:
+            pass
+
+
+async def _mock_prep_proposal(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confident T-2 pre-mock proposal; gate-fail becomes a targeted ask.
+
+    Fires only when the nearest coaching test is exactly two days away. The
+    gate (portal freshness, score confidence, syllabus coverage, unblocked plan,
+    resolved day types) is evaluated with every check individually wrapped so
+    one failure never crashes the scan. A passed gate builds a deterministic
+    2-day plan, claims it, and sends a proposal carrying the writable rows for
+    Confirm to replay. A failed gate sends a "what I still need" list instead.
+    """
+    try:
+        import coaching_lifecycle
+        import coaching_prediction
+        import coaching_planner
+        import coaching_syllabus
+        import execution_discipline
+        db_path = execution_discipline.DEFAULT_DB_PATH
+        today = dt.date.fromisoformat(session_context.local_today_iso()[:10])
+        nearest = await asyncio.to_thread(
+            coaching_planner._nearest_test, today, db_path=db_path
+        )
+        if nearest is None:
+            return
+        days_to_test = (nearest["test_date_day"] - today).days
+        if days_to_test != 2:
+            return
+        test_id = str(nearest.get("source_id") or "nearest-test")
+        test_title = str(nearest.get("title") or "Coaching test")
+        chat_id = telegram_allowed_user_id()
+
+        failures: list[str] = []
+
+        try:
+            fresh = coaching_lifecycle.fresh(
+                now=session_context.local_now(), db_path=db_path
+            )
+        except Exception:
+            logger.exception("mockprep freshness check failed")
+            fresh = False
+        if not fresh:
+            failures.append("portal data to be fresh (run /sync to refresh NTSC)")
+
+        try:
+            score = coaching_prediction.project_coaching_score(db_path=db_path)
+            confident = (
+                score.get("confidence") != "unavailable"
+                and int(score.get("evidence_count") or 0) >= 3
+            )
+        except Exception:
+            logger.exception("mockprep score check failed")
+            confident = False
+        if not confident:
+            failures.append(
+                "a few coaching result records (at least 3 evidence points) to be confident"
+            )
+
+        try:
+            known_coverage = any(
+                bool(test.get("coverage", {}).get("known"))
+                for test in coaching_syllabus.coverage_snapshot(
+                    today=session_context.local_today_iso(), db_path=db_path
+                )
+            )
+        except Exception:
+            logger.exception("mockprep coverage check failed")
+            known_coverage = False
+        if not known_coverage:
+            failures.append(
+                f"chapters for {test_title} (its syllabus coverage is unknown)"
+            )
+
+        day1 = (today + dt.timedelta(days=1)).isoformat()
+        day2 = (today + dt.timedelta(days=2)).isoformat()
+        blocked = False
+        for day in (day1, day2):
+            try:
+                outcome = study_domain.plan_facts(day, db_path=db_path).get("outcome")
+            except Exception:
+                logger.exception("mockprep plan_facts failed for %s", day)
+                outcome = "blocked"
+            if outcome == "blocked":
+                blocked = True
+        if blocked:
+            failures.append(
+                "your plan for the next two days to be clear (one day is currently blocked)"
+            )
+
+        day_types_ok = True
+        for day in (day1, day2):
+            try:
+                execution_discipline.day_type_for(day, db_path=db_path)
+            except Exception:
+                logger.exception("mockprep day_type_for failed for %s", day)
+                day_types_ok = False
+        if not day_types_ok:
+            failures.append("your day schedule for both days (day types are unresolved)")
+
+        if failures:
+            if reminders.claim(f"mockprep-gate:{test_id}", db_path=db_path):
+                bullets = "\n".join(f"• {failure}" for failure in failures)
+                await _send_markdown(
+                    context.bot,
+                    chat_id,
+                    f"I want to plan your 2 days before {test_title}, but I still need:\n{bullets}",
+                )
+            return
+
+        if not reminders.claim(f"mockprep:{test_id}", db_path=db_path):
+            return
+        plan = await asyncio.to_thread(
+            coaching_planner.build_plan,
+            target_date=day1, days=2, chat_id=chat_id, db_path=db_path,
+        )
+        rows = _daily_plan_rows_from_blocks(plan.get("blocks") or [])
+        _MOCKPREP_PROPOSALS[f"{day1}:{day2}"] = rows
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=f"mockprep:confirm:{day1}:{day2}"),
+            InlineKeyboardButton("❌ Dismiss", callback_data="mockprep:dismiss"),
+        ]])
+        try:
+            await _send_markdown(
+                context.bot, chat_id, _render_mockprep_proposal(nearest, plan),
+                reply_markup=keyboard,
+            )
+        except Exception:
+            reminders.release(f"mockprep:{test_id}", db_path=db_path)
+            raise
+    except Exception:
+        logger.exception("mock prep proposal failed")
+
+
+async def on_mockprep_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm/Dismiss for the T-2 pre-mock proposal.
+
+    ``mockprep:confirm:{start}:{end}`` replays the proposed blocks as daily-plan
+    rows through the same confirmed-write path the agent uses
+    (``study_domain.create_plan_item``); ``mockprep:dismiss`` just replies.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "mockprep:dismiss":
+        await _mockprep_reply(query, "Okay, skipping the pre-mock plan.")
+        return
+    if not data.startswith("mockprep:confirm:"):
+        return
+    rows = _MOCKPREP_PROPOSALS.pop(data[len("mockprep:confirm:"):], None)
+    if rows is None:
+        await _mockprep_reply(
+            query, "That pre-mock proposal has expired — run /today to see your plan."
+        )
+        return
+    try:
+        import execution_discipline
+        db_path = execution_discipline.DEFAULT_DB_PATH
+        for row in rows:
+            await asyncio.to_thread(study_domain.create_plan_item, dict(row), db_path=db_path)
+    except Exception:
+        logger.exception("mockprep confirm write failed")
+        await _mockprep_reply(query, "Could not write the plan — try /today.")
+        return
+    await _mockprep_reply(query, "✅ 2-day mock plan written — /today to see it")
 
 
 async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4068,6 +4413,15 @@ async def post_init(application: Application) -> None:
             first=120,
             name="execution_discipline_scan",
         )
+        # Chapter auto-classification: propose mastery/revision/hard tags for
+        # eligible completed chapters (tracked-from-start only). Proposals are
+        # claim-deduped and only confirmed via the classify: callback.
+        application.job_queue.run_repeating(
+            _guard_scheduled(_chapter_classify_scan),
+            interval=600,
+            first=300,
+            name="chapter_classify",
+        )
         application.job_queue.run_repeating(
             _guard_scheduled(_expire_drafts), interval=60, first=60, name="expire_drafts"
         )
@@ -4198,6 +4552,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_log_callback, pattern=r"^log:"))
     app.add_handler(CallbackQueryHandler(on_agent_callback, pattern=r"^agent:"))
     app.add_handler(CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:"))
+    app.add_handler(CallbackQueryHandler(on_classify_callback, pattern=r"^classify:"))
+    app.add_handler(CallbackQueryHandler(on_mockprep_callback, pattern=r"^mockprep:"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, catch_all))
     logger.info("Starting Telegram long polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
