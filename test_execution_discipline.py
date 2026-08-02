@@ -15,12 +15,15 @@ Usage:
 
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 import execution_discipline as ed
+import ntsc_coaching
+import session_context
 from config import ownership
 
 
@@ -223,3 +226,208 @@ def test_templates_and_blocks_exist_with_correct_columns(db):
         "block_key", "template_key", "seq", "start_hhmm", "end_hhmm",
         "kind", "title", "minutes",
     }
+
+
+# ---------------------------------------------------------------------------
+# day_type_for — per-date cached resolution
+# ---------------------------------------------------------------------------
+
+def _seed_coaching_day(db, date_iso, *, with_classes=True, synced_at=None):
+    conn = ntsc_coaching._connect(db)
+    try:
+        if with_classes:
+            conn.execute(
+                "INSERT OR REPLACE INTO coaching_classes "
+                "(source_id, class_date, start_time, duration_min, class_type) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (f"c-{date_iso}", date_iso, "15:00", 60, "class"),
+            )
+        if synced_at is not None:
+            conn.execute(
+                "INSERT INTO coaching_sync_runs (started_at, finished_at, status, datasets) "
+                "VALUES (?, ?, 'success', '[\"classes\"]')",
+                (synced_at.isoformat(), synced_at.isoformat()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_day_type(db, date_iso, day_type):
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO {ed.DAY_TYPES_TABLE} "
+            "(local_date, day_type, resolved_at) VALUES (?, ?, ?)",
+            (date_iso, day_type, "2026-08-02T12:00:00+00:00"),
+        )
+        conn.commit()
+
+
+def test_day_type_coaching_when_classes_and_fresh_after_noon(db):
+    ed.seed_templates(db)
+    _seed_coaching_day(
+        db, "2026-08-05", synced_at=dt.datetime.now(dt.timezone.utc),
+    )
+    assert ed.day_type_for("2026-08-05", db) == "coaching"
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            f"SELECT day_type, resolved_at FROM {ed.DAY_TYPES_TABLE} WHERE local_date = '2026-08-05'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "coaching"
+    assert row[1]
+
+
+def test_day_type_non_coaching_when_no_classes(db):
+    ed.seed_templates(db)
+    _seed_coaching_day(
+        db, "2026-08-05", with_classes=False,
+        synced_at=dt.datetime.now(dt.timezone.utc),
+    )
+    assert ed.day_type_for("2026-08-05", db) == "non_coaching"
+
+
+def test_day_type_non_coaching_when_sync_failed(db):
+    ed.seed_templates(db)
+    conn = ntsc_coaching._connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO coaching_sync_runs (started_at, finished_at, status) "
+            "VALUES (?, ?, 'failed')",
+            (dt.datetime.now(dt.timezone.utc).isoformat(),
+             dt.datetime.now(dt.timezone.utc).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert ed.day_type_for("2026-08-05", db) == "non_coaching"
+
+
+def test_day_type_non_coaching_when_cache_never_synced(db):
+    ed.seed_templates(db)
+    _seed_coaching_day(db, "2026-08-05", with_classes=True, synced_at=None)
+    assert ed.day_type_for("2026-08-05", db) == "non_coaching"
+
+
+def test_day_type_non_coaching_when_entirely_empty(db):
+    ed.seed_templates(db)
+    assert ed.day_type_for("2026-08-05", db) == "non_coaching"
+
+
+def test_day_type_is_cached(db):
+    ed.seed_templates(db)
+    _seed_coaching_day(db, "2026-08-05", synced_at=dt.datetime.now(dt.timezone.utc))
+    assert ed.day_type_for("2026-08-05", db) == "coaching"
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM coaching_classes")
+        conn.execute("DELETE FROM coaching_sync_runs")
+        conn.commit()
+    assert ed.day_type_for("2026-08-05", db) == "coaching"
+
+
+# ---------------------------------------------------------------------------
+# blocks_for_date — window fields
+# ---------------------------------------------------------------------------
+
+def test_blocks_for_date_returns_10_blocks_with_windows(db):
+    ed.seed_templates(db)
+    _set_day_type(db, "2026-08-05", "coaching")
+    blocks = ed.blocks_for_date("2026-08-05", db)
+    assert [b["seq"] for b in blocks] == list(range(1, 11))
+    first = blocks[0]
+    assert first["start_hhmm"] == "01:00"
+    assert first["window_start_min"] == 60
+    assert first["window_end_min"] == 480
+    assert first["crosses_midnight"] is False
+    last = blocks[-1]
+    assert last["start_hhmm"] == "22:15"
+    assert last["window_start_min"] == 1335
+    assert last["window_end_min"] == 60
+    assert last["crosses_midnight"] is True
+
+
+def test_blocks_for_date_non_coaching_crosses_midnight(db):
+    ed.seed_templates(db)
+    _set_day_type(db, "2026-08-06", "non_coaching")
+    blocks = ed.blocks_for_date("2026-08-06", db)
+    assert len(blocks) == 10
+    assert blocks[-1]["title"] == "Spillover/Advanced"
+    assert blocks[-1]["crosses_midnight"] is True
+
+
+# ---------------------------------------------------------------------------
+# current_block — boundary semantics
+# ---------------------------------------------------------------------------
+
+_TZ = session_context.local_now().tzinfo
+
+
+def _at(hour, minute):
+    return dt.datetime(2026, 8, 2, hour, minute, tzinfo=_TZ)
+
+
+def _coaching_window(db):
+    ed.seed_templates(db)
+    _set_day_type(db, "2026-08-02", "coaching")
+    _set_day_type(db, "2026-08-01", "coaching")
+
+
+def test_current_block_00_30_uses_yesterdays_crossing_block(db):
+    _coaching_window(db)
+    block = ed.current_block(_at(0, 30), db)
+    assert block is not None
+    assert block["local_date"] == "2026-08-01"
+    assert block["day_type"] == "coaching"
+    assert block["crosses_midnight"] is True
+    assert block["title"] == "Execution Block C (Level 1 HW)"
+
+
+def test_current_block_01_00_is_sleep_start_precedence(db):
+    _coaching_window(db)
+    block = ed.current_block(_at(1, 0), db)
+    assert block is not None
+    assert block["local_date"] == "2026-08-02"
+    assert block["title"] == "Sleep"
+
+
+def test_current_block_08_00_is_sleep_end_inclusive(db):
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 0), db)
+    assert block is not None
+    assert block["title"] == "Sleep"
+    assert block["window_end_min"] == 480
+
+
+def test_current_block_08_15_gap_is_none(db):
+    _coaching_window(db)
+    assert ed.current_block(_at(8, 15), db) is None
+
+
+def test_current_block_08_45_is_execution_block_a(db):
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+    assert block is not None
+    assert block["title"] == "Execution Block A"
+    assert block["day_type"] == "coaching"
+
+
+def test_current_block_22_15_is_execution_block_c_start_precedence(db):
+    _coaching_window(db)
+    block = ed.current_block(_at(22, 15), db)
+    assert block is not None
+    assert block["title"] == "Execution Block C (Level 1 HW)"
+    assert block["local_date"] == "2026-08-02"
+    assert block["seq"] == 10
+    assert block["start_hhmm"] == "22:15"
+    assert block["end_hhmm"] == "01:00"
+    assert block["minutes"] == 165
+
+
+def test_current_block_non_coaching_day(db):
+    ed.seed_templates(db)
+    _set_day_type(db, "2026-08-02", "non_coaching")
+    _set_day_type(db, "2026-08-01", "non_coaching")
+    block = ed.current_block(_at(8, 45), db)
+    assert block is not None
+    assert block["title"] == "Revision Block (Notion Backlog)"
+    assert block["day_type"] == "non_coaching"

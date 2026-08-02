@@ -5,25 +5,33 @@ user's daily timetable (JEE 2028 MASTER EXECUTION SYSTEM) at the block level:
 each local date resolves to one of two fixed daily templates (Coaching Day /
 Non-Coaching Day) and every study block is nudged, escalated and verified.
 
-This module owns the schema and the two seeded templates only:
+This module owns the schema, the two seeded templates, and the day/block
+lookups the discipline loop runs on:
 
 - execution_templates  — the two fixed day templates
 - execution_blocks     — the 20 blocks (10 per template), verbatim from the PDF
 - block_confirmations  — per (date, block) state machine (pending/started/
                          skipped/completed); schema only here — writes arrive
                          in later todos
-- execution_day_types  — per-date cached day-type resolution; schema only here
+- execution_day_types  — per-date cached day-type resolution, written by
+                         day_type_for (coaching iff the portal cache has a
+                         class for the date and had a recent successful sync)
 
-These four tables are LOCAL-only (owned by SQLite, never synced to Notion).
 Everything in this module is deterministic SQLite — no LLM, no messaging, no
-writes to the block_confirmations/execution_day_types tables and no touch of
-op_* / Notion-owned data.
+writes to block_confirmations and no touch of op_* / Notion-owned data.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import coaching_lifecycle
+import ntsc_coaching
+import session_context
+from config import settings
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
@@ -90,6 +98,28 @@ def _connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def _tz() -> ZoneInfo:
+    """User's timezone; falls back to UTC if the configured name is unknown."""
+    name = settings.user_timezone()
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _as_local(value: dt.datetime) -> dt.datetime:
+    """Normalise a datetime to an aware datetime in the user's timezone."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_tz())
+    return value.astimezone(_tz())
+
+
+def _hhmm_to_min(hhmm: str) -> int:
+    """HH:MM to minutes since midnight."""
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    return hour * 60 + minute
+
+
 def _block_minutes(start_hhmm: str, end_hhmm: str, kind: str) -> int | None:
     """Minutes for study/sleep blocks; None for break/class blocks.
 
@@ -99,9 +129,7 @@ def _block_minutes(start_hhmm: str, end_hhmm: str, kind: str) -> int | None:
     """
     if kind in ("break", "class"):
         return None
-    sh, sm = (int(part) for part in start_hhmm.split(":"))
-    eh, em = (int(part) for part in end_hhmm.split(":"))
-    return (eh * 60 + em - sh * 60 - sm) % 1440
+    return (_hhmm_to_min(end_hhmm) - _hhmm_to_min(start_hhmm)) % 1440
 
 
 # (template_key, name, day_type)
@@ -193,3 +221,117 @@ def blocks_for_template(template_key: str, db_path: str | Path = DEFAULT_DB_PATH
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-date day type + block windows
+# ---------------------------------------------------------------------------
+
+def day_type_for(date_iso: str, db_path: str | Path = DEFAULT_DB_PATH) -> str:
+    """Resolve a local date to 'coaching' or 'non_coaching', cached once per date.
+
+    A cached execution_day_types row for the date is returned unchanged. On a
+    miss the date is 'coaching' iff the coaching cache holds at least one class
+    for it AND had a recent successful sync — freshness is judged against the
+    ACTUAL current local time (a fixed noon would wrongly mark after-noon syncs
+    as stale). The result is persisted (INSERT OR REPLACE) so later ticks reuse
+    it. An empty / never-synced coaching cache falls back to 'non_coaching'
+    without raising.
+    """
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            f"SELECT day_type FROM {DAY_TYPES_TABLE} WHERE local_date = ?",
+            (date_iso[:10],),
+        ).fetchone()
+        if row is not None:
+            return row["day_type"]
+    finally:
+        conn.close()
+
+    classes = ntsc_coaching.classes_for_date(date_iso, db_path=db_path)
+    day_type = (
+        "coaching"
+        if classes and coaching_lifecycle.fresh(
+            now=session_context.local_now(), db_path=db_path,
+        )
+        else "non_coaching"
+    )
+
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            f"INSERT OR REPLACE INTO {DAY_TYPES_TABLE} "
+            "(local_date, day_type, resolved_at) VALUES (?, ?, ?)",
+            (date_iso[:10], day_type, session_context.local_now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return day_type
+
+
+def blocks_for_date(date_iso: str, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    """The day's blocks (from its resolved template) with minute windows, by seq.
+
+    Each block gains ``window_start_min`` / ``window_end_min`` (minutes since
+    midnight) and ``crosses_midnight`` (end on the next day). Returns [] when
+    the resolved template is unknown.
+    """
+    day_type = day_type_for(date_iso[:10], db_path=db_path)
+    template = get_template(day_type, db_path=db_path)
+    if template is None:
+        return []
+    blocks = blocks_for_template(template["template_key"], db_path=db_path)
+    for block in blocks:
+        start = _hhmm_to_min(block["start_hhmm"])
+        end = _hhmm_to_min(block["end_hhmm"])
+        block["window_start_min"] = start
+        block["window_end_min"] = end
+        block["crosses_midnight"] = end <= start
+    return blocks
+
+
+def current_block(now_aware_local: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """The block active at ``now_aware_local`` (aware local time), or None in a gap.
+
+    Considers today's blocks and yesterday's midnight-crossing blocks (a block
+    starting 22:15 yesterday covers 00:00–01:00 today). Windows are
+    end-inclusive with start-precedence: the block whose start equals another
+    block's end wins (22:15 → Execution Block C; 01:00 → Sleep; 08:00 → Sleep).
+    Candidates are scanned in seq order and the first containing window wins;
+    between-window gaps (08:00–08:30) return None.
+    """
+    local_now = _as_local(now_aware_local)
+    now_min = local_now.hour * 60 + local_now.minute
+    today_iso = local_now.date().isoformat()
+    yesterday_iso = (local_now.date() - dt.timedelta(days=1)).isoformat()
+
+    def candidates(date_iso: str) -> list[dict]:
+        day_type = day_type_for(date_iso, db_path=db_path)
+        return [
+            {**block, "local_date": date_iso, "day_type": day_type}
+            for block in blocks_for_date(date_iso, db_path=db_path)
+        ]
+
+    todays = candidates(today_iso)
+    yesterdays = candidates(yesterday_iso)
+
+    def contains(block: dict) -> bool:
+        start = block["window_start_min"]
+        end = block["window_end_min"]
+        if block["local_date"] == today_iso:
+            if block["crosses_midnight"]:
+                return now_min >= start
+            return start <= now_min <= end
+        if block["crosses_midnight"]:
+            return now_min < end
+        return False
+
+    for block in todays:
+        if block["window_start_min"] == now_min:
+            return block
+    for block in todays + yesterdays:
+        if contains(block):
+            return block
+    return None
