@@ -582,13 +582,88 @@ def run_auto_skip(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> di
     }
 
 
-def evaluate_completion(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
-    """Post-block check-in candidates.
+def _utc_iso(value: dt.datetime) -> str:
+    """Notion-style UTC ISO string for a datetime (matches ledger created_time)."""
+    return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
 
-    Stub — fully implemented in todo 9 (post-block check-in candidates).
-    Returns an empty list for now so the discipline scan can call it safely.
+
+def has_ledger_evidence(date_iso: str, block: dict, db_path: str | Path = DEFAULT_DB_PATH) -> bool:
+    """True iff a non-archived ledger row's session falls inside the block window.
+
+    The window is the block's start..end on its local_date with ±10 min slack.
+    ``created_time`` is the authoritative column (a crossing-midnight block's
+    session logged at 00:30 carries the next day's timestamp, so a
+    ``substr(date,1,10)=?`` filter alone would miss it); the ``date`` column is
+    only used as a fallback when ``created_time`` is missing. A missing ledger
+    table means no evidence (False).
     """
-    return []
+    local_date = date_iso[:10]
+    start = _combine_hhmm(local_date, block["start_hhmm"]) - dt.timedelta(minutes=10)
+    end = _block_end(block) + dt.timedelta(minutes=10)
+    dates = [local_date]
+    if block["crosses_midnight"]:
+        dates.append((dt.date.fromisoformat(local_date) + dt.timedelta(days=1)).isoformat())
+    placeholders = ",".join("?" for _ in dates)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM ledger WHERE archived = 0 AND ("
+            f"(created_time >= ? AND created_time <= ?) OR "
+            f"(COALESCE(created_time, '') = '' AND "
+            f"substr(COALESCE(date, ''), 1, 10) IN ({placeholders}))) LIMIT 1",
+            (_utc_iso(start), _utc_iso(end), *dates),
+        ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def evaluate_completion(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    """Post-block check-in candidates for started blocks (today + yesterday).
+
+    A started block whose window has ended is auto-completed silently when it
+    has ledger evidence; otherwise, once it has been over for at least 15
+    minutes and the CURRENT block is a study block, a ``discipline_checkin``
+    candidate is emitted. The candidate regenerates every scan tick until
+    claimed (reminders.claim dedups), so a block that ends into Sleep is
+    checked in at the next study block. Started blocks are never auto-skipped —
+    they end here (completed via evidence, or check-in).
+    """
+    now = _as_local(now)
+    today_iso = now.date().isoformat()
+    yesterday_iso = (now.date() - dt.timedelta(days=1)).isoformat()
+    candidates: list[dict] = []
+    for date_iso in (today_iso, yesterday_iso):
+        day_type = day_type_for(date_iso, db_path=db_path)
+        for block in blocks_for_date(date_iso, db_path=db_path):
+            block = {**block, "local_date": date_iso, "day_type": day_type}
+            state = get_state(date_iso, block["block_key"], db_path=db_path)
+            if state is None or state["status"] != "started":
+                continue
+            end = _block_end(block)
+            if now < end:
+                continue
+            if has_ledger_evidence(date_iso, block, db_path=db_path):
+                mark_completed(date_iso, block["block_key"], db_path=db_path)
+                continue
+            elapsed_after_end = (now - end).total_seconds() / 60.0
+            if elapsed_after_end < 15:
+                continue
+            current = current_block(now, db_path=db_path)
+            if current is not None and current["kind"] == "study":
+                candidates.append({
+                    "kind": "discipline_checkin",
+                    "event_key": f"discipline:{date_iso}:{block['block_key']}:checkin",
+                    "tier": "checkin",
+                    "date": date_iso,
+                    "block_key": block["block_key"],
+                    "title": block["title"],
+                    "window": f"{block['start_hhmm']}-{block['end_hhmm']}",
+                    "block": block,
+                })
+    return candidates
 
 
 # ---------------------------------------------------------------------------

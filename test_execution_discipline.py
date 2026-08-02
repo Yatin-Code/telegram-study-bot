@@ -24,6 +24,7 @@ import pytest
 import execution_discipline as ed
 import ntsc_coaching
 import session_context
+import sync
 from config import ownership
 
 
@@ -713,3 +714,95 @@ def test_discipline_message_never_raises(db, monkeypatch):
     text = ed.discipline_message("shame", block, db_path=db)
     assert isinstance(text, str)
     assert text
+
+
+# ---------------------------------------------------------------------------
+# Post-block check-in (ledger evidence + regenerating checkin candidate)
+# ---------------------------------------------------------------------------
+
+def _seed_ledger(db, created_time_utc, date):
+    with sync.connect(db) as conn:
+        sync.init_db(conn)
+        conn.execute(
+            "INSERT INTO ledger (notion_page_id, created_time, date, last_synced_at, raw_json, archived) "
+            "VALUES (?, ?, ?, ?, '{}', 0)",
+            (f"ledger-{created_time_utc}", created_time_utc, date, "2026-07-20T00:00:00+00:00"),
+        )
+        conn.commit()
+
+
+def _exec_block(db, date_iso, block_key):
+    for block in ed.blocks_for_date(date_iso, db):
+        if block["block_key"] == block_key:
+            return {**block, "local_date": date_iso}
+    return None
+
+
+def _utc(hour, minute, day=2, month=8, year=2026):
+    return dt.datetime(year, month, day, hour, minute, tzinfo=_TZ).astimezone(
+        dt.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+
+
+def test_started_block_with_ledger_evidence_auto_completes(db):
+    _coaching_window(db)
+    ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    _seed_ledger(db, _utc(9, 0), "2026-08-02")
+    assert ed.evaluate_completion(_at(10, 30), db) == []
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "completed"
+
+
+def test_started_block_no_ledger_emits_checkin(db):
+    _coaching_window(db)
+    ed.confirm_start("2026-08-02", "coach_b09_review", db)
+    candidates = ed.evaluate_completion(_at(22, 35), db)
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["tier"] == "checkin"
+    assert candidate["kind"] == "discipline_checkin"
+    assert candidate["block_key"] == "coach_b09_review"
+    assert candidate["event_key"] == "discipline:2026-08-02:coach_b09_review:checkin"
+    assert ed.get_state("2026-08-02", "coach_b09_review", db)["status"] == "started"
+
+
+def test_checkin_not_emitted_before_window_ends(db):
+    _coaching_window(db)
+    ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    assert ed.evaluate_completion(_at(9, 30), db) == []
+
+
+def test_checkin_not_emitted_during_sleep_then_regenerates(db):
+    _coaching_window(db)
+    ed.confirm_start("2026-08-02", "coach_b10_exec_c", db)
+    sleep_now = dt.datetime(2026, 8, 3, 1, 20, tzinfo=_TZ)
+    assert ed.evaluate_completion(sleep_now, db) == []
+    study_now = dt.datetime(2026, 8, 3, 8, 45, tzinfo=_TZ)
+    candidates = ed.evaluate_completion(study_now, db)
+    assert len(candidates) == 1
+    assert candidates[0]["block_key"] == "coach_b10_exec_c"
+
+
+def test_checkin_skipped_block_none(db):
+    _coaching_window(db)
+    ed.confirm_skip("2026-08-02", "coach_b02_exec_a", db)
+    assert ed.evaluate_completion(_at(10, 30), db) == []
+
+
+def test_has_ledger_evidence_crossing_via_created_time(db):
+    _coaching_window(db)
+    block = _exec_block(db, "2026-08-02", "coach_b10_exec_c")
+    _seed_ledger(db, _utc(0, 30, day=3), "2026-08-03")
+    assert ed.has_ledger_evidence("2026-08-02", block, db) is True
+
+
+def test_has_ledger_evidence_ignores_date_outside_window(db):
+    _coaching_window(db)
+    block = _exec_block(db, "2026-08-02", "coach_b10_exec_c")
+    _seed_ledger(db, _utc(5, 0, day=3), "2026-08-03")
+    assert ed.has_ledger_evidence("2026-08-02", block, db) is False
+
+
+def test_has_ledger_evidence_no_ledger_table_false(db):
+    _coaching_window(db)
+    block = _exec_block(db, "2026-08-02", "coach_b02_exec_a")
+    assert ed.has_ledger_evidence("2026-08-02", block, db) is False
