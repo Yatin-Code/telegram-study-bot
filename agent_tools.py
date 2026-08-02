@@ -687,6 +687,7 @@ READ_TOOLS = frozenset({
     "get_coaching_snapshot", "get_upcoming_syllabus", "get_next_class",
     "get_plan_suggestions", "get_chapter_progress", "get_next_doubt",
     "get_doubt_interaction", "get_score_prediction", "get_backlog_status",
+    "get_today_blocks", "get_current_block",
 })
 
 
@@ -905,6 +906,26 @@ TOOL_SPECS = [
             "impossible), its metrics, plan adherence/headroom, and per-dataset data "
             "freshness. Use for 'is my backlog out of control' or 'should I add more time'. "
             "Read-only; never writes a plan."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_today_blocks",
+        "description": (
+            "Read today's execution-discipline blocks (from the resolved daily template) "
+            "with each block's confirmation status (pending/started/skipped/completed), a "
+            "'current' marker on the active block, and a short what-to-do hint. Use for "
+            "'what is my schedule today' or 'what should I be doing now'. Read-only."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_current_block",
+        "description": (
+            "Read the execution-discipline block active right now: its title, window, "
+            "confirmation status, whether the ledger has evidence for it, plus (best-effort) "
+            "days to the next test and the backlog level. Returns a small 'no current block' "
+            "dict when between windows. Read-only."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -1211,6 +1232,105 @@ def coaching_progress_relevant_freshness(db_path: str | Path) -> dict[str, Any]:
         return {}
 
 
+def _discipline_hint(now: dt.datetime, block: dict[str, Any], db_path: str | Path) -> str | None:
+    """Short 'what to do' hint from build_llm_context's plan/coverage slice.
+
+    Best-effort: any failure (empty db, missing tables) yields None so the
+    read tool never breaks on a hint.
+    """
+    try:
+        import execution_discipline
+        ctx = execution_discipline.build_llm_context(now, block, db_path=db_path)
+        items = ctx.get("plan_items") or []
+        if items:
+            return f"Plan: {items[0].get('title')}"
+        uncovered = ctx.get("uncovered_topics") or []
+        if uncovered:
+            return f"Uncovered: {uncovered[0].get('test')}"
+    except Exception:
+        pass
+    return None
+
+
+def _run_get_today_blocks(chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    """Today's execution-discipline blocks with status + current marker + hint."""
+    import execution_discipline
+    now = session_context.local_now()
+    today_iso = session_context.local_today_iso()
+    blocks = execution_discipline.blocks_for_date(today_iso, db_path=db_path)
+    current = execution_discipline.current_block(now, db_path=db_path)
+    current_key = current["block_key"] if current else None
+    hint_block = current or (blocks[0] if blocks else None)
+    hint = _discipline_hint(now, hint_block, db_path) if hint_block else None
+    out: list[dict[str, Any]] = []
+    for block in blocks:
+        state = execution_discipline.get_state(today_iso, block["block_key"], db_path=db_path)
+        entry: dict[str, Any] = {
+            "block_key": block["block_key"],
+            "title": block["title"],
+            "kind": block["kind"],
+            "window": f"{block['start_hhmm']}-{block['end_hhmm']}",
+            "status": (state or {}).get("status") or "pending",
+            "current": block["block_key"] == current_key,
+        }
+        if hint and block["block_key"] == current_key:
+            entry["hint"] = hint
+        out.append(entry)
+    return {"date": today_iso, "blocks": out, "generated_with": "deterministic"}
+
+
+def _run_get_current_block(chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    """The block active now + status + ledger evidence + best-effort test/backlog."""
+    import execution_discipline
+    now = session_context.local_now()
+    block = execution_discipline.current_block(now, db_path=db_path)
+    if block is None:
+        return {
+            "current": None,
+            "message": "No active block right now (between windows).",
+            "generated_with": "deterministic",
+        }
+    state = execution_discipline.get_state(
+        block["local_date"], block["block_key"], db_path=db_path,
+    )
+    result: dict[str, Any] = {
+        "block_key": block["block_key"],
+        "title": block["title"],
+        "kind": block["kind"],
+        "window": f"{block['start_hhmm']}-{block['end_hhmm']}",
+        "status": (state or {}).get("status") or "pending",
+        "has_ledger_evidence": execution_discipline.has_ledger_evidence(
+            block["local_date"], block, db_path=db_path,
+        ),
+        "generated_with": "deterministic",
+    }
+    try:
+        import ntsc_coaching
+        snap = ntsc_coaching.context_snapshot(db_path=db_path)
+        tests = snap.get("next_tests") or []
+        if tests:
+            first = tests[0]
+            result["next_test"] = first.get("title")
+            test_date = str(first.get("test_date") or "")[:10]
+            if test_date:
+                result["days_to_test"] = (
+                    dt.date.fromisoformat(test_date)
+                    - dt.date.fromisoformat(block["local_date"])
+                ).days
+    except Exception:
+        pass
+    try:
+        import coaching_policy
+        level = coaching_policy.backlog_escalation(
+            today=block["local_date"], db_path=db_path,
+        ).get("level")
+        if level:
+            result["backlog_level"] = level
+    except Exception:
+        pass
+    return result
+
+
 def execute_tool(
     name: str,
     arguments: dict[str, Any],
@@ -1413,6 +1533,10 @@ def execute_tool(
                 "freshness": coaching_policy.classify_freshness(db_path=db_path),
                 "generated_with": "deterministic",
             }
+        if name == "get_today_blocks":
+            return _run_get_today_blocks(chat_id, db_path)
+        if name == "get_current_block":
+            return _run_get_current_block(chat_id, db_path)
         if name in WRITE_TOOLS:
             return {
                 "error": True,

@@ -407,3 +407,76 @@ def test_coaching_read_tools_empty_mirror(tmp_path):
     ):
         out = agent_tools.execute_tool(name, args, chat_id=1, db_path=db)
         assert not out.get("error"), (name, out)
+
+
+# ---------------------------------------------------------------------------
+# Execution-discipline read tools (todo 10): today's blocks + current block
+# ---------------------------------------------------------------------------
+
+def _discipline_db(tmp_path):
+    import execution_discipline
+    path = tmp_path / "discipline.db"
+    execution_discipline.seed_templates(db_path=path)
+    return path
+
+
+def test_get_today_blocks_read_tool(tmp_path):
+    import session_context
+    db = _discipline_db(tmp_path)
+    out = agent_tools.execute_tool("get_today_blocks", {}, chat_id=1, db_path=db)
+    assert not out.get("error"), out
+    assert out["date"] == session_context.local_today_iso()
+    assert len(out["blocks"]) == 10
+    for block in out["blocks"]:
+        assert block["status"] == "pending"
+        assert block["block_key"] and block["title"] and block["window"]
+        assert "current" in block
+
+
+def test_get_current_block_read_tool(tmp_path, monkeypatch):
+    import datetime as dt
+    import execution_discipline
+    db = _discipline_db(tmp_path)
+    now = dt.datetime(2026, 8, 5, 10, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setattr(execution_discipline.session_context, "local_now", lambda: now)
+    monkeypatch.setattr(execution_discipline.settings, "user_timezone", lambda: "UTC")
+    out = agent_tools.execute_tool("get_current_block", {}, chat_id=1, db_path=db)
+    assert not out.get("error"), out
+    assert out["block_key"] == "noncoach_b02_revision"
+    assert out["status"] == "pending"
+    assert out["has_ledger_evidence"] is False
+
+
+def test_discipline_tools_in_spec_and_registry():
+    spec_names = {s["name"] for s in agent_tools.TOOL_SPECS}
+    for name in ("get_today_blocks", "get_current_block"):
+        assert name in agent_tools.READ_TOOLS
+        assert name in spec_names
+        spec = next(s for s in agent_tools.TOOL_SPECS if s["name"] == name)
+        assert spec["parameters"]["type"] == "object"
+
+
+def test_render_compact_discipline_lines(tmp_path, monkeypatch):
+    import datetime as dt
+    import execution_discipline
+    import session_context
+    import coaching_context
+    db = _discipline_db(tmp_path)
+    now = dt.datetime(2026, 8, 5, 10, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setattr(session_context, "local_now", lambda: now)
+    monkeypatch.setattr(session_context, "local_today_iso", lambda: "2026-08-05")
+    monkeypatch.setattr(execution_discipline.settings, "user_timezone", lambda: "UTC")
+    execution_discipline.confirm_start("2026-08-05", "noncoach_b02_revision", db_path=db)
+    text = coaching_context.render_compact(db_path=db)
+    assert "Current block" in text
+    assert "Today:" in text
+
+
+def test_render_compact_discipline_empty_db(tmp_path):
+    import sqlite3
+    import coaching_context
+    db = tmp_path / "empty.db"
+    sqlite3.connect(db).close()
+    text = coaching_context.render_compact(db_path=db)
+    assert "Current block" not in text
+    assert "Today:" not in text

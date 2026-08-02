@@ -140,6 +140,48 @@ def _freshness_line(*, db_path: str | Path) -> list[str]:
     return lines
 
 
+def _discipline_lines(*, db_path: str | Path) -> list[str]:
+    """Two compact execution-discipline lines (current block + today's progress).
+
+    Omitted gracefully (no lines, no exception) when the discipline tables are
+    empty or any lookup fails.
+    """
+    lines: list[str] = []
+    try:
+        import execution_discipline
+        import session_context
+        now = session_context.local_now()
+        today_iso = session_context.local_today_iso()
+        block = execution_discipline.current_block(now, db_path=db_path)
+        if block is not None:
+            state = execution_discipline.get_state(
+                block["local_date"], block["block_key"], db_path=db_path,
+            )
+            status = (state or {}).get("status") or "pending"
+            lines.append(
+                f"- Current block: {block['title']} "
+                f"({block['start_hhmm']}-{block['end_hhmm']}) · {status}"
+            )
+        blocks = execution_discipline.blocks_for_date(today_iso, db_path=db_path)
+        study = [b for b in blocks if b["kind"] == "study"]
+        if study:
+            started = 0
+            skipped = 0
+            for b in study:
+                state = execution_discipline.get_state(today_iso, b["block_key"], db_path=db_path)
+                status = (state or {}).get("status") or "pending"
+                if status == "started":
+                    started += 1
+                elif status == "skipped":
+                    skipped += 1
+            lines.append(
+                f"- Today: {started}/{len(study)} blocks started, {skipped} skipped"
+            )
+    except Exception:
+        pass
+    return lines
+
+
 def render_compact(
     chat_id: int | None = None, *, user_text: str = "",
     db_path: str | Path = DEFAULT_DB_PATH,
@@ -232,4 +274,5 @@ def render_compact(
     lines.extend(_prediction_line(db_path=db_path))
     lines.extend(_escalation_line(db_path=db_path))
     lines.extend(_freshness_line(db_path=db_path))
+    lines.extend(_discipline_lines(db_path=db_path))
     return _redact("\n".join(lines))
