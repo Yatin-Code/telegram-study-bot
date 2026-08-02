@@ -12,6 +12,7 @@ import datetime as dt
 import logging
 import logging.handlers
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -517,6 +518,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not onboarding.is_complete(chat_id):
         text, markup = await asyncio.to_thread(_setup_hub_view)
         await update.effective_message.reply_text(text, reply_markup=markup)
+        await _out_of_box_execution_check(chat_id, context)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3329,6 +3331,7 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🚀 First time? Run /setup — 2 minutes, and every engine "
             "(planner, streaks, teacher alerts) comes alive."
         )
+        await _out_of_box_execution_check(chat_id, context)
 
     # Gap 3: if a field-edit is pending for this chat, apply the new value.
     editing = draft_store.get_editing_draft_for_chat(chat_id)
@@ -3776,6 +3779,132 @@ async def _coaching_proactive_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
     except Exception:
         logger.exception("coaching proactive scan failed")
+
+
+async def _out_of_box_execution_check(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """First-run execution awareness while onboarding is still incomplete.
+
+    Syncs best-effort (ledger + a portal sync when the NTSC mirror is still
+    empty), resolves the current execution block, and — when a study block is
+    active — sends the same Started/Skip buttons the discipline scan uses
+    (reusing ``on_discipline_callback``): 'time to start' for a pending block,
+    a mid-block prompt when it is already started, nothing for
+    skipped/completed blocks. An empty Notion mirror (no ledger rows and no
+    work items) triggers a one-line prompt to log a session or set chapters.
+    Every message is claim-deduped per (date, block) / 'onboarding-oob-empty';
+    a failed send releases the claim so a later attempt can retry. Never fires
+    outside a study block (``current_block`` guarantees) and never blocks the
+    /start or catch_all flows on exceptions.
+    """
+    try:
+        import execution_discipline
+        db_path = execution_discipline.DEFAULT_DB_PATH
+        try:
+            await sync.sync_once_locked(db_keys=("ledger",))
+        except Exception:
+            logger.exception("out-of-box ledger sync failed")
+        try:
+            if _ntsc_mirror_empty(db_path):
+                await asyncio.to_thread(ntsc_sync.sync_once)
+        except Exception:
+            logger.exception("out-of-box NTSC sync failed")
+
+        now = session_context.local_now()
+        block = execution_discipline.current_block(now, db_path=db_path)
+        if block is not None and block.get("kind") == "study":
+            date = block["local_date"]
+            key = block["block_key"]
+            title = block["title"]
+            state = execution_discipline.get_state(date, key, db_path=db_path)
+            status = state["status"] if state else None
+            if status in (None, "pending"):
+                claim_key = f"onboarding-oob:{date}:{key}"
+                if not reminders.claim(claim_key, db_path=db_path):
+                    return
+                text = (
+                    f"⏰ {title} ({block['start_hhmm']}-{block['end_hhmm']}) "
+                    "— time to start."
+                )
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Started", callback_data=f"discipline:start:{date}:{key}"
+                    ),
+                    InlineKeyboardButton(
+                        "Skip", callback_data=f"discipline:skip:{date}:{key}"
+                    ),
+                ]])
+                try:
+                    await _send_markdown(context.bot, chat_id, text, reply_markup=keyboard)
+                except Exception:
+                    reminders.release(claim_key, db_path=db_path)
+                    raise
+                return
+            if status == "started":
+                claim_key = f"onboarding-oob-started:{date}:{key}"
+                if not reminders.claim(claim_key, db_path=db_path):
+                    return
+                text = (
+                    f"You're already mid-block ({title}) — keep going, and "
+                    "log it when done."
+                )
+                try:
+                    await _send_markdown(context.bot, chat_id, text)
+                except Exception:
+                    reminders.release(claim_key, db_path=db_path)
+                    raise
+                return
+            return
+
+        if _notion_mirror_empty(db_path):
+            claim_key = "onboarding-oob-empty"
+            if not reminders.claim(claim_key, db_path=db_path):
+                return
+            text = (
+                "I don't know anything yet — log your first session "
+                "(e.g. `physics kinematics 20q 15c 25min`) or set your "
+                "chapters in /setup."
+            )
+            try:
+                await _send_markdown(context.bot, chat_id, text)
+            except Exception:
+                reminders.release(claim_key, db_path=db_path)
+                raise
+    except Exception:
+        logger.exception("out-of-box execution check failed")
+
+
+def _table_row_count(db_path: str | Path, table: str) -> int:
+    """Row count for ``table``, or 0 when the table does not exist."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def _ntsc_mirror_empty(db_path: str | Path) -> bool:
+    """True when the portal/NTSC mirror has never been populated."""
+    return all(
+        _table_row_count(db_path, table) == 0
+        for table in (
+            "coaching_sync_runs",
+            "coaching_classes",
+            "coaching_tests",
+            "coaching_profile",
+        )
+    )
+
+
+def _notion_mirror_empty(db_path: str | Path) -> bool:
+    """True when the Notion mirror holds no ledger rows and no work items."""
+    return (
+        _table_row_count(db_path, "ledger") == 0
+        and _table_row_count(db_path, "op_work_items") == 0
+    )
 
 
 async def _execution_discipline_scan(context: ContextTypes.DEFAULT_TYPE) -> None:

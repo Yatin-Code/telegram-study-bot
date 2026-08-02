@@ -905,6 +905,224 @@ def test_mockprep_callback_registered_once_near_discipline():
     assert mockprep_site > discipline_site
 
 
+# ---------------------------------------------------------------------------
+# C4 out-of-the-box execution check (todo 5): new behavior (failing-first)
+# ---------------------------------------------------------------------------
+
+async def _run_out_of_box_check(db, now, monkeypatch, *, ntsc_raises=False):
+    sent = []
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text, _kw.get("reply_markup")))
+
+    async def noop_sync(**_kw):
+        return {}
+
+    def ntsc_noop():
+        return {"status": "ok"}
+
+    def ntsc_fail():
+        raise RuntimeError("ntsc down")
+
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot.sync, "sync_once_locked", noop_sync)
+    monkeypatch.setattr(
+        bot.ntsc_sync, "sync_once", ntsc_noop if not ntsc_raises else ntsc_fail
+    )
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(session_context, "local_now", lambda: now)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    context = types.SimpleNamespace(bot=types.SimpleNamespace())
+    await bot._out_of_box_execution_check(1, context)
+    return sent
+
+
+def test_out_of_box_pending_study_block_sends_one_start_with_buttons(db, monkeypatch):
+    """(a) At 08:45 on a seeded coaching day with a pending study block the
+    check sends exactly ONE 'time to start' message with the discipline
+    Started/Skip buttons; a second call sends nothing (claim-dedup)."""
+    _seed_discipline(db)
+    sent = asyncio.run(_run_out_of_box_check(db, _at(8, 45), monkeypatch))
+    assert len(sent) == 1
+    assert "time to start" in sent[0][1]
+    assert "Execution Block A" in sent[0][1]
+    data = _button_data(sent[0][2])
+    assert "discipline:start:2026-08-02:coach_b02_exec_a" in data
+    assert "discipline:skip:2026-08-02:coach_b02_exec_a" in data
+    sent2 = asyncio.run(_run_out_of_box_check(db, _at(8, 45), monkeypatch))
+    assert sent2 == []
+
+
+def test_out_of_box_started_block_sends_mid_block_once(db, monkeypatch):
+    """(b) A block already started → 'mid-block' message once."""
+    _seed_discipline(db)
+    ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    sent = asyncio.run(_run_out_of_box_check(db, _at(8, 45), monkeypatch))
+    assert len(sent) == 1
+    assert "mid-block" in sent[0][1]
+    assert "Execution Block A" in sent[0][1]
+    sent2 = asyncio.run(_run_out_of_box_check(db, _at(8, 45), monkeypatch))
+    assert sent2 == []
+
+
+def test_out_of_box_sleep_block_sends_nothing(db, monkeypatch):
+    """(c) Block kind sleep → nothing (not even the empty-mirror prompt)."""
+    _seed_discipline(db)
+    insert(db, "work_items", notion_page_id="w1", title="DPP backlog",
+           kind="Backlog", status="Backlog")
+    sent = asyncio.run(_run_out_of_box_check(db, _at(2, 0), monkeypatch))
+    assert sent == []
+
+
+def test_out_of_box_skipped_block_sends_nothing(db, monkeypatch):
+    """A skipped study block → nothing."""
+    _seed_discipline(db)
+    ed.confirm_skip("2026-08-02", "coach_b02_exec_a", db)
+    sent = asyncio.run(_run_out_of_box_check(db, _at(8, 45), monkeypatch))
+    assert sent == []
+
+
+def test_out_of_box_empty_mirror_sends_guidance_once(db, monkeypatch):
+    """(d) Empty Notion mirror (no ledger rows and no work items) → the
+    one-line 'I don't know anything yet' prompt, once."""
+    sent = asyncio.run(_run_out_of_box_check(db, _at(12, 0), monkeypatch))
+    assert len(sent) == 1
+    assert "I don't know anything yet" in sent[0][1]
+    assert "physics kinematics 20q 15c 25min" in sent[0][1]
+    sent2 = asyncio.run(_run_out_of_box_check(db, _at(12, 0), monkeypatch))
+    assert sent2 == []
+
+
+def test_out_of_box_ntsc_sync_exception_does_not_propagate(db, monkeypatch):
+    """(e) An exception in the best-effort NTSC sync must not propagate and
+    must not block the rest of the check (the start message still sends)."""
+    _seed_discipline(db)
+    sent = asyncio.run(
+        _run_out_of_box_check(db, _at(8, 45), monkeypatch, ntsc_raises=True)
+    )
+    assert len(sent) == 1
+    assert "time to start" in sent[0][1]
+
+
+def test_out_of_box_check_wired_into_start_and_catch_all():
+    """The check is wired into /start (after the hub render) and the catch_all
+    first-run hint, both behind the incomplete-onboarding gates."""
+    assert "async def _out_of_box_execution_check(" in _BOT_SOURCE
+    assert _BOT_SOURCE.count(
+        "await _out_of_box_execution_check(chat_id, context)"
+    ) == 2
+    start_site = _BOT_SOURCE.index("async def start(update:")
+    start_gate = _BOT_SOURCE.index("if not onboarding.is_complete(chat_id):", start_site)
+    start_call = _BOT_SOURCE.index("await _out_of_box_execution_check(chat_id, context)", start_site)
+    assert start_call > start_gate
+    catch_site = _BOT_SOURCE.index("async def catch_all(update:")
+    hint = _BOT_SOURCE.index('reminders.claim("onboarding-hint:v1")', catch_site)
+    catch_call = _BOT_SOURCE.rindex("await _out_of_box_execution_check(chat_id, context)", catch_site)
+    assert catch_call > hint
+
+
+def test_start_sends_hub_and_invokes_out_of_box_check(db, monkeypatch):
+    """End-to-end /start: incomplete onboarding renders the hub AND invokes the
+    out-of-box check (plain empty mirror → the one-line guidance fires)."""
+    replies = []
+    sent = []
+
+    class Message:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text))
+
+    async def noop_sync(**_kw):
+        return {}
+
+    def ntsc_noop():
+        return {"status": "ok"}
+
+    async def _allowed(_u):
+        return False
+
+    update = types.SimpleNamespace(
+        effective_message=Message(),
+        effective_chat=types.SimpleNamespace(id=42),
+    )
+    monkeypatch.setattr(bot, "_reject_if_unauthorized", _allowed)
+    monkeypatch.setattr(bot.onboarding, "is_complete", lambda chat: False)
+    monkeypatch.setattr(bot, "_setup_hub_view", lambda: ("HUB TEXT", None))
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot.sync, "sync_once_locked", noop_sync)
+    monkeypatch.setattr(bot.ntsc_sync, "sync_once", ntsc_noop)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(session_context, "local_now", lambda: DAY)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    asyncio.run(bot.start(update, types.SimpleNamespace(bot=types.SimpleNamespace())))
+    assert "HUB TEXT" in replies
+    assert len(sent) == 1
+    assert "I don't know anything yet" in sent[0][1]
+
+
+def test_catch_all_first_run_hint_still_works_and_invokes_check(db, monkeypatch):
+    """End-to-end catch_all: the onboarding-hint:v1 claim still fires and the
+    out-of-box check is invoked right after it."""
+    replies = []
+    claims = []
+    sent = []
+
+    class Message:
+        text = "hello"
+
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text))
+
+    async def noop_sync(**_kw):
+        return {}
+
+    def ntsc_noop():
+        return {"status": "ok"}
+
+    async def _allowed(_u):
+        return False
+
+    update = types.SimpleNamespace(
+        effective_message=Message(),
+        effective_chat=types.SimpleNamespace(id=42),
+        effective_user=types.SimpleNamespace(id=42),
+    )
+    monkeypatch.setattr(bot, "_reject_if_unauthorized", _allowed)
+    monkeypatch.setattr(bot.reset_service, "pending_confirmation", lambda _chat: None)
+    monkeypatch.setattr(bot.exam_readiness, "pending_resolution", lambda _chat: None)
+    monkeypatch.setattr(bot.draft_store, "get_pending_doubt_resolution", lambda _chat: None)
+    monkeypatch.setattr(bot.draft_store, "get_pending_setting_edit", lambda _chat: None)
+    monkeypatch.setattr(bot.user_jobs, "get_pending_edit", lambda _chat: None)
+    monkeypatch.setattr(bot.draft_store, "get_session_debrief", lambda _chat: None)
+    monkeypatch.setattr(bot.onboarding, "active_section", lambda _chat: None)
+    monkeypatch.setattr(bot.onboarding, "is_complete", lambda _chat: False)
+    monkeypatch.setattr(bot.draft_store, "get_editing_draft_for_chat", lambda _chat: None)
+    monkeypatch.setattr(bot.draft_store, "get_pending_clarification", lambda _chat: None)
+
+    async def _agent(_u, chat, text):
+        return None
+
+    monkeypatch.setattr(bot, "_handle_agent_text", _agent)
+    monkeypatch.setattr(bot.reminders, "claim", lambda key, **kw: claims.append(key) or True)
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot.sync, "sync_once_locked", noop_sync)
+    monkeypatch.setattr(bot.ntsc_sync, "sync_once", ntsc_noop)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(session_context, "local_now", lambda: DAY)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    asyncio.run(bot.catch_all(update, types.SimpleNamespace(bot=types.SimpleNamespace())))
+    assert "onboarding-hint:v1" in claims
+    assert any("First time? Run /setup" in r for r in replies)
+    assert any(k.startswith("onboarding-oob") for k in claims)
+    assert len(sent) == 1
+    assert "I don't know anything yet" in sent[0][1]
+
+
 def main() -> int:
     import sys
     import pytest as _pytest
