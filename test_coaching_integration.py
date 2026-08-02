@@ -17,18 +17,22 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import sqlite3
+import types
 
 import pytest
 
 import agent_tools
+import bot
 import coaching_context
 import coaching_doubts
 import coaching_policy
 import coaching_proactive
 import coaching_progress
 import coaching_syllabus
+import execution_discipline as ed
 import ntsc_coaching
 import operational_store
 import reminders
@@ -427,6 +431,149 @@ def test_proactive_scan_cooldown_and_claim_dedup(db):
     soon = DAY + dt.timedelta(minutes=5)
     again = coaching_proactive.scan_candidates(now=soon, chat_id=1, db_path=db)
     assert again == []
+
+
+# ---------------------------------------------------------------------------
+# Execution-discipline wiring (todo 7): scan + inline callback
+# ---------------------------------------------------------------------------
+
+_TZ = session_context.local_now().tzinfo
+
+
+def _at(hour, minute):
+    return dt.datetime(2026, 8, 2, hour, minute, tzinfo=_TZ)
+
+
+def _seed_discipline(db, *, day_type="coaching"):
+    ed.seed_templates(db_path=db)
+    with _conn(db) as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO {ed.DAY_TYPES_TABLE} "
+            "(local_date, day_type, resolved_at) VALUES (?, ?, ?)",
+            ("2026-08-02", day_type, "2026-08-02T12:00:00+00:00"),
+        )
+        conn.commit()
+
+
+def _decision_rows(db):
+    with _conn(db) as conn:
+        return conn.execute(
+            f"SELECT * FROM {coaching_policy.DECISIONS_TABLE}"
+        ).fetchall()
+
+
+async def _run_discipline_scan(db, now, monkeypatch):
+    sent = []
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text))
+
+    async def noop_sync(**_kw):
+        return {}
+
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot.sync, "sync_once_locked", noop_sync)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(ed, "_llm_complete", lambda messages: "coach text")
+    monkeypatch.setattr(session_context, "local_now", lambda: now)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    context = types.SimpleNamespace(bot=types.SimpleNamespace())
+    await bot._execution_discipline_scan(context)
+    return sent
+
+
+def test_discipline_scan_sends_one_claimed_and_records(db, monkeypatch):
+    _seed_discipline(db)
+    sent = asyncio.run(_run_discipline_scan(db, _at(8, 30), monkeypatch))
+    assert len(sent) == 1
+    assert sent[0][1] == "coach text"
+    rows = _decision_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["allow"] == 1
+    assert rows[0]["kind"] == "discipline_start"
+
+
+def test_discipline_scan_second_scan_sends_nothing_no_double_record(db, monkeypatch):
+    _seed_discipline(db)
+    sent = asyncio.run(_run_discipline_scan(db, _at(8, 30), monkeypatch))
+    assert len(sent) == 1
+    sent2 = asyncio.run(_run_discipline_scan(db, _at(8, 30), monkeypatch))
+    assert sent2 == []
+    # The same decision_key is INSERT OR REPLACE'd, so only one row remains.
+    assert len(_decision_rows(db)) == 1
+
+
+def test_discipline_scan_budget_blocks_31st(db, monkeypatch):
+    _seed_discipline(db)
+    for i in range(30):
+        decision = coaching_policy.decide_notification(
+            kind="discipline_start",
+            now=_at(8, 0),
+            event_key=f"discipline:2026-08-02:coach_b02_exec_a:start:{i}",
+            chat_id=1,
+            db_path=db,
+            budget_per_day=30,
+        )
+        coaching_policy.record_decision(decision, db_path=db)
+    sent = asyncio.run(_run_discipline_scan(db, _at(8, 30), monkeypatch))
+    assert sent == []
+    blocked = [r for r in _decision_rows(db) if not r["allow"]]
+    assert blocked
+    assert all("budget" in (r["blocked_by"] or "") for r in blocked)
+
+
+def test_discipline_scan_sleep_block_emits_nothing(db, monkeypatch):
+    _seed_discipline(db)
+    sent = asyncio.run(_run_discipline_scan(db, _at(2, 0), monkeypatch))
+    assert sent == []
+
+
+def _fake_query(data, edits):
+    class Query:
+        def __init__(self):
+            self.data = data
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text, **_kw):
+            edits.append(text)
+
+    return Query()
+
+
+def test_discipline_callback_start_records_and_edits(db, monkeypatch):
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    edits = []
+    query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
+    update = types.SimpleNamespace(callback_query=query)
+    asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
+    assert edits and "time to start" in edits[0]
+
+
+def test_discipline_callback_start_on_skipped_shows_skipped(db, monkeypatch):
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    ed.confirm_skip("2026-08-02", "coach_b02_exec_a", db)
+    edits = []
+    query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
+    update = types.SimpleNamespace(callback_query=query)
+    asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
+    assert edits and "skipped" in edits[0]
+    assert "time to start" not in edits[0]
+
+
+def test_discipline_callback_skip_records_skipped(db, monkeypatch):
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    edits = []
+    query = _fake_query("discipline:skip:2026-08-02:coach_b02_exec_a", edits)
+    update = types.SimpleNamespace(callback_query=query)
+    asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "skipped"
+    assert edits and "skipped" in edits[0]
 
 
 def main() -> int:

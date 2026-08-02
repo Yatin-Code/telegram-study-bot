@@ -582,6 +582,15 @@ def run_auto_skip(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> di
     }
 
 
+def evaluate_completion(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    """Post-block check-in candidates.
+
+    Stub — fully implemented in todo 9 (post-block check-in candidates).
+    Returns an empty list for now so the discipline scan can call it safely.
+    """
+    return []
+
+
 # ---------------------------------------------------------------------------
 # LLM coach message (code decides when; LLM writes what) + deterministic fallback
 # ---------------------------------------------------------------------------

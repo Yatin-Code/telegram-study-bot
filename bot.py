@@ -3054,6 +3054,45 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await agent_renderer.render(query, result["response"])
 
 
+async def on_discipline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Started/Skip on execution-discipline block messages.
+
+    ``discipline:start:<date>:<block_key>`` transitions the block to started;
+    ``discipline:skip:<date>:<block_key>`` to skipped. The buttons are removed
+    by editing the message. The "time to start" coach text is shown ONLY when
+    the start transition actually happened (status 'started'); an already
+    skipped/completed block shows its actual state instead.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 4:
+        return
+    _, action, date, block_key = parts
+    import execution_discipline
+    db_path = execution_discipline.DEFAULT_DB_PATH
+    if action == "start":
+        state = execution_discipline.confirm_start(date, block_key, db_path=db_path)
+    elif action == "skip":
+        state = execution_discipline.confirm_skip(date, block_key, db_path=db_path)
+    else:
+        return
+    if state is None:
+        await query.edit_message_text("Unknown block.")
+        return
+    status = state["status"]
+    if status == "started":
+        text = f"⏰ {block_key} — time to start. Go!"
+    elif status == "skipped":
+        text = f"⏭ {block_key} skipped."
+    elif status == "completed":
+        text = f"✅ {block_key} already completed."
+    else:
+        text = f"{block_key} is still pending."
+    await query.edit_message_text(text)
+
+
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -3678,6 +3717,61 @@ async def _coaching_proactive_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("coaching proactive scan failed")
 
 
+async def _execution_discipline_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enforce the daily timetable: policy-gated, claim-deduped discipline nudges.
+
+    Runs every 60s. First auto-skips any never-started study block that has
+    passed its start+25 window (records the skip, sends nothing), then gathers
+    due escalation candidates plus post-block check-ins. Every candidate is
+    decided via ``coaching_policy.decide_notification`` and the decision is
+    recorded — allowed or not — so the daily budget, cooldowns and audit trail
+    are always anchored. Approved candidates are claimed via ``reminders.claim``
+    before sending so a later scan cannot double-send the same event; a failed
+    send releases the claim so the next scan can retry. The candidate generator
+    only emits study blocks, so nothing fires during sleep/break/class.
+    """
+    try:
+        import execution_discipline
+        import coaching_policy
+        db_path = execution_discipline.DEFAULT_DB_PATH
+        now = session_context.local_now()
+        await sync.sync_once_locked(db_keys=("ledger",))
+        await asyncio.to_thread(execution_discipline.run_auto_skip, now, db_path)
+        candidates = await asyncio.to_thread(
+            lambda: (
+                execution_discipline.due_escalation_candidates(now, db_path)
+                + execution_discipline.evaluate_completion(now, db_path)
+            )
+        )
+        chat_id = telegram_allowed_user_id()
+        for candidate in candidates:
+            decision = coaching_policy.decide_notification(
+                kind=candidate["kind"],
+                now=now,
+                event_key=candidate["event_key"],
+                chat_id=chat_id,
+                db_path=db_path,
+                budget_per_day=30,
+            )
+            coaching_policy.record_decision(decision, db_path=db_path)
+            if not decision["allow"]:
+                continue
+            if not reminders.claim(candidate["event_key"], db_path=db_path):
+                continue
+            try:
+                text = execution_discipline.discipline_message(
+                    candidate["tier"], candidate["block"], db_path=db_path, now=now
+                )
+                await _send_markdown(context.bot, chat_id, text)
+            except Exception:
+                reminders.release(candidate["event_key"], db_path=db_path)
+                logger.exception(
+                    "execution discipline send failed for %s", candidate["event_key"]
+                )
+    except Exception:
+        logger.exception("execution discipline scan failed")
+
+
 async def _expire_drafts(context: ContextTypes.DEFAULT_TYPE) -> None:
     expired = await asyncio.to_thread(draft_store.expire_stale_drafts)
     for item in expired:
@@ -3965,6 +4059,15 @@ async def post_init(application: Application) -> None:
             first=180,
             name="coaching_proactive_scan",
         )
+        # Execution-discipline loop: block-level timetable enforcement. The
+        # candidate generator only emits study blocks, so nothing fires during
+        # sleep/break/class; policy gates quiet hours/cooldowns/budget.
+        application.job_queue.run_repeating(
+            _guard_scheduled(_execution_discipline_scan),
+            interval=60,
+            first=120,
+            name="execution_discipline_scan",
+        )
         application.job_queue.run_repeating(
             _guard_scheduled(_expire_drafts), interval=60, first=60, name="expire_drafts"
         )
@@ -4094,6 +4197,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_plan_callback, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_log_callback, pattern=r"^log:"))
     app.add_handler(CallbackQueryHandler(on_agent_callback, pattern=r"^agent:"))
+    app.add_handler(CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, catch_all))
     logger.info("Starting Telegram long polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
