@@ -30,7 +30,7 @@ At execution time, `/next` activates the next row. Log the block using the
 existing execution flow. The resulting Ledger row is linked to the Work Item;
 Telegram then offers `Plan complete` or `Carry to backlog`.
 
-## Execution discipline
+## Execution discipline + portal-first onboarding
 
 The bot enforces the daily JEE timetable at the block level. Each local date
 resolves to a fixed Coaching or Non-Coaching day template, and every study
@@ -39,6 +39,15 @@ inline buttons. If you never start, it pushes at +10 min, gives a tough coach
 talk at +20 min, and auto-skips at +25 min; if you start but don't log real
 work, it checks in after the block. Completion is only ever credited from a
 real Ledger entry — never inferred.
+
+Setup is portal-first: whatever the Narayana portal mirror already knows
+(classes, tests, syllabus, course) is auto-pulled into the setup hub, and you
+are only asked for the few things the portal can't give — gradually, one item
+per week. Two days before a coaching test, when the bot is confident it knows
+your situation, it proposes a focused 2-day plan and asks for confirmation
+before writing anything. And once you finish a chapter it tracked from
+activation, it proposes tagging it **mastery**, **revision** or **hard** —
+you confirm before the tag is saved.
 
 ## Commands
 
