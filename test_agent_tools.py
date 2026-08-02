@@ -480,3 +480,95 @@ def test_render_compact_discipline_empty_db(tmp_path):
     text = coaching_context.render_compact(db_path=db)
     assert "Current block" not in text
     assert "Today:" not in text
+
+
+# ---------------------------------------------------------------------------
+# Chapter classifications (todo 11): read tool + render_compact line + digest
+# ---------------------------------------------------------------------------
+
+def _classifications_db(tmp_path):
+    import sqlite3
+    import chapter_classification
+
+    path = tmp_path / "classifications.db"
+    with sqlite3.connect(path) as conn:
+        chapter_classification.init_db(conn)
+        conn.execute(
+            "INSERT INTO chapter_classifications "
+            "(chapter_key, subject, chapter, tag, accuracy_ratio, cognitive_yield, "
+            "evidence_count, reason, decided_at, status) VALUES "
+            "('a1', 'Physics', 'Kinematics', 'mastery', 0.7, 60, 3, 'solid accuracy', "
+            "'2026-07-01T10:00:00.000+00:00', 'confirmed')"
+        )
+        conn.execute(
+            "INSERT INTO chapter_classifications "
+            "(chapter_key, subject, chapter, tag, accuracy_ratio, cognitive_yield, "
+            "evidence_count, reason, decided_at, status) VALUES "
+            "('b2', 'Chemistry', 'Thermodynamics', 'revision', 0.45, 30, 2, 'weak yield', "
+            "'2026-07-02T10:00:00.000+00:00', 'proposed')"
+        )
+        conn.commit()
+    return path
+
+
+def test_get_chapter_classifications_read_tool(tmp_path):
+    db = _classifications_db(tmp_path)
+    out = agent_tools.execute_tool(
+        "get_chapter_classifications", {}, chat_id=1, db_path=db,
+    )
+    assert not out.get("error"), out
+    confirmed = out["confirmed"]
+    assert len(confirmed) == 1
+    assert confirmed[0]["subject"] == "Physics"
+    assert confirmed[0]["chapter"] == "Kinematics"
+    assert confirmed[0]["tag"] == "mastery"
+    assert confirmed[0]["accuracy_ratio"] == 0.7
+    assert confirmed[0]["cognitive_yield"] == 60
+    assert confirmed[0]["decided_at"].startswith("2026-07-01")
+    assert len(out["proposed"]) == 1
+    assert out["proposed"][0]["tag"] == "revision"
+    assert out["proposed"][0]["subject"] == "Chemistry"
+
+
+def test_get_chapter_classifications_empty_db(db):
+    out = agent_tools.execute_tool(
+        "get_chapter_classifications", {}, chat_id=1, db_path=db,
+    )
+    assert not out.get("error"), out
+    assert out["confirmed"] == []
+    assert out["proposed"] == []
+
+
+def test_chapter_classifications_in_spec_and_registry():
+    spec_names = {s["name"] for s in agent_tools.TOOL_SPECS}
+    assert "get_chapter_classifications" in agent_tools.READ_TOOLS
+    assert "get_chapter_classifications" in spec_names
+    spec = next(
+        s for s in agent_tools.TOOL_SPECS if s["name"] == "get_chapter_classifications"
+    )
+    assert spec["parameters"]["type"] == "object"
+
+
+def test_render_compact_chapter_status_line(tmp_path):
+    import coaching_context
+    db = _classifications_db(tmp_path)
+    text = coaching_context.render_compact(db_path=db)
+    assert "Chapter status:" in text
+    assert "Physics Kinematics = mastery" in text
+    assert "Thermodynamics" not in text  # proposed rows are not in the status line
+
+
+def test_render_compact_no_chapter_line_empty_db(tmp_path):
+    import sqlite3
+    import coaching_context
+    db = tmp_path / "empty.db"
+    sqlite3.connect(db).close()
+    text = coaching_context.render_compact(db_path=db)
+    assert "Chapter status:" not in text
+
+
+def test_schema_digest_includes_classifications(tmp_path):
+    import sql_tool
+    db = _classifications_db(tmp_path)
+    digest = sql_tool.schema_digest(db_path=db)
+    assert "chapter_classifications" in digest

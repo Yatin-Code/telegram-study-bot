@@ -687,7 +687,7 @@ READ_TOOLS = frozenset({
     "get_coaching_snapshot", "get_upcoming_syllabus", "get_next_class",
     "get_plan_suggestions", "get_chapter_progress", "get_next_doubt",
     "get_doubt_interaction", "get_score_prediction", "get_backlog_status",
-    "get_today_blocks", "get_current_block",
+    "get_today_blocks", "get_current_block", "get_chapter_classifications",
 })
 
 
@@ -858,6 +858,16 @@ TOOL_SPECS = [
                 "limit": {"type": "integer", "description": "How many upcoming tests to include (default 5)"},
             },
         },
+    },
+    {
+        "name": "get_chapter_classifications",
+        "description": (
+            "Read the confirmed chapter classifications (mastery/revision/hard) "
+            "with the per-chapter accuracy ratio and cognitive yield that drove "
+            "each tag, plus any still-pending proposals. Use for 'which chapters "
+            "are done and how did I do on them'. Read-only; nothing is written."
+        ),
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": "get_next_doubt",
@@ -1331,6 +1341,51 @@ def _run_get_current_block(chat_id: int | str, db_path: str | Path) -> dict[str,
     return result
 
 
+def _run_get_chapter_classifications(chat_id: int | str, db_path: str | Path) -> dict[str, Any]:
+    """Confirmed/proposed chapter tags (mastery/revision/hard) — read-only.
+
+    Returns only subject/chapter/tag/metrics/decided_at — never the raw
+    payloads. An empty or missing table yields empty lists, never an error.
+    """
+    import chapter_classification
+    confirmed: list[dict[str, Any]] = []
+    proposed: list[dict[str, Any]] = []
+    try:
+        if not Path(db_path).exists():
+            return {
+                "confirmed": confirmed,
+                "proposed": proposed,
+                "generated_with": "deterministic",
+            }
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            table = chapter_classification.CLASSIFICATIONS_TABLE
+            rows = conn.execute(
+                f"SELECT subject, chapter, tag, accuracy_ratio, cognitive_yield, "
+                f"decided_at, status FROM {table} ORDER BY decided_at"
+            ).fetchall()
+        for row in rows:
+            entry = {
+                "subject": row["subject"],
+                "chapter": row["chapter"],
+                "tag": row["tag"],
+                "accuracy_ratio": row["accuracy_ratio"],
+                "cognitive_yield": row["cognitive_yield"],
+                "decided_at": row["decided_at"],
+            }
+            if row["status"] == "confirmed":
+                confirmed.append(entry)
+            elif row["status"] == "proposed":
+                proposed.append(entry)
+    except sqlite3.Error:
+        pass
+    return {
+        "confirmed": confirmed,
+        "proposed": proposed,
+        "generated_with": "deterministic",
+    }
+
+
 def execute_tool(
     name: str,
     arguments: dict[str, Any],
@@ -1537,6 +1592,8 @@ def execute_tool(
             return _run_get_today_blocks(chat_id, db_path)
         if name == "get_current_block":
             return _run_get_current_block(chat_id, db_path)
+        if name == "get_chapter_classifications":
+            return _run_get_chapter_classifications(chat_id, db_path)
         if name in WRITE_TOOLS:
             return {
                 "error": True,

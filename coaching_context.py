@@ -182,6 +182,33 @@ def _discipline_lines(*, db_path: str | Path) -> list[str]:
     return lines
 
 
+def _chapter_status_line(*, db_path: str | Path) -> list[str]:
+    """One compact line for confirmed chapter classifications (capped at 3).
+
+    Omitted gracefully (no line, no exception) when the classification tables
+    are empty or any lookup fails.
+    """
+    lines: list[str] = []
+    try:
+        import sqlite3
+        import chapter_classification
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT subject, chapter, tag "
+                f"FROM {chapter_classification.CLASSIFICATIONS_TABLE} "
+                "WHERE status='confirmed' ORDER BY decided_at LIMIT 3"
+            ).fetchall()
+        if rows:
+            parts = ", ".join(
+                f"{r['subject']} {r['chapter']} = {r['tag']}" for r in rows
+            )
+            lines.append(f"- Chapter status: {parts}")
+    except Exception:
+        pass
+    return lines
+
+
 def render_compact(
     chat_id: int | None = None, *, user_text: str = "",
     db_path: str | Path = DEFAULT_DB_PATH,
@@ -275,4 +302,5 @@ def render_compact(
     lines.extend(_escalation_line(db_path=db_path))
     lines.extend(_freshness_line(db_path=db_path))
     lines.extend(_discipline_lines(db_path=db_path))
+    lines.extend(_chapter_status_line(db_path=db_path))
     return _redact("\n".join(lines))
