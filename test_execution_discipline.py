@@ -431,3 +431,119 @@ def test_current_block_non_coaching_day(db):
     assert block is not None
     assert block["title"] == "Revision Block (Notion Backlog)"
     assert block["day_type"] == "non_coaching"
+
+
+# ---------------------------------------------------------------------------
+# Block confirmation state machine
+# ---------------------------------------------------------------------------
+
+def test_get_state_none_when_no_row(db):
+    ed.seed_templates(db)
+    assert ed.get_state("2026-08-05", "coach_b02_exec_a", db) is None
+
+
+def test_confirm_start_pending_to_started_once(db):
+    ed.seed_templates(db)
+    row = ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    assert row["status"] == "started"
+    assert row["started_at"]
+    assert row["template_key"] == ed.COACHING_TEMPLATE_KEY
+    first_started_at = row["started_at"]
+    again = ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    assert again["status"] == "started"
+    assert again["started_at"] == first_started_at
+
+
+def test_confirm_skip_from_pending_and_from_started(db):
+    ed.seed_templates(db)
+    pending_skip = ed.confirm_skip("2026-08-05", "coach_b02_exec_a", db)
+    assert pending_skip["status"] == "skipped"
+    assert pending_skip["skipped_at"]
+    started = ed.confirm_start("2026-08-05", "coach_b03_break", db)
+    assert started["status"] == "started"
+    started_skip = ed.confirm_skip("2026-08-05", "coach_b03_break", db)
+    assert started_skip["status"] == "skipped"
+    assert started_skip["skipped_at"]
+
+
+def test_confirm_skip_after_completed_is_noop(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    ed.mark_completed("2026-08-05", "coach_b02_exec_a", db)
+    after = ed.confirm_skip("2026-08-05", "coach_b02_exec_a", db)
+    assert after["status"] == "completed"
+    assert after["skipped_at"] is None
+
+
+def test_mark_completed_only_from_started(db):
+    ed.seed_templates(db)
+    conn = ed._connect(db)
+    try:
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status) "
+            "VALUES ('2026-08-05', 'coach_b02_exec_a', ?, 'pending')",
+            (ed.COACHING_TEMPLATE_KEY,),
+        )
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status) "
+            "VALUES ('2026-08-05', 'coach_b03_break', ?, 'skipped')",
+            (ed.COACHING_TEMPLATE_KEY,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    pending = ed.mark_completed("2026-08-05", "coach_b02_exec_a", db)
+    assert pending["status"] == "pending"
+    skipped = ed.mark_completed("2026-08-05", "coach_b03_break", db)
+    assert skipped["status"] == "skipped"
+    ed.confirm_start("2026-08-05", "coach_b04_exec_b", db)
+    done = ed.mark_completed("2026-08-05", "coach_b04_exec_b", db)
+    assert done["status"] == "completed"
+    assert done["completed_at"]
+
+
+def test_mark_completed_no_row_returns_none(db):
+    ed.seed_templates(db)
+    assert ed.mark_completed("2026-08-05", "coach_b02_exec_a", db) is None
+
+
+def test_confirmations_pk_unique(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    conn = ed._connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+                "(local_date, block_key, template_key, status) "
+                "VALUES ('2026-08-05', 'coach_b02_exec_a', 'x', 'pending')"
+            )
+    finally:
+        conn.close()
+
+
+def test_unknown_block_key_is_noop(db):
+    ed.seed_templates(db)
+    assert ed.get_state("2099-01-01", "nope", db) is None
+    assert ed.confirm_start("2099-01-01", "nope", db) is None
+    assert ed.confirm_skip("2099-01-01", "nope", db) is None
+    assert ed.mark_completed("2099-01-01", "nope", db) is None
+
+
+def test_full_lifecycle_leaves_one_completed_row(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    ed.mark_completed("2026-08-05", "coach_b02_exec_a", db)
+    ed.confirm_skip("2026-08-05", "coach_b02_exec_a", db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT * FROM {ed.CONFIRMATIONS_TABLE} "
+            f"WHERE local_date='2026-08-05' AND block_key='coach_b02_exec_a'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["completed_at"]

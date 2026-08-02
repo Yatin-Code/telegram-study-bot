@@ -335,3 +335,138 @@ def current_block(now_aware_local: dt.datetime, db_path: str | Path = DEFAULT_DB
         if contains(block):
             return block
     return None
+
+
+# ---------------------------------------------------------------------------
+# Block confirmation state machine
+# ---------------------------------------------------------------------------
+
+def _block_template_key(conn: sqlite3.Connection, block_key: str) -> str | None:
+    """The block's template_key, or None when block_key is unknown."""
+    row = conn.execute(
+        f"SELECT template_key FROM {BLOCKS_TABLE} WHERE block_key = ?",
+        (block_key,),
+    ).fetchone()
+    return row["template_key"] if row is not None else None
+
+
+def get_state(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """The confirmation row for (date, block) as a dict, or None when absent.
+
+    No row is not an error, and an unknown block_key also yields None here.
+    """
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            f"SELECT local_date, block_key, template_key, status, started_at, "
+            f"skipped_at, completed_at FROM {CONFIRMATIONS_TABLE} "
+            f"WHERE local_date = ? AND block_key = ?",
+            (date_iso[:10], block_key),
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def confirm_start(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """Transition a block to 'started' (pending → started, started_at=now).
+
+    Inserts a new started row when none exists. From started/skipped/completed
+    this is a no-op returning the current row unchanged (started_at is never
+    rewritten and a finished block is never resurrected). None for an unknown
+    block_key (never raises).
+    """
+    conn = _connect(db_path)
+    try:
+        template_key = _block_template_key(conn, block_key)
+        if template_key is None:
+            return None
+        local_date = date_iso[:10]
+        row = conn.execute(
+            f"SELECT * FROM {CONFIRMATIONS_TABLE} WHERE local_date=? AND block_key=?",
+            (local_date, block_key),
+        ).fetchone()
+        now = session_context.local_now().isoformat()
+        if row is None:
+            conn.execute(
+                f"INSERT INTO {CONFIRMATIONS_TABLE} "
+                "(local_date, block_key, template_key, status, started_at) "
+                "VALUES (?, ?, ?, 'started', ?)",
+                (local_date, block_key, template_key, now),
+            )
+        elif row["status"] == "pending":
+            conn.execute(
+                f"UPDATE {CONFIRMATIONS_TABLE} SET status='started', started_at=? "
+                f"WHERE local_date=? AND block_key=?",
+                (now, local_date, block_key),
+            )
+        conn.commit()
+        return get_state(local_date, block_key, db_path=db_path)
+    finally:
+        conn.close()
+
+
+def confirm_skip(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """Transition a block to 'skipped' (pending OR started → skipped).
+
+    Auto-skip (todo 4) relies on started → skipped being allowed. Inserts a new
+    skipped row when none exists; once already skipped/completed this is a
+    no-op returning the current row. None for an unknown block_key.
+    """
+    conn = _connect(db_path)
+    try:
+        template_key = _block_template_key(conn, block_key)
+        if template_key is None:
+            return None
+        local_date = date_iso[:10]
+        row = conn.execute(
+            f"SELECT * FROM {CONFIRMATIONS_TABLE} WHERE local_date=? AND block_key=?",
+            (local_date, block_key),
+        ).fetchone()
+        now = session_context.local_now().isoformat()
+        if row is None:
+            conn.execute(
+                f"INSERT INTO {CONFIRMATIONS_TABLE} "
+                "(local_date, block_key, template_key, status, skipped_at) "
+                "VALUES (?, ?, ?, 'skipped', ?)",
+                (local_date, block_key, template_key, now),
+            )
+        elif row["status"] in ("pending", "started"):
+            conn.execute(
+                f"UPDATE {CONFIRMATIONS_TABLE} SET status='skipped', skipped_at=? "
+                f"WHERE local_date=? AND block_key=?",
+                (now, local_date, block_key),
+            )
+        conn.commit()
+        return get_state(local_date, block_key, db_path=db_path)
+    finally:
+        conn.close()
+
+
+def mark_completed(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """Mark a block 'completed' (started → completed, completed_at=now).
+
+    ONLY from started: from pending/skipped/completed this is a no-op returning
+    the current row, and with no existing row it returns None — a completion is
+    never invented. None for an unknown block_key.
+    """
+    conn = _connect(db_path)
+    try:
+        template_key = _block_template_key(conn, block_key)
+        if template_key is None:
+            return None
+        local_date = date_iso[:10]
+        row = conn.execute(
+            f"SELECT * FROM {CONFIRMATIONS_TABLE} WHERE local_date=? AND block_key=?",
+            (local_date, block_key),
+        ).fetchone()
+        if row is not None and row["status"] == "started":
+            conn.execute(
+                f"UPDATE {CONFIRMATIONS_TABLE} SET status='completed', completed_at=? "
+                f"WHERE local_date=? AND block_key=?",
+                (session_context.local_now().isoformat(), local_date, block_key),
+            )
+            conn.commit()
+        return get_state(local_date, block_key, db_path=db_path)
+    finally:
+        conn.close()
