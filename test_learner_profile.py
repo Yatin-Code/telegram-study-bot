@@ -65,7 +65,11 @@ def seeded_profile_db(tmp_path):
     return db
 
 
-def test_profile_derives_only_evidence_backed_comparisons(tmp_path):
+def test_profile_derives_only_evidence_backed_comparisons(tmp_path, monkeypatch):
+    # The seeded ledger rows carry explicit +05:30 (IST) offsets and the
+    # assertions expect IST window semantics (Chem 18:30 -> "evening"). Pin the
+    # user timezone to IST so the test is deterministic in ANY CI timezone.
+    monkeypatch.setattr(learner_profile.settings, "user_timezone", lambda: "Asia/Kolkata")
     db = seeded_profile_db(tmp_path)
     profile = learner_profile.derive(42, as_of="2026-07-22", db_path=db)
     assert profile["weakest_subject"]["subject"] == "Physics"
@@ -89,7 +93,8 @@ def test_profile_save_is_stable_when_only_derived_timestamp_changes(tmp_path):
     assert learner_profile.latest(42, db_path=db)["as_of_date"] == "2026-07-22"
 
 
-def test_nightly_insights_are_new_deduplicated_and_evidence_linked(tmp_path):
+def test_nightly_insights_are_new_deduplicated_and_evidence_linked(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_profile.settings, "user_timezone", lambda: "Asia/Kolkata")
     db = seeded_profile_db(tmp_path)
     first = learner_profile.nightly_insight(
         42, as_of="2026-07-22", use_llm=False, db_path=db

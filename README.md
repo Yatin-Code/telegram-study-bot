@@ -30,6 +30,16 @@ At execution time, `/next` activates the next row. Log the block using the
 existing execution flow. The resulting Ledger row is linked to the Work Item;
 Telegram then offers `Plan complete` or `Carry to backlog`.
 
+## Execution discipline
+
+The bot enforces the daily JEE timetable at the block level. Each local date
+resolves to a fixed Coaching or Non-Coaching day template, and every study
+block is nudged with a "Time to start" message carrying **Started** / **Skip**
+inline buttons. If you never start, it pushes at +10 min, gives a tough coach
+talk at +20 min, and auto-skips at +25 min; if you start but don't log real
+work, it checks in after the block. Completion is only ever credited from a
+real Ledger entry — never inferred.
+
 ## Commands
 
 - `/goal 300 CY every day` or `/goal Physics PYQs for 2 hours daily`

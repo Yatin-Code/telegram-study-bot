@@ -577,8 +577,95 @@ def test_discipline_callback_skip_records_skipped(db, monkeypatch):
     assert edits and "skipped" in edits[0]
 
 
+def _seed_coaching_day(db):
+    """Seed templates + a real coaching day via the actual resolution path.
+
+    A coaching class for the date plus a SUCCESS coaching_sync_runs row whose
+    finished_at is recent enough that ``coaching_lifecycle.fresh`` is True, so
+    ``day_type_for`` resolves to 'coaching' from real data (not a direct row).
+    """
+    ed.seed_templates(db_path=db)
+    ntsc_coaching.replace_classes([{
+        "classDate": "2026-08-02", "startTime": "09:00", "duration": 60,
+        "classType": "Regular Class", "subjects": "Physics",
+    }], db_path=db)
+    with _conn(db) as conn:
+        conn.execute(
+            "INSERT INTO coaching_sync_runs (started_at,finished_at,status,datasets,error) "
+            "VALUES (?,?,?,?,?)",
+            ("2026-08-02T07:30:00+00:00", "2026-08-02T08:00:00+00:00", "success",
+             '["profile","classes","tests","results"]', None),
+        )
+        for key in ("ledger", "doubts", "revision"):
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_meta "
+                "(db_key,last_started_at,last_completed_at,last_row_count,last_error) "
+                "VALUES (?,?,?,?,?)",
+                (key, "2026-08-02T12:00:00+00:00", "2026-08-02T12:14:00+00:00", 5, None),
+            )
+        conn.commit()
+
+
+def test_full_day_drive(db, monkeypatch):
+    """Drive a fake clock through a full coaching day across three study blocks.
+
+    Covers every discipline path end to end: start-once, confirm via the
+    callback, ledger-evidenced auto-completion, the C1 guard (a started block
+    with no ledger row yields exactly ONE check-in candidate, claimed once),
+    and the unconfirmed escalation ladder (push -> shame -> pending-only
+    auto-skip). All offline; _llm_complete and sync_once_locked are stubbed.
+    """
+    _seed_coaching_day(db)
+    assert ed.day_type_for("2026-08-02", db_path=db) == "coaching"
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+
+    # --- Block A (08:30-10:00): start once -> confirm -> ledger -> complete.
+    sent = asyncio.run(_run_discipline_scan(db, _at(8, 31), monkeypatch))
+    assert len(sent) == 1
+    assert sent[0][1] == "coach text"
+    edits = []
+    query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(
+        types.SimpleNamespace(callback_query=query), types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
+    insert(db, "ledger", notion_page_id="cached-a",
+           created_time="2026-08-02T09:00:00.000+00:00")
+    sent = asyncio.run(_run_discipline_scan(db, _at(10, 15), monkeypatch))
+    assert sent == []
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "completed"
+
+    # --- Block B (10:30-12:00): started, no ledger -> checkin claimed once.
+    query = _fake_query("discipline:start:2026-08-02:coach_b04_exec_b", edits)
+    asyncio.run(bot.on_discipline_callback(
+        types.SimpleNamespace(callback_query=query), types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b04_exec_b", db)["status"] == "started"
+
+    # --- Acquisition Block (12:00-14:00): unconfirmed escalation ladder.
+    sent = asyncio.run(_run_discipline_scan(db, _at(12, 1), monkeypatch))
+    assert len(sent) == 1
+    sent = asyncio.run(_run_discipline_scan(db, _at(12, 11), monkeypatch))
+    assert len(sent) == 1
+    # Block B checkin is due at 12:15 (15 min after its 12:00 end); the
+    # Acquisition start/push are already claimed, so exactly the checkin sends.
+    sent = asyncio.run(_run_discipline_scan(db, _at(12, 15), monkeypatch))
+    assert len(sent) == 1
+    assert sent[0][1] == "coach text"
+    sent = asyncio.run(_run_discipline_scan(db, _at(12, 16), monkeypatch))
+    assert sent == []
+    sent = asyncio.run(_run_discipline_scan(db, _at(12, 21), monkeypatch))
+    assert len(sent) == 1
+    sent = asyncio.run(_run_discipline_scan(db, _at(12, 26), monkeypatch))
+    assert sent == []
+    assert ed.get_state("2026-08-02", "coach_b05_acquisition", db)["status"] == "skipped"
+
+    # --- Final block_confirmations state rows.
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "completed"
+    assert ed.get_state("2026-08-02", "coach_b04_exec_b", db)["status"] == "started"
+    assert ed.get_state("2026-08-02", "coach_b05_acquisition", db)["status"] == "skipped"
+
+
 # ---------------------------------------------------------------------------
-# Startup registration smoke test (todo 8): source-inspection, offline
+# Startup registration smoke test (todo 8): source-only, offline
 # ---------------------------------------------------------------------------
 
 _BOT_SOURCE = Path(bot.__file__).read_text(encoding="utf-8")
