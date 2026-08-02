@@ -1386,6 +1386,53 @@ def weak_points(*, db_path: str | Path = DEFAULT_DB_PATH) -> list[dict[str, Any]
     return sorted(result, key=lambda row: (-row["score"], row["chapter"]))
 
 
+def chapter_metrics(
+    subject: str | None = None,
+    chapter: str | None = None,
+    *,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> list[dict[str, Any]]:
+    """Per-chapter accuracy + cognitive-yield aggregation over the ledger.
+
+    Groups non-archived ledger rows by (subject, chapter_text), skipping rows
+    whose chapter_text is NULL/empty. ``subject``/``chapter`` optionally filter
+    to a single group. Read-only; a missing ledger table yields [] (never
+    raises) — the same OperationalError guard as
+    execution_discipline.has_ledger_evidence.
+    """
+    clauses = ["archived = 0", "NULLIF(TRIM(COALESCE(chapter_text, '')), '') IS NOT NULL"]
+    params: list[Any] = []
+    if subject is not None:
+        clauses.append("subject = ?")
+        params.append(subject)
+    if chapter is not None:
+        clauses.append("chapter_text = ?")
+        params.append(chapter)
+    where = " AND ".join(clauses)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(f"""
+            SELECT subject, chapter_text,
+                   COUNT(*) AS sessions,
+                   ROUND(AVG(accuracy_ratio), 3) AS avg_accuracy,
+                   ROUND(SUM(cognitive_yield), 1) AS total_cy,
+                   ROUND(AVG(cognitive_yield), 1) AS avg_cy,
+                   MIN(date) AS first_date,
+                   MAX(date) AS last_date,
+                   SUM(actual_time_min) AS total_minutes
+            FROM ledger
+            WHERE {where}
+            GROUP BY subject, chapter_text
+            ORDER BY subject, chapter_text
+        """, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
 def weekly_report(*, end_date: str | None = None, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
     end = dt.date.fromisoformat((end_date or session_context.local_today_iso())[:10])
     start = end - dt.timedelta(days=6)

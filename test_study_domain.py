@@ -724,3 +724,137 @@ def test_weak_points_merge_multiple_evidence_sources(db):
     assert row["chapter"] == "Rotation"
     assert row["mistakes"] == 1 and row["unresolved_doubts"] == 1 and row["blocks"] == 2
     assert row["confidence"] == "medium"
+
+
+# --- todo 9: chapter_metrics (per-chapter accuracy + cognitive-yield) ---
+
+def test_ledger_schema_supports_chapter_metrics_columns(db):
+    """Baseline: the ledger table carries every column the planned
+    chapter_metrics query reads (subject, chapter_text, accuracy_ratio,
+    cognitive_yield, date, actual_time_min, archived)."""
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(ledger)").fetchall()}
+    assert {
+        "subject", "chapter_text", "accuracy_ratio", "cognitive_yield",
+        "date", "actual_time_min", "archived",
+    } <= cols
+
+
+def test_weak_points_shape_unchanged_on_seeded_ledger(db):
+    """Baseline: weak_points keeps its current per-chapter ledger merge shape
+    (chapter/blocks/avg_accuracy/score/confidence) on a seeded ledger."""
+    insert(db, "ledger", notion_page_id="w1", task="Rot", chapter_text="Rotation",
+           date="2026-07-20", actual_time_min=45, questions_attempted=10,
+           questions_correct=5, cognitive_yield=20, accuracy_ratio=0.5)
+    insert(db, "ledger", notion_page_id="w2", task="Rot 2", chapter_text="Rotation",
+           date="2026-07-20", actual_time_min=45, questions_attempted=10,
+           questions_correct=6, cognitive_yield=25, accuracy_ratio=0.6)
+    rows = sd.weak_points(db_path=db)
+    assert len(rows) == 1
+    row = rows[0]
+    assert set(row) >= {"chapter", "mistakes", "marks_lost", "exams",
+                        "unresolved_doubts", "blocks", "avg_accuracy",
+                        "score", "confidence"}
+    assert row["chapter"] == "Rotation"
+    assert row["blocks"] == 2
+    assert row["avg_accuracy"] == pytest.approx(0.55)
+    assert row["confidence"] == "low"
+
+
+def test_chapter_metrics_aggregates_accuracy_and_cy(db):
+    """3 Kinematics rows (accuracy .5/.7/.9, CY 40/60/80) aggregate to one row."""
+    insert(db, "ledger", notion_page_id="k1", task="K1", subject="Physics",
+           chapter_text="Kinematics", date="2026-07-18", actual_time_min=30,
+           questions_attempted=10, questions_correct=5, cognitive_yield=40,
+           accuracy_ratio=0.5)
+    insert(db, "ledger", notion_page_id="k2", task="K2", subject="Physics",
+           chapter_text="Kinematics", date="2026-07-19", actual_time_min=40,
+           questions_attempted=10, questions_correct=7, cognitive_yield=60,
+           accuracy_ratio=0.7)
+    insert(db, "ledger", notion_page_id="k3", task="K3", subject="Physics",
+           chapter_text="Kinematics", date="2026-07-20", actual_time_min=50,
+           questions_attempted=10, questions_correct=9, cognitive_yield=80,
+           accuracy_ratio=0.9)
+    rows = sd.chapter_metrics(subject="Physics", chapter="Kinematics", db_path=db)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["subject"] == "Physics"
+    assert row["chapter_text"] == "Kinematics"
+    assert row["sessions"] == 3
+    assert row["avg_accuracy"] == pytest.approx(0.7)
+    assert row["avg_cy"] == pytest.approx(60)
+    assert row["total_cy"] == pytest.approx(180)
+    assert row["first_date"] == "2026-07-18"
+    assert row["last_date"] == "2026-07-20"
+    assert row["total_minutes"] == pytest.approx(120)
+
+
+def test_chapter_metrics_excludes_archived_rows(db):
+    insert(db, "ledger", notion_page_id="a1", subject="Physics", chapter_text="Kinematics",
+           date="2026-07-18", actual_time_min=30, questions_attempted=10,
+           questions_correct=5, cognitive_yield=40, accuracy_ratio=0.5)
+    insert(db, "ledger", notion_page_id="a2", subject="Physics", chapter_text="Kinematics",
+           date="2026-07-19", actual_time_min=40, questions_attempted=10,
+           questions_correct=9, cognitive_yield=80, accuracy_ratio=0.9, archived=1)
+    rows = sd.chapter_metrics(subject="Physics", chapter="Kinematics", db_path=db)
+    assert len(rows) == 1
+    assert rows[0]["sessions"] == 1
+    assert rows[0]["avg_accuracy"] == pytest.approx(0.5)
+
+
+def test_chapter_metrics_no_args_returns_all_subjects(db):
+    insert(db, "ledger", notion_page_id="m1", subject="Physics", chapter_text="Kinematics",
+           date="2026-07-18", actual_time_min=30, questions_attempted=10,
+           questions_correct=5, cognitive_yield=40, accuracy_ratio=0.5)
+    insert(db, "ledger", notion_page_id="m2", subject="Chemistry", chapter_text="Mole Concept",
+           date="2026-07-19", actual_time_min=40, questions_attempted=10,
+           questions_correct=6, cognitive_yield=60, accuracy_ratio=0.6)
+    rows = sd.chapter_metrics(db_path=db)
+    by_key = {(r["subject"], r["chapter_text"]): r for r in rows}
+    assert set(by_key) == {("Physics", "Kinematics"), ("Chemistry", "Mole Concept")}
+    assert by_key[("Physics", "Kinematics")]["sessions"] == 1
+    assert by_key[("Chemistry", "Mole Concept")]["sessions"] == 1
+
+
+def test_chapter_metrics_filters_by_subject_only(db):
+    insert(db, "ledger", notion_page_id="f1", subject="Physics", chapter_text="Kinematics",
+           date="2026-07-18", actual_time_min=30, questions_attempted=10,
+           questions_correct=5, cognitive_yield=40, accuracy_ratio=0.5)
+    insert(db, "ledger", notion_page_id="f2", subject="Chemistry", chapter_text="Mole Concept",
+           date="2026-07-19", actual_time_min=40, questions_attempted=10,
+           questions_correct=6, cognitive_yield=60, accuracy_ratio=0.6)
+    rows = sd.chapter_metrics(subject="Physics", db_path=db)
+    assert len(rows) == 1
+    assert rows[0]["subject"] == "Physics"
+    assert rows[0]["chapter_text"] == "Kinematics"
+
+
+def test_chapter_metrics_empty_ledger_table_returns_empty_list(db):
+    """An existing but empty ledger table aggregates to [] (no exception)."""
+    assert sd.chapter_metrics(db_path=db) == []
+
+
+def test_chapter_metrics_missing_ledger_table_returns_empty_list(tmp_path):
+    """A db with no ledger table at all returns [] (OperationalError guard)."""
+    path = tmp_path / "empty.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    assert sd.chapter_metrics(db_path=path) == []
+    assert sd.chapter_metrics(subject="Physics", db_path=path) == []
+
+
+def test_chapter_metrics_skips_empty_chapter_text(db):
+    insert(db, "ledger", notion_page_id="e1", subject="Physics", chapter_text="Kinematics",
+           date="2026-07-18", actual_time_min=30, questions_attempted=10,
+           questions_correct=5, cognitive_yield=40, accuracy_ratio=0.5)
+    insert(db, "ledger", notion_page_id="e2", subject="Physics", chapter_text="",
+           date="2026-07-19", actual_time_min=40, questions_attempted=10,
+           questions_correct=6, cognitive_yield=60, accuracy_ratio=0.6)
+    insert(db, "ledger", notion_page_id="e3", subject="Physics", chapter_text=None,
+           date="2026-07-20", actual_time_min=50, questions_attempted=10,
+           questions_correct=7, cognitive_yield=70, accuracy_ratio=0.7)
+    rows = sd.chapter_metrics(db_path=db)
+    assert len(rows) == 1
+    assert rows[0]["chapter_text"] == "Kinematics"
+    assert rows[0]["sessions"] == 1
