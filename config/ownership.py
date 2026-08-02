@@ -39,6 +39,10 @@ LOCAL_SQL_TABLES: tuple[str, ...] = (
     "chat_context",
     "commitment_checks",
     "op_execution_links",
+    "execution_templates",
+    "execution_blocks",
+    "block_confirmations",
+    "execution_day_types",
 )
 
 NOTION_OWNED_LABELS: dict[str, str] = {
