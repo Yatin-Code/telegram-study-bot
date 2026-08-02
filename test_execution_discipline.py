@@ -716,6 +716,54 @@ def test_discipline_message_never_raises(db, monkeypatch):
     assert text
 
 
+def test_discipline_message_checkin_prompt_says_ended_exact(db, monkeypatch):
+    """C2: the checkin system prompt explicitly says the block just ended.
+
+    Baseline characterization flipped by the fix: before C2 the prompt was
+    generic across tiers (never said \"ended\"), which let the real LLM write
+    \"Execution Block B (10:30-12:00) starts now\" for a checkin.
+    """
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+    captured = {}
+
+    def fake(messages):
+        captured["system"] = messages[0]["content"]
+        return "custom text"
+
+    monkeypatch.setattr(ed, "_llm_complete", fake)
+    ed.discipline_message("checkin", block, db_path=db)
+    assert "strict-but-caring study coach" in captured["system"]
+    assert "This block just ended." in captured["system"]
+    assert "Ask whether they finished it" in captured["system"]
+
+
+def test_discipline_message_checkin_prompt_says_ended(db, monkeypatch):
+    """C2: checkin prompt says the block just ended and asks if they finished.
+
+    start/push/shame prompts keep the generic wording and never mention the
+    block having ended.
+    """
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+    prompts = {}
+
+    def fake(messages):
+        prompts["current"] = messages[0]["content"]
+        return "custom text"
+
+    monkeypatch.setattr(ed, "_llm_complete", fake)
+    for tier in ("start", "push", "shame", "checkin"):
+        ed.discipline_message(tier, block, db_path=db)
+        prompts[tier] = prompts.pop("current")
+    checkin = prompts["checkin"]
+    assert "ended" in checkin
+    assert "finish" in checkin
+    assert "starts now" not in checkin
+    for tier in ("start", "push", "shame"):
+        assert "just ended" not in prompts[tier]
+
+
 # ---------------------------------------------------------------------------
 # Post-block check-in (ledger evidence + regenerating checkin candidate)
 # ---------------------------------------------------------------------------

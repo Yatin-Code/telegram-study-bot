@@ -841,9 +841,14 @@ def discipline_message(
         system = (
             "You are the strict-but-caring study coach of a JEE aspirant. "
             f"Write a SHORT (<220 chars) Telegram message for tier {tier} about this block. "
-            "Use ONLY these facts; never invent marks, dates, ranks, AIR, or promises.\n"
-            + json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+            "Use ONLY these facts; never invent marks, dates, ranks, AIR, or promises."
         )
+        if tier == "checkin":
+            system += (
+                " This block just ended. Ask whether they finished it (log it) or tell you "
+                "what they did instead. Never imply the block is upcoming or starting now."
+            )
+        system += "\n" + json.dumps(redacted, ensure_ascii=False, sort_keys=True)
         messages = [
             {"role": "system", "content": system},
             {
