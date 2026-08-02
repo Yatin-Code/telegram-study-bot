@@ -1123,6 +1123,183 @@ def test_catch_all_first_run_hint_still_works_and_invokes_check(db, monkeypatch)
     assert "I don't know anything yet" in sent[0][1]
 
 
+# ---------------------------------------------------------------------------
+# C5 weekly gap-filling scan (todo 6): baseline characterization + new behavior
+# ---------------------------------------------------------------------------
+
+GAP_DAY = "2026-08-02"          # Sunday (weekday 6) = the weekly-report weekday
+GAP_WEEKDAY = 6
+
+
+def _gap_status(*, chapters_missing=(), commitments_ok=True, optional_missing=()):
+    """Deterministic onboarding.status() dict for the gap-scan tests.
+
+    ``backlog`` is reported ok regardless of the DB — the scan re-checks the DB
+    itself (0 Backlog/Inbox work items AND 0 ledger rows). ``optional_missing``
+    marks the never-re-asked sections (next_mock, capacity, rhythm, prefs,
+    portal) as not ok.
+    """
+    missing = set(optional_missing)
+    return {
+        "chapters": {
+            "ok": not chapters_missing,
+            "missing_subjects": list(chapters_missing),
+            "suggested_topics": {},
+        },
+        "backlog": {"ok": True, "detail": "0 item(s) tracked"},
+        "commitments": {
+            "ok": commitments_ok,
+            "detail": "2 daily commitment(s)" if commitments_ok else "none",
+        },
+        "next_mock": {"ok": "next_mock" not in missing, "detail": ""},
+        "capacity": {"ok": "capacity" not in missing, "detail": ""},
+        "rhythm": {"ok": "rhythm" not in missing, "detail": ""},
+        "prefs": {"ok": "prefs" not in missing, "detail": ""},
+        "portal": {"ok": "portal" not in missing, "detail": ""},
+    }
+
+
+def _claims(db):
+    with _conn(db) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT event_key FROM reminder_events ORDER BY event_key"
+        )]
+
+
+async def _run_weekly_gap_scan(db, monkeypatch, *, weekday=GAP_WEEKDAY, status=None):
+    sent = []
+
+    async def fake_send(_bot, chat_id, text, **_kw):
+        sent.append((chat_id, text, _kw.get("reply_markup")))
+
+    def _status(**kw):
+        return status
+
+    monkeypatch.setattr(bot, "_send_markdown", fake_send)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    monkeypatch.setattr(
+        bot.config_settings, "timetable_reminder_weekday", lambda: weekday
+    )
+    monkeypatch.setattr(bot.onboarding, "status", _status)
+    monkeypatch.setattr(bot.onboarding, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(
+        bot.onboarding, "chapters_prompt",
+        lambda **kw: "Which chapter are you currently on in Physics?",
+    )
+    context = types.SimpleNamespace(bot=types.SimpleNamespace())
+    await bot._weekly_gap_scan(context)
+    return sent
+
+
+def test_weekly_report_weekday_gate_pattern_exists():
+    """The weekly-report weekday gate pattern is shared by the weekly jobs
+    (timetable reminder + report) and the gap scan reuses it."""
+    assert "_weekly_timetable_reminder" in _BOT_SOURCE
+    assert "_weekly_report_job" in _BOT_SOURCE
+    assert "config_settings.timetable_reminder_weekday()" in _BOT_SOURCE
+
+
+def test_weekly_gap_weekday_missing_chapters_sends_one(db, monkeypatch):
+    """(a) On the configured weekday with chapters missing → exactly ONE
+    'I still need to know' message carrying an onb:sec:chapters button."""
+    sent = asyncio.run(_run_weekly_gap_scan(
+        db, monkeypatch, status=_gap_status(chapters_missing=["Physics"]),
+    ))
+    assert len(sent) == 1
+    assert "I still need to know" in sent[0][1]
+    assert "Current chapters" in sent[0][1]
+    data = _button_data(sent[0][2])
+    assert "onb:sec:chapters" in data
+
+
+def test_weekly_gap_second_call_same_week_sends_nothing(db, monkeypatch):
+    """(b) Claim-deduped per (section, week): a second scan the same week sends
+    nothing."""
+    kw = dict(status=_gap_status(chapters_missing=["Physics"]))
+    sent = asyncio.run(_run_weekly_gap_scan(db, monkeypatch, **kw))
+    assert len(sent) == 1
+    sent2 = asyncio.run(_run_weekly_gap_scan(db, monkeypatch, **kw))
+    assert sent2 == []
+
+
+def test_weekly_gap_non_weekday_sends_nothing(db, monkeypatch):
+    """(c) On any other weekday the scan sends nothing."""
+    other = (GAP_WEEKDAY + 1) % 7
+    sent = asyncio.run(_run_weekly_gap_scan(
+        db, monkeypatch, weekday=other,
+        status=_gap_status(chapters_missing=["Physics"]),
+    ))
+    assert sent == []
+
+
+def test_weekly_gap_backlog_empty_and_no_ledger_sends_backlog(db, monkeypatch):
+    """Backlog is picked when chapters are placed but there are 0 Backlog/Inbox
+    work items AND 0 ledger rows."""
+    sent = asyncio.run(_run_weekly_gap_scan(
+        db, monkeypatch, status=_gap_status(),
+    ))
+    assert len(sent) == 1
+    assert "I still need to know" in sent[0][1]
+    assert "Backlog" in sent[0][1]
+    data = _button_data(sent[0][2])
+    assert "onb:sec:backlog" in data
+
+
+def test_weekly_gap_commitments_missing_sends_commitments(db, monkeypatch):
+    """Commitments is picked when chapters + backlog are satisfied but there
+    are no active daily commitments."""
+    insert(db, "work_items", notion_page_id="w1", title="DPP backlog",
+           kind="Backlog", status="Backlog")
+    sent = asyncio.run(_run_weekly_gap_scan(
+        db, monkeypatch, status=_gap_status(commitments_ok=False),
+    ))
+    assert len(sent) == 1
+    assert "I still need to know" in sent[0][1]
+    assert "Daily commitments" in sent[0][1]
+    data = _button_data(sent[0][2])
+    assert "onb:sec:commitments" in data
+
+
+def test_weekly_gap_all_satisfied_claims_all_and_sends_nothing(db, monkeypatch):
+    """(d) Everything genuinely needed is satisfied → no message and the
+    onboarding-gap:all:{date} claim is recorded."""
+    insert(db, "work_items", notion_page_id="w1", title="DPP backlog",
+           kind="Backlog", status="Backlog")
+    sent = asyncio.run(_run_weekly_gap_scan(
+        db, monkeypatch, status=_gap_status(),
+    ))
+    assert sent == []
+    assert f"onboarding-gap:all:{GAP_DAY}" in _claims(db)
+
+
+def test_weekly_gap_optional_sections_never_send(db, monkeypatch):
+    """(e) Optional sections (next_mock/capacity/rhythm/prefs/portal) never
+    produce messages even when their status is not ok."""
+    insert(db, "work_items", notion_page_id="w1", title="DPP backlog",
+           kind="Backlog", status="Backlog")
+    sent = asyncio.run(_run_weekly_gap_scan(
+        db, monkeypatch,
+        status=_gap_status(optional_missing=["next_mock", "capacity", "rhythm",
+                                             "prefs", "portal"]),
+    ))
+    assert sent == []
+    assert f"onboarding-gap:all:{GAP_DAY}" in _claims(db)
+
+
+def test_weekly_gap_job_registered_in_post_init():
+    """The run_daily job is registered inside the job_queue guard with the
+    deterministic 09:30 clock across all weekdays (weekday gate is internal)."""
+    assert _BOT_SOURCE.count('name="weekly_gap_scan"') == 1
+    assert _BOT_SOURCE.count("_guard_scheduled(_weekly_gap_scan)") == 1
+    assert (
+        'run_daily(\n            _guard_scheduled(_weekly_gap_scan), time=_clock("09:30"),'
+        in _BOT_SOURCE
+    )
+    job_guard = _BOT_SOURCE.index("if application.job_queue is not None:")
+    job_site = _BOT_SOURCE.index('name="weekly_gap_scan"')
+    assert job_site > job_guard
+
+
 def main() -> int:
     import sys
     import pytest as _pytest

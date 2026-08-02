@@ -4075,6 +4075,66 @@ async def _weekly_timetable_reminder(context: ContextTypes.DEFAULT_TYPE) -> None
         logger.exception("timetable reminder failed")
 
 
+async def _weekly_gap_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Weekly soft gap-filling: re-ask ONE genuinely-missing onboarding item.
+
+    Runs daily at 09:30 but self-gates on the weekly-report weekday (mirrors
+    ``_weekly_timetable_reminder``). Re-runs ``onboarding.status()`` and picks
+    the first genuinely-missing item in priority order — chapters (a subject
+    with no Current Syllabus work item) → backlog (0 Backlog/Inbox work items
+    AND zero ledger rows) → commitments (no active daily goals). Optional
+    sections (next_mock, capacity, rhythm, prefs, portal) are never re-asked.
+    The chosen section is claimed per (section, week) so it is never asked more
+    than once per week; when nothing is missing the all-claim is recorded and
+    nothing is sent. Text is the section's deterministic base prompt — no LLM.
+    """
+    try:
+        today = session_context.local_today_iso()
+        if dt.date.fromisoformat(today[:10]).weekday() != config_settings.timetable_reminder_weekday():
+            return
+        db_path = onboarding.DEFAULT_DB_PATH
+        stats = await asyncio.to_thread(onboarding.status)
+        chat_id = telegram_allowed_user_id()
+        section_id = None
+        missing_subjects = stats.get("chapters", {}).get("missing_subjects") or []
+        if missing_subjects:
+            section_id = "chapters"
+        else:
+            backlog = await asyncio.to_thread(
+                study_domain._rows,
+                "work_items", "archived=0 AND status IN ('Backlog','Inbox')",
+                db_path=db_path,
+            )
+            if not backlog and _table_row_count(db_path, "ledger") == 0:
+                section_id = "backlog"
+            elif not (stats.get("commitments") or {}).get("ok"):
+                section_id = "commitments"
+        if section_id is None:
+            reminders.claim(f"onboarding-gap:all:{today}", db_path=db_path)
+            return
+        if not reminders.claim(f"onboarding-gap:{section_id}:{today}", db_path=db_path):
+            return
+        section = onboarding.section_by_id(section_id) or {
+            "title": section_id, "prompt": "",
+        }
+        prompt = section.get("prompt") or ""
+        if section_id == "chapters":
+            prompt = onboarding.chapters_prompt()
+        text = f"I still need to know: {section['title']} — {prompt}"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                section["title"], callback_data=f"onb:sec:{section_id}"
+            ),
+        ]])
+        try:
+            await _send_markdown(context.bot, chat_id, text, reply_markup=keyboard)
+        except Exception:
+            reminders.release(f"onboarding-gap:{section_id}:{today}", db_path=db_path)
+            raise
+    except Exception:
+        logger.exception("weekly gap scan failed")
+
+
 async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         now = session_context.local_now()
@@ -4601,6 +4661,14 @@ async def post_init(application: Application) -> None:
         application.job_queue.run_daily(
             _guard_scheduled(_weekly_report_job), time=_clock(config_settings.weekly_report_time()),
             days=tuple(range(7)), name="weekly_report",
+        )
+        # Weekly soft gap-filling: re-ask ONE genuinely-missing onboarding item
+        # (chapters/backlog/commitments) on the weekly-report weekday, claimed
+        # per (section, week). The weekday gate lives inside the scan, so the
+        # job runs daily at 09:30 and self-gates.
+        application.job_queue.run_daily(
+            _guard_scheduled(_weekly_gap_scan), time=_clock("09:30"),
+            days=tuple(range(7)), name="weekly_gap_scan",
         )
         application.job_queue.run_daily(
             _guard_scheduled(_commitment_verify_job), time=_clock(config_settings.commitment_check_time()),
