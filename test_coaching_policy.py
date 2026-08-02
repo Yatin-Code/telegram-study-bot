@@ -33,6 +33,7 @@ import sync
 
 NOW = dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc)
 NIGHT = dt.datetime(2026, 8, 2, 23, 30, tzinfo=dt.timezone.utc)
+DISC_NIGHT = dt.datetime(2026, 8, 2, 23, 0, tzinfo=dt.timezone.utc)
 
 
 @pytest.fixture()
@@ -334,6 +335,140 @@ def test_decision_is_durable_and_auditable(db):
             f"SELECT * FROM {pol.DECISIONS_TABLE}"
         ).fetchall()
     assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# execution-discipline kinds (Phase 15)
+# ---------------------------------------------------------------------------
+
+def test_discipline_kinds_registered_correctly():
+    for kind in ("discipline_start", "discipline_push", "discipline_shame",
+                 "discipline_checkin"):
+        assert kind in pol.KIND_DATASETS
+        assert kind in pol.QUIET_BYPASS_KINDS
+    assert pol.KIND_DATASETS["discipline_start"] == ()
+    assert pol.KIND_DATASETS["discipline_push"] == ()
+    assert pol.KIND_DATASETS["discipline_shame"] == ()
+    assert pol.KIND_DATASETS["discipline_checkin"] == ("ledger",)
+    # C4 trap guard: start/push/shame depend on the local template only and
+    # must NOT be data-gated (that would silently disable them whenever the
+    # coaching cache is not fresh). Only checkin is ledger-freshness gated.
+    for kind in ("discipline_start", "discipline_push", "discipline_shame"):
+        assert kind not in pol.DATA_GATED_KINDS
+    assert "discipline_checkin" in pol.DATA_GATED_KINDS
+    assert pol.KIND_COOLDOWN_MIN["discipline_start"] == 0
+    assert pol.KIND_COOLDOWN_MIN["discipline_push"] == 10
+    assert pol.KIND_COOLDOWN_MIN["discipline_shame"] == 10
+    assert pol.KIND_COOLDOWN_MIN["discipline_checkin"] == 60
+
+
+def test_discipline_kind_bypasses_quiet_hours_but_planning_does_not(db):
+    discipline = pol.decide_notification(
+        kind="discipline_start", now=DISC_NIGHT, db_path=db,
+    )
+    assert discipline["allow"] is True
+    assert "quiet_hours" not in discipline["blocked_by"]
+
+    planning = pol.decide_notification(
+        kind="planning", now=DISC_NIGHT, db_path=db,
+    )
+    assert planning["allow"] is False
+    assert "quiet_hours" in planning["blocked_by"]
+
+
+def test_discipline_start_allowed_when_coaching_cache_never_synced(db):
+    decided = pol.decide_notification(kind="discipline_start", now=NOW, db_path=db)
+    assert decided["allow"] is True
+    assert "stale_data" not in decided["blocked_by"]
+    assert decided["relevance"]["stale_datasets"] == []
+
+
+def test_discipline_checkin_blocked_when_ledger_stale(db):
+    sync_meta(db, "ledger", completed="2026-07-30T00:00:00+00:00")
+    decided = pol.decide_notification(kind="discipline_checkin", now=NOW, db_path=db)
+    assert decided["allow"] is False
+    assert "stale_data" in decided["blocked_by"]
+    assert "ledger=stale" in decided["relevance"]["stale_datasets"]
+
+
+def test_discipline_checkin_allowed_with_fresh_ledger_inside_quiet_hours(db):
+    sync_meta(db, "ledger", completed="2026-08-02T22:55:00+00:00")
+    decided = pol.decide_notification(
+        kind="discipline_checkin", now=DISC_NIGHT, db_path=db,
+    )
+    assert decided["allow"] is True
+    assert "quiet_hours" not in decided["blocked_by"]
+    assert decided["relevance"]["data_fresh"] is True
+
+
+def test_discipline_kinds_still_respect_cooldown(db):
+    first = pol.decide_notification(
+        kind="discipline_push", now=NOW, event_key="p1", db_path=db,
+    )
+    assert first["allow"] is True
+    pol.record_decision(first, db_path=db)
+    second = pol.decide_notification(
+        kind="discipline_push", now=NOW + dt.timedelta(minutes=5),
+        event_key="p2", db_path=db,
+    )
+    assert second["allow"] is False
+    assert "cooldown" in second["blocked_by"]
+    assert second["cooldown"]["min_gap_min"] == 10
+
+
+def test_discipline_kinds_still_respect_daily_budget(db):
+    sync_meta(db, "ledger", completed="2026-08-02T11:55:00+00:00")
+    now = NOW
+    for index in range(3):
+        decision = pol.decide_notification(
+            kind="discipline_checkin", now=now, event_key=f"c{index}",
+            chat_id=1, db_path=db, cooldown_min=0, budget_per_day=3,
+        )
+        assert decision["allow"] is True
+        pol.record_decision(decision, db_path=db)
+    over = pol.decide_notification(
+        kind="discipline_checkin", now=now + dt.timedelta(hours=1),
+        event_key="c_over", chat_id=1, db_path=db, cooldown_min=0,
+        budget_per_day=3,
+    )
+    assert over["allow"] is False
+    assert "budget" in over["blocked_by"]
+
+
+def test_budget_param_30_respected_for_planning(db):
+    now = NOW
+    for index in range(30):
+        decision = pol.decide_notification(
+            kind="planning", now=now, event_key=f"b{index}",
+            chat_id=1, db_path=db, cooldown_min=0, budget_per_day=30,
+        )
+        assert decision["allow"] is True
+        pol.record_decision(decision, db_path=db)
+    over = pol.decide_notification(
+        kind="planning", now=now + dt.timedelta(hours=1), event_key="b_over",
+        chat_id=1, db_path=db, cooldown_min=0, budget_per_day=30,
+    )
+    assert over["allow"] is False
+    assert "budget" in over["blocked_by"]
+    assert over["budget"]["per_day"] == 30
+
+
+def test_default_budget_12_still_caps_planning(db):
+    now = NOW
+    for index in range(pol.NOTIFICATIONS_MAX_PER_DAY):
+        decision = pol.decide_notification(
+            kind="planning", now=now, event_key=f"d{index}",
+            chat_id=1, db_path=db, cooldown_min=0,
+        )
+        assert decision["allow"] is True
+        pol.record_decision(decision, db_path=db)
+    over = pol.decide_notification(
+        kind="planning", now=now + dt.timedelta(hours=1), event_key="d_over",
+        chat_id=1, db_path=db, cooldown_min=0,
+    )
+    assert over["allow"] is False
+    assert "budget" in over["blocked_by"]
+    assert over["budget"]["per_day"] == pol.NOTIFICATIONS_MAX_PER_DAY
 
 
 # ---------------------------------------------------------------------------

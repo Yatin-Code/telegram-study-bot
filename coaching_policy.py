@@ -503,6 +503,13 @@ DEFAULT_COOLDOWN_MIN = _policy_env_int("POLICY_COOLDOWN_MIN", 30)
 URGENT_KINDS = {"system_alert"}
 URGENT_PRIORITIES = {"urgent", "critical"}
 
+# Discipline kinds may skip the quiet-hours gate: the execution-discipline scan
+# only emits them while inside a declared study block, so they can fire during
+# the late scheduled blocks (e.g. 22:15-01:00) without disturbing sleep/breaks.
+QUIET_BYPASS_KINDS = {
+    "discipline_start", "discipline_push", "discipline_shame", "discipline_checkin",
+}
+
 # Dataset a kind depends on (used for relevance gating).
 KIND_DATASETS: dict[str, tuple[str, ...]] = {
     "planning": ("operational",),
@@ -520,6 +527,13 @@ KIND_DATASETS: dict[str, tuple[str, ...]] = {
     "coaching_progress": ("coaching",),
     "doubt_reattempt": ("doubts",),
     "readiness": ("coaching",),
+    # Execution-discipline kinds. start/push/shame are NOT data-gated: they
+    # depend only on the local template (day_type already gates coaching-ness).
+    "discipline_start": (),
+    "discipline_push": (),
+    "discipline_shame": (),
+    # checkin verifies ledger evidence, so it must stay ledger-freshness gated.
+    "discipline_checkin": ("ledger",),
 }
 
 # Kinds that must not fire while their dataset is stale/failed/never_synced.
@@ -527,6 +541,8 @@ DATA_GATED_KINDS = {
     "exam", "teacher", "commitment_check", "commitment_nudge",
     "weekly_report", "insight", "coaching_pre", "coaching_post",
     "coaching_progress", "doubt_reattempt", "readiness",
+    # checkin verifies ledger evidence; start/push/shame deliberately NOT here.
+    "discipline_checkin",
 }
 
 # Per-kind cooldown override (minutes); falls back to DEFAULT_COOLDOWN_MIN.
@@ -540,6 +556,11 @@ KIND_COOLDOWN_MIN: dict[str, int] = {
     "coaching_progress": 24 * 60,
     "doubt_reattempt": 24 * 60,
     "readiness": 12 * 60,
+    # Execution-discipline escalation tiers + post-block checkin.
+    "discipline_start": 0,
+    "discipline_push": 10,
+    "discipline_shame": 10,
+    "discipline_checkin": 60,
 }
 
 
@@ -645,6 +666,8 @@ def decide_notification(
         now, start_hhmm=quiet_hours[0] if quiet_hours else None,
         end_hhmm=quiet_hours[1] if quiet_hours else None,
     )
+    if kind in QUIET_BYPASS_KINDS:
+        quiet_active = False  # discipline kinds are scan-gated to study blocks only
     if quiet_active and not urgent:
         allow = False
         blocked_by.append("quiet_hours")
