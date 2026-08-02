@@ -19,6 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import execution_discipline
 import sql_tool
 
 
@@ -63,6 +64,48 @@ def _seed_temp_db() -> Path:
     conn.commit()
     conn.close()
     return tmp
+
+
+def _seed_discipline_temp_db() -> Path:
+    """Create a temp DB seeded with the 4 execution-discipline local tables."""
+    tmp = Path(tempfile.mkstemp(suffix=".db")[1])
+    conn = sqlite3.connect(str(tmp))
+    execution_discipline.init_db(conn)
+    conn.close()
+    execution_discipline.seed_templates(tmp)
+    return tmp
+
+
+def test_schema_digest_empty_db() -> bool:
+    """schema_digest must survive a completely empty db (no tables at all)."""
+    ok = True
+    print("\n=== schema_digest on empty db ===")
+    tmp = Path(tempfile.mkstemp(suffix=".db")[1])
+    sqlite3.connect(str(tmp)).close()
+    digest = sql_tool.schema_digest(db_path=tmp)
+    ok = _check(ok, "digest is a plain str", isinstance(digest, str))
+    ok = _check(ok, "digest raises nothing", True)
+    ok = _check(ok, "no execution_templates line", "execution_templates" not in digest)
+    ok = _check(ok, "no execution_blocks line", "execution_blocks" not in digest)
+    ok = _check(ok, "no block_confirmations line", "block_confirmations" not in digest)
+    ok = _check(ok, "no execution_day_types line", "execution_day_types" not in digest)
+    tmp.unlink(missing_ok=True)
+    assert ok
+
+
+def test_schema_digest_discipline_tables_present() -> bool:
+    """NEW: seeded discipline tables must appear in the digest with sample rows."""
+    ok = True
+    print("\n=== schema_digest lists seeded execution-discipline tables ===")
+    db = _seed_discipline_temp_db()
+    digest = sql_tool.schema_digest(db_path=db)
+    ok = _check(ok, "digest contains execution_templates", "execution_templates" in digest)
+    ok = _check(ok, "digest contains execution_blocks", "execution_blocks" in digest)
+    ok = _check(ok, "digest contains block_confirmations", "block_confirmations" in digest)
+    ok = _check(ok, "digest contains execution_day_types", "execution_day_types" in digest)
+    ok = _check(ok, "sample row mentions Execution Block A", "Execution Block A" in digest)
+    db.unlink(missing_ok=True)
+    assert ok
 
 
 def test_valid_selects() -> bool:
@@ -278,6 +321,8 @@ def test_edge_cases() -> bool:
 
 
 def main() -> int:
+    test_schema_digest_empty_db()
+    test_schema_digest_discipline_tables_present()
     test_valid_selects()
     test_reject_writes()
     test_multi_statement_injection()

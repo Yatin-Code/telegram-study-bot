@@ -15,6 +15,7 @@ from typing import Any
 
 import sync
 import operational_store
+from config import ownership
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
@@ -230,6 +231,33 @@ def schema_digest(db_path: str | Path = DEFAULT_DB_PATH) -> str:
                     lines.append(f"  sample row 2: {_truncate_sample(dict(sample[1]))}")
             else:
                 lines.append("  (no active rows)")
+        # LOCAL execution-discipline tables (bot-created, block-level timetable
+        # enforcement) — listed only when they exist.
+        local_lines: list[str] = []
+        for table in ownership.LOCAL_SQL_TABLES:
+            if table not in existing_tables:
+                continue
+            info = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            cols = [f"{r['name']}:{r['type'] or 'TEXT'}" for r in info]
+            local_lines.append(f"TABLE {table} (local): {', '.join(cols)}")
+            sample_sql = (
+                f'SELECT * FROM "{table}" LIMIT 2'
+                if "archived" not in {r["name"] for r in info}
+                else f'SELECT * FROM "{table}" WHERE archived=0 LIMIT 2'
+            )
+            sample = conn.execute(sample_sql).fetchall()
+            if sample:
+                local_lines.append(f"  sample row 1: {_truncate_sample(dict(sample[0]))}")
+                if len(sample) > 1:
+                    local_lines.append(f"  sample row 2: {_truncate_sample(dict(sample[1]))}")
+            else:
+                local_lines.append("  (no rows)")
+        if local_lines:
+            lines.append(
+                "LOCAL execution-discipline tables (bot-created, block-level "
+                "timetable enforcement):"
+            )
+            lines.extend(local_lines)
         link_table = operational_store.EXECUTION_LINKS_TABLE
         if link_table in existing_tables:
             link_info = conn.execute(f'PRAGMA table_info("{link_table}")').fetchall()
