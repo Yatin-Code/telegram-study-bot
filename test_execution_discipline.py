@@ -628,3 +628,88 @@ def test_no_candidates_for_sleep_break_class(db):
     assert ed.due_escalation_candidates(_at(16, 0), db) == []
     assert ed.run_auto_skip(_at(2, 0), db) is None
     assert ed.run_auto_skip(_at(16, 0), db) is None
+
+
+# ---------------------------------------------------------------------------
+# LLM coach message + deterministic fallback
+# ---------------------------------------------------------------------------
+
+def test_discipline_message_returns_mocked_text(db, monkeypatch):
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+    monkeypatch.setattr(ed, "_llm_complete", lambda messages: "custom text")
+    assert ed.discipline_message("start", block, db_path=db) == "custom text"
+
+
+def test_discipline_message_fallback_exact_per_tier(db, monkeypatch):
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+
+    def boom(messages):
+        raise RuntimeError("quota")
+
+    monkeypatch.setattr(ed, "_llm_complete", boom)
+    assert ed.discipline_message("start", block, db_path=db) == (
+        "⏰ Execution Block A (08:30-10:00) — time to start."
+    )
+    assert ed.discipline_message("push", block, db_path=db) == (
+        "You haven't started Execution Block A yet. Still time — start now."
+    )
+    assert ed.discipline_message("shame", block, db_path=db) == (
+        "You skipped Execution Block A. This is your dream — log it or lose the streak."
+    )
+    assert ed.discipline_message("checkin", block, db_path=db) == (
+        "Did you finish Execution Block A? Log it or tell me what you did."
+    )
+
+
+def test_discipline_message_fallback_has_title_no_air(db, monkeypatch):
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+
+    def boom(messages):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(ed, "_llm_complete", boom)
+    for tier in ("start", "push", "shame", "checkin"):
+        text = ed.discipline_message(tier, block, db_path=db)
+        assert "Execution Block A" in text
+        assert "AIR" not in text
+        assert len(text) < 220
+
+
+def test_discipline_message_redacts_context(db, monkeypatch):
+    _coaching_window(db)
+    conn = ntsc_coaching._connect(db)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO coaching_classes "
+            "(source_id, class_date, start_time, duration_min, class_type, subjects) "
+            "VALUES ('c-phone', '2026-08-02', '15:00', 60, 'class', 'Physics — call 9876543210')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    block = ed.current_block(_at(8, 45), db)
+    captured = {}
+
+    def fake(messages):
+        captured["system"] = messages[0]["content"]
+        return "custom text"
+
+    monkeypatch.setattr(ed, "_llm_complete", fake)
+    ed.discipline_message("start", block, db_path=db)
+    assert "[REDACTED]" in captured["system"]
+
+
+def test_discipline_message_never_raises(db, monkeypatch):
+    _coaching_window(db)
+    block = ed.current_block(_at(8, 45), db)
+
+    def boom(messages):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ed, "_llm_complete", boom)
+    text = ed.discipline_message("shame", block, db_path=db)
+    assert isinstance(text, str)
+    assert text

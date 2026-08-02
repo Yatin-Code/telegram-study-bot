@@ -24,14 +24,24 @@ writes to block_confirmations and no touch of op_* / Notion-owned data.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import coaching_doubts
 import coaching_lifecycle
+import coaching_planner
+import coaching_policy
+import coaching_prediction
+import coaching_syllabus
+import commitments
 import ntsc_coaching
 import session_context
+import study_domain
+import llm.router as llm_router
 from config import settings
+from llm.router import LLMRequest
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "sqlite_mirror.db"
@@ -570,3 +580,199 @@ def run_auto_skip(now: dt.datetime, db_path: str | Path = DEFAULT_DB_PATH) -> di
         "skipped": True,
         "auto": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM coach message (code decides when; LLM writes what) + deterministic fallback
+# ---------------------------------------------------------------------------
+
+_FALLBACKS = {
+    "start": "⏰ {title} ({start}-{end}) — time to start.",
+    "push": "You haven't started {title} yet. Still time — start now.",
+    "shame": "You skipped {title}. This is your dream — log it or lose the streak.",
+    "checkin": "Did you finish {title}? Log it or tell me what you did.",
+}
+
+
+def _llm_complete(messages: list[dict[str, str]]) -> str:
+    """Thin wrapper over the LLM router. Raises on failure (caller catches)."""
+    response = llm_router.complete(LLMRequest(
+        messages=messages,
+        purpose="domain",
+        max_output_tokens=256,
+        temperature=0.6,
+    ))
+    return response.text
+
+
+def _first_active_daily_goal(db_path: str | Path) -> str | None:
+    """The first active Daily goal's id, or None when none exists."""
+    conn = study_domain._connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id FROM op_goals WHERE archived=0 AND status='Active' "
+            "AND period='Daily' ORDER BY created_time LIMIT 1"
+        ).fetchone()
+        return row["id"] if row is not None else None
+    finally:
+        conn.close()
+
+
+def build_llm_context(now: dt.datetime, block: dict, db_path: str | Path = DEFAULT_DB_PATH) -> dict:
+    """Compact, redacted-friendly context for the coach message.
+
+    Each source is guarded individually so one phase's failure never drops the
+    whole context; only keys whose source succeeded are included (no values are
+    fabricated). The caller redacts the result before it reaches the LLM.
+    """
+    now = _as_local(now)
+    local_date = block.get("local_date") or block.get("date") or now.date().isoformat()
+    context: dict = {
+        "block": {
+            "title": block["title"],
+            "window": f"{block['start_hhmm']}-{block['end_hhmm']}",
+            "kind": block["kind"],
+            "day_type": block.get("day_type"),
+        },
+    }
+
+    try:
+        classes = ntsc_coaching.classes_for_date(local_date, db_path=db_path)
+        if classes:
+            context["today_classes"] = [
+                {"time": c.get("start_time"), "subjects": c.get("subjects")}
+                for c in classes[:5]
+            ]
+    except Exception:
+        pass
+
+    try:
+        facts = study_domain.plan_facts(local_date, db_path=db_path)
+        items = facts.get("active_items") or []
+        if items:
+            context["plan_items"] = [
+                {"title": it.get("title"), "minutes": it.get("estimated_min")}
+                for it in items[:5]
+            ]
+    except Exception:
+        pass
+
+    try:
+        level = coaching_policy.backlog_escalation(today=local_date, db_path=db_path).get("level")
+        if level:
+            context["backlog_level"] = level
+    except Exception:
+        pass
+
+    try:
+        snap = ntsc_coaching.context_snapshot(db_path=db_path)
+        tests = snap.get("next_tests") or []
+        if tests:
+            first = tests[0]
+            context["next_test"] = first.get("title")
+            test_date = str(first.get("test_date") or "")[:10]
+            if test_date:
+                context["days_to_test"] = (
+                    dt.date.fromisoformat(test_date) - dt.date.fromisoformat(local_date)
+                ).days
+        latest = snap.get("latest_result")
+        if latest:
+            context["latest_result"] = {
+                "title": latest.get("title"),
+                "marks": latest.get("total_marks"),
+                "max": latest.get("maximum_marks"),
+            }
+    except Exception:
+        pass
+
+    try:
+        tests = coaching_syllabus.coverage_snapshot(today=local_date, limit=3, db_path=db_path)
+        uncovered = [
+            {"test": test.get("title"), "uncovered": (test.get("coverage") or {}).get("uncovered_count")}
+            for test in tests
+            if (test.get("coverage") or {}).get("uncovered_count")
+        ]
+        if uncovered:
+            context["uncovered_topics"] = uncovered[:3]
+    except Exception:
+        pass
+
+    try:
+        doubts = coaching_doubts.ranked_doubts(now=now, db_path=db_path)
+        if doubts:
+            context["next_doubt"] = (
+                doubts[0].get("core_concept") or doubts[0].get("title")
+            )
+    except Exception:
+        pass
+
+    try:
+        proj = coaching_prediction.project_coaching_score(db_path=db_path)
+        if proj.get("total"):
+            context["score_projection"] = {
+                "range": proj.get("total"),
+                "confidence": proj.get("confidence"),
+            }
+    except Exception:
+        pass
+
+    try:
+        plan = coaching_planner.plan_tomorrow(db_path=db_path)
+        warnings = plan.get("warnings") or []
+        unplaced = plan.get("unplaced_count") or 0
+        if warnings or unplaced:
+            context["planner"] = {"warnings": warnings[:5], "unplaced": unplaced}
+    except Exception:
+        pass
+
+    try:
+        goal = _first_active_daily_goal(db_path=db_path)
+        if goal:
+            context["streak"] = commitments.streak(goal, db_path=db_path)
+    except Exception:
+        pass
+
+    return context
+
+
+def _fallback(tier: str, block: dict) -> str:
+    template = _FALLBACKS.get(tier, _FALLBACKS["start"])
+    return template.format(
+        title=block["title"], start=block["start_hhmm"], end=block["end_hhmm"],
+    )
+
+
+def discipline_message(
+    tier: str, block: dict, *, db_path: str | Path = DEFAULT_DB_PATH, now: dt.datetime | None = None,
+) -> str:
+    """LLM-written message for a tier, or the deterministic fallback on any failure.
+
+    The LLM writes the text from a bounded, redacted, fact-only context; on ANY
+    exception (no keys, router error, quota, empty reply) the fixed fallback is
+    returned so the scan never blocks. No AIR/rank references anywhere.
+    """
+    try:
+        context = build_llm_context(now or session_context.local_now(), block, db_path=db_path)
+        redacted = coaching_policy.redact_payload(context)
+        system = (
+            "You are the strict-but-caring study coach of a JEE aspirant. "
+            f"Write a SHORT (<220 chars) Telegram message for tier {tier} about this block. "
+            "Use ONLY these facts; never invent marks, dates, ranks, AIR, or promises.\n"
+            + json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    f"Block: {block['title']} ({block['start_hhmm']}-{block['end_hhmm']}). "
+                    f"Tier: {tier}."
+                ),
+            },
+        ]
+        text = _llm_complete(messages).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return _fallback(tier, block)
