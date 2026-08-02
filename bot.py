@@ -2319,10 +2319,16 @@ def _setup_hub_view() -> tuple[str, InlineKeyboardMarkup]:
     lines = [
         "*🚀 Setup — what I need to run every engine*",
         f"Progress: `{completed}/{total}` complete",
+    ]
+    portal = stats.get("portal")
+    if portal is not None:
+        mark = "✅" if portal.get("ok") else "⚠️"
+        lines.append(f"{mark} *Portal sync* — {portal.get('detail', '')}")
+    lines.extend([
         "_Ledger, doubts & revision sync from Notion automatically — these "
         "are the things I can't discover myself._",
         "",
-    ]
+    ])
     for section in onboarding.SECTIONS:
         st = stats.get(section["id"], {"ok": False, "detail": ""})
         mark = "✅" if st["ok"] else "⚠️"
@@ -2350,6 +2356,25 @@ def _setup_section_view(section_id: str, *, mode: str = "single") -> tuple[str, 
         personalized = onboarding.personalized_prompt(section_id)
         if personalized and personalized != prompt:
             prompt = personalized
+    except Exception:
+        pass
+    try:
+        stats = onboarding.status()
+        if section_id == "chapters":
+            missing = stats.get("chapters", {}).get("missing_subjects") or []
+            subject = missing[0] if missing else None
+            topics = (stats.get("chapters", {}).get("suggested_topics") or {}).get(subject) or []
+            if topics:
+                prompt += (
+                    "\nPortal syllabus suggests: `" + ", ".join(topics[:6]) +
+                    "` — send the one you're on, or a different name."
+                )
+        elif section_id == "target_exam":
+            hint = (stats.get("target_exam") or {}).get("course_hint")
+            if hint:
+                prompt += (
+                    f"\nPortal shows your course as `{hint}` — is that your target year?"
+                )
     except Exception:
         pass
     lines = []
@@ -2390,6 +2415,10 @@ def _setup_finish_summary() -> str:
     for section in onboarding.SECTIONS:
         st = stats.get(section["id"], {"ok": False, "detail": ""})
         lines.append(f"{'✅' if st['ok'] else '⚠️'} *{section['title']}* — {st['detail']}")
+    portal = stats.get("portal")
+    if portal is not None and not portal.get("ok"):
+        lines.append("")
+        lines.append("⚠️ Portal not synced — classes/tests will appear after /sync or when NTSC credentials are set.")
     lines.append("")
     lines.append("Edit anytime: /setup · /settings · /memory. Now just study and talk to me normally.")
     return "\n".join(lines)
