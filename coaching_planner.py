@@ -55,6 +55,7 @@ KINDS: tuple[str, ...] = (
     "Coaching Homework",
     "Backlog",
     "Test Prep",
+    "Mock Prep",
     "Doubt Work",
     "Doubt Reattempt",
     "Planned Item",
@@ -62,6 +63,7 @@ KINDS: tuple[str, ...] = (
 
 # Deterministic priority tiers (higher = placed first into free gaps).
 PRIO_FIXED = 100
+PRIO_MOCK_PREP = 90
 PRIO_REVISION = 88
 PRIO_HOMEWORK = 84
 PRIO_TEST_PREP = 78
@@ -396,6 +398,31 @@ def _test_prep_block(test: dict[str, Any], date: str, cfg: dict[str, Any]) -> di
     )
 
 
+def _mock_prep_block(test: dict[str, Any], date: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    days_to = (test["test_date_day"] - dt.date.fromisoformat(date)).days
+    syllabus = str(test.get("syllabus") or "").strip()
+    reason = f"Mock prep for {test['title']} on {test['test_date']}"
+    evidence: dict[str, Any] = {
+        "test": test["title"],
+        "test_date": test["test_date"],
+        "days_to_test": days_to,
+        "origin": test["origin"],
+    }
+    if syllabus:
+        reason = f"{reason} — {syllabus[:120]}"
+        evidence["syllabus"] = syllabus
+    return _block(
+        kind="Mock Prep",
+        title=f"Mock Prep: {test['title']}",
+        date=date,
+        duration_min=int(cfg["mock_prep_minutes"]),
+        priority=PRIO_MOCK_PREP,
+        reason=reason,
+        evidence=evidence,
+        source=f"mock-prep:{test['source_id']}:{date}",
+    )
+
+
 def _doubt_prep_block(
     window: dict[str, Any], doubts: list[dict[str, Any]], date: str, cfg: dict[str, Any],
     day_start_min: int,
@@ -725,6 +752,7 @@ def capacity_settings(
         "homework_minutes": 45,
         "backlog_minutes": 45,
         "test_prep_minutes": 45,
+        "mock_prep_minutes": 60,
         "test_prep_days": 3,
         "doubt_prep_minutes": 20,
         "doubt_reattempt_minutes": 15,
@@ -870,7 +898,11 @@ def build_plan(
     if nearest_test is not None:
         for date in dates:
             days_to = (nearest_test["test_date_day"] - dt.date.fromisoformat(date)).days
-            if 0 <= days_to <= int(cfg["test_prep_days"]):
+            if 1 <= days_to <= 2:
+                # T-2 and T-1: a dedicated Mock Prep block replaces the generic
+                # Test Prep on the two days before the nearest test.
+                by_date[date]["generic"].append(_mock_prep_block(nearest_test, date, cfg))
+            elif 0 <= days_to <= int(cfg["test_prep_days"]):
                 by_date[date]["generic"].append(_test_prep_block(nearest_test, date, cfg))
 
     for date in dates:
@@ -935,6 +967,10 @@ def build_plan(
         "test_prep_blocks": sum(
             1 for group in by_date.values()
             for b in group["generic"] if b.get("kind") == "Test Prep"
+        ),
+        "mock_prep_blocks": sum(
+            1 for group in by_date.values()
+            for b in group["generic"] if b.get("kind") == "Mock Prep"
         ),
         "doubt_blocks": sum(
             1 for group in by_date.values()

@@ -197,7 +197,7 @@ def test_priority_order_and_reasons_drive_placement(db):
         db, "work_items", notion_page_id="b1", title="Old Kinematics sheets",
         kind="Backlog", status="Backlog", estimated_min=45, priority=30,
     )
-    add_test(db, "Test 1", "2026-08-05", syllabus="Thermo; Kinematics")
+    add_test(db, "Test 1", "2026-08-06", syllabus="Thermo; Kinematics")
 
     plan = cp.build_plan(target_date="2026-08-03", days=1, db_path=db)
 
@@ -216,9 +216,9 @@ def test_priority_order_and_reasons_drive_placement(db):
     assert "Revision is due" in by_kind["Revision"]["reason"]
     assert "homework" in by_kind["Coaching Homework"]["reason"].lower()
     assert by_kind["Coaching Homework"]["evidence"]["due_date"] == "2026-08-03"
-    assert "on 2026-08-05" in by_kind["Test Prep"]["reason"]
+    assert "on 2026-08-06" in by_kind["Test Prep"]["reason"]
     assert "Thermo" in by_kind["Test Prep"]["reason"]
-    assert by_kind["Test Prep"]["evidence"]["days_to_test"] == 2
+    assert by_kind["Test Prep"]["evidence"]["days_to_test"] == 3
     assert "backlog" in by_kind["Backlog"]["reason"].lower()
 
 
@@ -429,6 +429,72 @@ def test_plan_tomorrow_uses_local_tomorrow(db, monkeypatch):
     plan = cp.plan_tomorrow(db_path=db)
     assert plan["dates"] == ["2026-08-03"]
     assert any(b["kind"] == "Coaching Class" for b in plan["blocks"])
+
+
+def test_two_day_plan_uses_mock_prep_on_t2_and_t1(db):
+    """A 2-day plan before a test 2 days out carries Mock Prep, not Test Prep."""
+    add_test(db, "Mock 1", "2026-08-08", syllabus="Thermo; Kinematics")
+    plan = cp.build_plan(target_date="2026-08-06", days=2, db_path=db)
+    kinds_by_date = {
+        date: [b["kind"] for b in plan["blocks"] if b["date"] == date]
+        for date in plan["dates"]
+    }
+    for date in ("2026-08-06", "2026-08-07"):
+        assert kinds_by_date[date] == ["Mock Prep"], f"Mock Prep on {date}"
+        title = [b["title"] for b in plan["blocks"] if b["date"] == date]
+        assert all("Mock 1" in t for t in title)
+    assert plan["sources"]["mock_prep_blocks"] == 2
+    assert plan["sources"]["test_prep_blocks"] == 0
+
+
+def test_mock_prep_block_replaces_test_prep_on_t2_and_t1(db):
+    """T-2 and T-1 get a dedicated Mock Prep block; T-3 and T-0 keep generic Test Prep."""
+    add_test(db, "Mock 1", "2026-08-08", syllabus="Thermo; Kinematics")
+    plan = cp.build_plan(target_date="2026-08-05", days=4, db_path=db)
+    blocks = {
+        date: [b for b in plan["blocks"] if b["date"] == date]
+        for date in plan["dates"]
+    }
+    t3, t2, t1, t0 = "2026-08-05", "2026-08-06", "2026-08-07", "2026-08-08"
+
+    for date in (t2, t1):
+        mock = [b for b in blocks[date] if b["kind"] == "Mock Prep"]
+        assert mock, f"expected a Mock Prep block on {date}"
+        assert "Mock 1" in mock[0]["title"]
+        assert mock[0]["duration_min"] == 60
+        assert mock[0]["priority"] == cp.PRIO_MOCK_PREP
+        assert not [b for b in blocks[date] if b["kind"] == "Test Prep"], (
+            f"generic Test Prep must not appear on {date}"
+        )
+
+    for date in (t3, t0):
+        assert [b for b in blocks[date] if b["kind"] == "Test Prep"], (
+            f"generic Test Prep expected on {date}"
+        )
+        assert not [b for b in blocks[date] if b["kind"] == "Mock Prep"]
+
+    assert plan["sources"]["mock_prep_blocks"] == 2
+    assert plan["sources"]["test_prep_blocks"] == 2
+
+
+def test_mock_prep_drops_when_no_free_gap(db):
+    """A Mock Prep block is dropped with a skip_reason when the day has no free gap."""
+    add_test(db, "Mock 2", "2026-08-06", syllabus="Thermo")
+    # T-2 (2026-08-04): pack the whole 08:00-22:00 window with back-to-back
+    # fixed classes so no 60-minute gap remains for the Mock Prep block.
+    for hour in range(8, 22, 2):
+        add_class(
+            db, "2026-08-04", f"{hour:02d}:00", duration_min=120, subjects="Physics",
+        )
+    plan = cp.build_plan(
+        target_date="2026-08-04", days=1, db_path=db,
+        capacity={"max_daily_minutes": 1500},
+    )
+    unplaced = [u for u in plan["unplaced"] if u["kind"] == "Mock Prep"]
+    assert unplaced, "Mock Prep should be dropped when the day has no free gap"
+    assert unplaced[0]["skip_reason"] == "no free gap of 60 minutes"
+    assert unplaced[0]["placed"] is False
+    assert any("could not place 'Mock Prep: Mock 2'" in w for w in plan["warnings"])
 
 
 def main() -> int:
