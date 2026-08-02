@@ -21,6 +21,7 @@ import asyncio
 import datetime as dt
 import sqlite3
 import types
+from pathlib import Path
 
 import pytest
 
@@ -574,6 +575,42 @@ def test_discipline_callback_skip_records_skipped(db, monkeypatch):
     asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "skipped"
     assert edits and "skipped" in edits[0]
+
+
+# ---------------------------------------------------------------------------
+# Startup registration smoke test (todo 8): source-inspection, offline
+# ---------------------------------------------------------------------------
+
+_BOT_SOURCE = Path(bot.__file__).read_text(encoding="utf-8")
+
+
+def test_discipline_job_registered_once_in_post_init():
+    assert _BOT_SOURCE.count('name="execution_discipline_scan"') == 1
+    assert _BOT_SOURCE.count("_guard_scheduled(_execution_discipline_scan)") == 1
+    # The job is a run_repeating with interval=60, inside the job_queue guard.
+    assert "run_repeating(\n            _guard_scheduled(_execution_discipline_scan),\n            interval=60," in _BOT_SOURCE
+    # It sits inside the `if application.job_queue is not None:` block.
+    job_guard = _BOT_SOURCE.index("if application.job_queue is not None:")
+    job_site = _BOT_SOURCE.index("_guard_scheduled(_execution_discipline_scan)")
+    assert job_site > job_guard
+
+
+def test_discipline_callback_registered_once_and_agent_preserved():
+    assert _BOT_SOURCE.count(
+        'CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:")'
+    ) == 1
+    # The existing ^agent: handler is still registered (no regression).
+    assert _BOT_SOURCE.count(
+        'CallbackQueryHandler(on_agent_callback, pattern=r"^agent:")'
+    ) == 1
+    # The discipline handler is added immediately after the agent handler.
+    agent_site = _BOT_SOURCE.index(
+        'CallbackQueryHandler(on_agent_callback, pattern=r"^agent:")'
+    )
+    discipline_site = _BOT_SOURCE.index(
+        'CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:")'
+    )
+    assert discipline_site > agent_site
 
 
 def main() -> int:
