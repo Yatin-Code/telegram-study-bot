@@ -59,6 +59,31 @@ def test_get_schema_hides_legacy_bare_sql_mirrors(db):
         assert bare not in tables
 
 
+def test_get_schema_rejects_non_whitelisted_table(db):
+    """Bug #6: table names are whitelisted before SQL identifier interpolation."""
+    with sqlite3.connect(db) as conn:
+        for name in ("ledger", "op_goals", "goals"):
+            conn.execute(f"CREATE TABLE {name} (x INTEGER)")
+    # A valid, enumerated table still returns its schema unchanged.
+    out = agent_tools.get_schema("ledger", db_path=db)
+    assert out["columns"] == [
+        {"name": "x", "type": "INTEGER", "notnull": 0, "pk": 0}
+    ]
+    # Bare SQL-owned mirrors are hidden by the listing, so they are rejected.
+    out = agent_tools.get_schema("goals", db_path=db)
+    assert out["error"]
+    # A made-up name is rejected.
+    out = agent_tools.get_schema("no_such_table", db_path=db)
+    assert out["error"]
+    # An injection attempt never reaches the SQL layer.
+    out = agent_tools.get_schema("ledger'; DROP TABLE ledger;--", db_path=db)
+    assert out["error"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='ledger'"
+        ).fetchone()[0] == 1
+
+
 def test_raw_sql_cannot_sneak_through_select_tool(db):
     """The bug that motivated this refactor: a write via the 'read' tool
     must be impossible even when the statement parses."""

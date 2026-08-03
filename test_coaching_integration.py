@@ -683,6 +683,21 @@ def test_discipline_job_registered_once_in_post_init():
     assert job_site > job_guard
 
 
+def test_ntsc_sync_uses_dedicated_lock_distinct_from_discipline():
+    """Bug #7: a slow portal sync must never starve the discipline scans."""
+    context = types.SimpleNamespace(
+        application=types.SimpleNamespace(bot_data={})
+    )
+    maintenance = bot._maintenance_lock(context)
+    ntsc = bot._ntsc_sync_lock(context)
+    assert ntsc is not maintenance
+    assert bot._NTSC_SYNC_LOCK_KEY != bot._MAINTENANCE_LOCK_KEY
+    assert bot._NTSC_SYNC_LOCK_KEY in context.application.bot_data
+    # The NTSC job is registered under its own guard, not the shared one.
+    assert _BOT_SOURCE.count("_guard_ntsc_sync(_periodic_ntsc_sync)") == 1
+    assert "_guard_scheduled(_periodic_ntsc_sync)" not in _BOT_SOURCE
+
+
 def test_discipline_callback_registered_once_and_agent_preserved():
     assert _BOT_SOURCE.count(
         'CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:")'
@@ -788,7 +803,8 @@ def _two_day_plan():
 
 
 async def _run_mockprep_proposal(db, monkeypatch, *, fresh=True, score=None,
-                                 coverage=None, plan_outcome="ready"):
+                                 coverage=None, plan_outcome="ready",
+                                 today="2026-08-02"):
     sent = []
 
     async def fake_send(_bot, chat_id, text, **_kw):
@@ -801,7 +817,7 @@ async def _run_mockprep_proposal(db, monkeypatch, *, fresh=True, score=None,
     monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
     monkeypatch.setattr(session_context, "local_now", lambda: DAY)
-    monkeypatch.setattr(session_context, "local_today_iso", lambda: "2026-08-02")
+    monkeypatch.setattr(session_context, "local_today_iso", lambda: today)
     monkeypatch.setattr(coaching_lifecycle, "fresh", lambda **kw: fresh)
     monkeypatch.setattr(
         coaching_prediction, "project_coaching_score",
@@ -867,12 +883,26 @@ def test_mockprep_confirm_writes_daily_plan_rows(db, monkeypatch):
     sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch))
     assert len(sent) == 1
     edits = []
-    query = _fake_query("mockprep:confirm:2026-08-03:2026-08-04", edits)
+    query = _fake_query("mockprep:confirm:2026-08-02:2026-08-03", edits)
     update = types.SimpleNamespace(callback_query=query)
     asyncio.run(bot.on_mockprep_callback(update, types.SimpleNamespace()))
     rows = study_domain._rows("daily_plan", "archived=0", db_path=db)
     assert len(rows) == 2
     assert edits and "2-day mock plan written" in edits[0]
+
+
+def test_mockprep_plans_t2_and_t1_not_exam_day(db, monkeypatch):
+    """Bug #5: the 2-day proposal covers [T-2, T-1], never the exam day."""
+    seed_coaching(db, test_date="2026-08-16")
+    import coaching_planner
+    monkeypatch.setattr(coaching_planner, "build_plan", lambda **kw: _two_day_plan())
+    sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch, today="2026-08-14"))
+    assert len(sent) == 1
+    data = _button_data(sent[0][2])
+    assert "mockprep:confirm:2026-08-14:2026-08-15" in data
+    assert not any("2026-08-16" in d for d in data), (
+        "the exam day must never be inside the mock-prep plan window"
+    )
 
 
 def test_mockprep_dismiss_no_rows_and_reply(db, monkeypatch):
@@ -1304,6 +1334,78 @@ def main() -> int:
     import sys
     import pytest as _pytest
     return _pytest.main([__file__, "-q"])
+
+
+# ---------------------------------------------------------------------------
+# Bug #3 regression: claim → send failure must release the claim so the
+# notification can be retried (never silently lost). Representative coverage
+# over the 8 legacy claim-without-release paths: _planning_reminder,
+# _schedule_watch_scan, _exam_reminder_scan (identical pattern for the rest).
+# ---------------------------------------------------------------------------
+
+def test_planning_reminder_releases_claim_on_send_failure(db, monkeypatch):
+    """A failed planning-reminder send releases ``planning:{today}``."""
+    released = []
+
+    async def failing_send(*_a, **_kw):
+        raise RuntimeError("network")
+
+    async def noop_sync(**_kw):
+        return {}
+
+    monkeypatch.setattr(bot.sync, "sync_once_locked", noop_sync)
+    monkeypatch.setattr(bot.reminders, "claim", lambda key, **kw: True)
+    monkeypatch.setattr(bot.reminders, "release", lambda key, **kw: released.append(key))
+    monkeypatch.setattr(bot.reminders, "planning_message", lambda **kw: "plan")
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    context = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=failing_send))
+    asyncio.run(bot._planning_reminder(context))
+    assert released == [f"planning:{session_context.local_today_iso()}"]
+
+
+def test_schedule_watch_scan_releases_claim_on_send_failure(db, monkeypatch):
+    """A failed schedule-watch send releases the plan-analysis claim."""
+    released = []
+
+    async def failing_send(*_a, **_kw):
+        raise RuntimeError("network")
+
+    async def noop_sync(**_kw):
+        return {}
+
+    change = ("plan-analysis:2026-08-02:2026-08-02T10:00:00", "Today's sequence is ready")
+    monkeypatch.setattr(bot.sync, "sync_once_locked", noop_sync)
+    monkeypatch.setattr(bot.reminders, "settled_plan_change", lambda **kw: change)
+    monkeypatch.setattr(bot.reminders, "claim", lambda key, **kw: True)
+    monkeypatch.setattr(bot.reminders, "release", lambda key, **kw: released.append(key))
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    context = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=failing_send))
+    asyncio.run(bot._schedule_watch_scan(context))
+    assert released == [change[0]]
+
+
+def test_exam_reminder_scan_releases_claim_on_send_failure(db, monkeypatch):
+    """A failed exam-finished send releases the exam-finished claim."""
+    released = []
+
+    async def failing_send(*_a, **_kw):
+        raise RuntimeError("network")
+
+    async def noop(*_a, **_kw):
+        return None
+
+    exam = {"notion_page_id": "exam-x", "title": "Mock X",
+            "exam_date": "2026-08-04T09:00:00+00:00", "status": "Planned"}
+    monkeypatch.setattr(bot, "_send_current_readiness_reviews", noop)
+    monkeypatch.setattr(bot, "_mock_prep_proposal", noop)
+    monkeypatch.setattr(bot.reminders, "due_exams", lambda: [exam])
+    monkeypatch.setattr(bot.reminders, "claim", lambda key, **kw: True)
+    monkeypatch.setattr(bot.reminders, "release", lambda key, **kw: released.append(key))
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    context = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=failing_send))
+    asyncio.run(bot._exam_reminder_scan(context))
+    expected = f"exam-finished:exam-x:{session_context.local_today_iso()}"
+    assert released == [expected]
 
 
 if __name__ == "__main__":

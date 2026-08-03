@@ -71,6 +71,8 @@ LOG_FILE = LOG_DIR / "bot.log"
 logger = logging.getLogger(__name__)
 _MAINTENANCE_LOCK_KEY = "_study_bot_maintenance_lock"
 _fallback_maintenance_lock: asyncio.Lock | None = None
+_NTSC_SYNC_LOCK_KEY = "_study_bot_ntsc_sync_lock"
+_fallback_ntsc_sync_lock: asyncio.Lock | None = None
 
 BOT_COMMANDS = [
     BotCommand(item.command, item.description) for item in bot_identity.COMMANDS
@@ -175,6 +177,31 @@ def _maintenance_lock(context) -> asyncio.Lock:
 def _guard_scheduled(callback):
     async def guarded(context):
         async with _maintenance_lock(context):
+            await callback(context)
+
+    guarded.__name__ = getattr(callback, "__name__", "guarded_job")
+    return guarded
+
+
+def _ntsc_sync_lock(context) -> asyncio.Lock:
+    """Dedicated lock for the portal sync — never contends with the discipline scans."""
+    application = getattr(context, "application", None)
+    bot_data = getattr(application, "bot_data", None)
+    if bot_data is not None:
+        lock = bot_data.get(_NTSC_SYNC_LOCK_KEY)
+        if lock is None:
+            lock = asyncio.Lock()
+            bot_data[_NTSC_SYNC_LOCK_KEY] = lock
+        return lock
+    global _fallback_ntsc_sync_lock
+    if _fallback_ntsc_sync_lock is None:
+        _fallback_ntsc_sync_lock = asyncio.Lock()
+    return _fallback_ntsc_sync_lock
+
+
+def _guard_ntsc_sync(callback):
+    async def guarded(context):
+        async with _ntsc_sync_lock(context):
             await callback(context)
 
     guarded.__name__ = getattr(callback, "__name__", "guarded_job")
@@ -3327,10 +3354,14 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # One-time nudge toward /setup for a fresh install.
     if not onboarding.is_complete(chat_id) and reminders.claim("onboarding-hint:v1"):
-        await message.reply_text(
-            "🚀 First time? Run /setup — 2 minutes, and every engine "
-            "(planner, streaks, teacher alerts) comes alive."
-        )
+        try:
+            await message.reply_text(
+                "🚀 First time? Run /setup — 2 minutes, and every engine "
+                "(planner, streaks, teacher alerts) comes alive."
+            )
+        except Exception:
+            reminders.release("onboarding-hint:v1")
+            raise
         await _out_of_box_execution_check(chat_id, context)
 
     # Gap 3: if a field-edit is pending for this chat, apply the new value.
@@ -3971,8 +4002,9 @@ async def _chapter_classify_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     completed chapter the LLM proposes ONE tag from the redacted chapter
     metrics; the proposal is claimed via ``reminders.claim`` BEFORE sending so
     a later scan cannot double-send the same chapter, and a failed send
-    releases the claim so the next scan can retry. The message carries
-    Confirm/Dismiss buttons; the row stays 'proposed' until confirmed.
+    releases the claim AND discards the just-written 'proposed' row so the
+    next scan can re-propose. The message carries Confirm/Dismiss buttons; the
+    row stays 'proposed' until confirmed.
     """
     try:
         import chapter_classification
@@ -4015,6 +4047,9 @@ async def _chapter_classify_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 reminders.release(
                     f"classify:{candidate['chapter_key']}", db_path=db_path
                 )
+                chapter_classification.discard_proposal(
+                    candidate["chapter_key"], db_path=db_path
+                )
                 logger.exception(
                     "chapter classification send failed for %s", candidate["chapter_key"]
                 )
@@ -4041,8 +4076,12 @@ async def _planning_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         await sync.sync_once_locked(db_keys=("revision", "doubts", "ledger"))
         today = session_context.local_today_iso()
         if reminders.claim(f"planning:{today}"):
-            message = await asyncio.to_thread(reminders.planning_message)
-            await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=message)
+            try:
+                message = await asyncio.to_thread(reminders.planning_message)
+                await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=message)
+            except Exception:
+                reminders.release(f"planning:{today}")
+                raise
     except Exception:
         logger.exception("planning reminder failed")
 
@@ -4054,9 +4093,13 @@ async def _schedule_watch_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         change = await asyncio.to_thread(reminders.settled_plan_change)
         if change and reminders.claim(change[0]):
-            await context.bot.send_message(
-                chat_id=telegram_allowed_user_id(), text=change[1]
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_allowed_user_id(), text=change[1]
+                )
+            except Exception:
+                reminders.release(change[0])
+                raise
     except Exception:
         logger.exception("schedule watcher failed")
 
@@ -4068,9 +4111,13 @@ async def _weekly_timetable_reminder(context: ContextTypes.DEFAULT_TYPE) -> None
             return
         week = now.date().isocalendar()[:2]
         if reminders.claim(f"timetable:{week[0]}:{week[1]}"):
-            await context.bot.send_message(
-                chat_id=telegram_allowed_user_id(), text=reminders.weekly_timetable_message()
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_allowed_user_id(), text=reminders.weekly_timetable_message()
+                )
+            except Exception:
+                reminders.release(f"timetable:{week[0]}:{week[1]}")
+                raise
     except Exception:
         logger.exception("timetable reminder failed")
 
@@ -4182,7 +4229,11 @@ async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text += f"\n🐛 {len(open_bugs)} open bug note(s) this week — /bugs to triage."
         except Exception:
             logger.exception("weekly bug note failed")
-        await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=text)
+        try:
+            await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=text)
+        except Exception:
+            reminders.release(f"weekly-report:{week[0]}:{week[1]}")
+            raise
     except Exception:
         logger.exception("weekly report job failed")
 
@@ -4195,11 +4246,15 @@ async def _exam_reminder_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         for exam in await asyncio.to_thread(reminders.due_exams):
             event = f"exam-finished:{exam['notion_page_id']}:{session_context.local_today_iso()}"
             if reminders.claim(event):
-                await context.bot.send_message(
-                    chat_id=telegram_allowed_user_id(),
-                    text=(f"Has {exam.get('title')} finished? When it has, run "
-                          f"/finish_exam {exam.get('title')} to put full-paper analysis first."),
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=telegram_allowed_user_id(),
+                        text=(f"Has {exam.get('title')} finished? When it has, run "
+                              f"/finish_exam {exam.get('title')} to put full-paper analysis first."),
+                    )
+                except Exception:
+                    reminders.release(event)
+                    raise
         await _mock_prep_proposal(context)
     except Exception:
         logger.exception("exam reminder scan failed")
@@ -4364,8 +4419,11 @@ async def _mock_prep_proposal(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"chapters for {test_title} (its syllabus coverage is unknown)"
             )
 
-        day1 = (today + dt.timedelta(days=1)).isoformat()
-        day2 = (today + dt.timedelta(days=2)).isoformat()
+        # The gate fires exactly two days before the test, so today == T-2.
+        # The two planned days are the two days BEFORE the exam (T-2, T-1);
+        # the exam day itself is never included in the plan window.
+        day1 = today.isoformat()
+        day2 = (today + dt.timedelta(days=1)).isoformat()
         blocked = False
         for day in (day1, day2):
             try:
@@ -4393,11 +4451,15 @@ async def _mock_prep_proposal(context: ContextTypes.DEFAULT_TYPE) -> None:
         if failures:
             if reminders.claim(f"mockprep-gate:{test_id}", db_path=db_path):
                 bullets = "\n".join(f"• {failure}" for failure in failures)
-                await _send_markdown(
-                    context.bot,
-                    chat_id,
-                    f"I want to plan your 2 days before {test_title}, but I still need:\n{bullets}",
-                )
+                try:
+                    await _send_markdown(
+                        context.bot,
+                        chat_id,
+                        f"I want to plan your 2 days before {test_title}, but I still need:\n{bullets}",
+                    )
+                except Exception:
+                    reminders.release(f"mockprep-gate:{test_id}", db_path=db_path)
+                    raise
             return
 
         if not reminders.claim(f"mockprep:{test_id}", db_path=db_path):
@@ -4465,11 +4527,15 @@ async def _teacher_opportunity_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             key = reminders.teacher_event_key(window, decision, item.get("doubts"))
             if not reminders.claim(key):
                 continue
-            await _send_markdown(
-                context.bot,
-                telegram_allowed_user_id(),
-                message_templates.teacher_opportunity(item),
-            )
+            try:
+                await _send_markdown(
+                    context.bot,
+                    telegram_allowed_user_id(),
+                    message_templates.teacher_opportunity(item),
+                )
+            except Exception:
+                reminders.release(key)
+                raise
     except Exception:
         logger.exception("teacher opportunity scan failed")
 
@@ -4525,7 +4591,11 @@ async def _commitment_nudge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         drift = await asyncio.to_thread(advisor.trajectory_warnings)
         if drift:
             nudge = message_templates.insert_section(nudge, "Risks", drift)
-        await _send_markdown(context.bot, telegram_allowed_user_id(), nudge)
+        try:
+            await _send_markdown(context.bot, telegram_allowed_user_id(), nudge)
+        except Exception:
+            reminders.release(f"commitment-nudge:{yesterday}")
+            raise
     except Exception:
         logger.exception("commitment nudge job failed")
 
@@ -4557,10 +4627,12 @@ async def _user_jobs_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         now = session_context.local_now()
         for job in await asyncio.to_thread(user_jobs.due_jobs, now):
-            if reminders.claim(f"user-job:{job['id']}:{now.date().isoformat()}"):
+            claim_key = f"user-job:{job['id']}:{now.date().isoformat()}"
+            if reminders.claim(claim_key):
                 try:
                     await _run_user_job(job, context)
                 except Exception:
+                    reminders.release(claim_key)
                     logger.exception("user job %s failed", job["id"])
     except Exception:
         logger.exception("user jobs scan failed")
@@ -4577,6 +4649,7 @@ async def _llm_health_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     application.bot_data.setdefault(_MAINTENANCE_LOCK_KEY, asyncio.Lock())
+    application.bot_data.setdefault(_NTSC_SYNC_LOCK_KEY, asyncio.Lock())
     await application.bot.set_my_commands(BOT_COMMANDS)
     logger.info("Registered %d bot commands", len(BOT_COMMANDS))
     await asyncio.to_thread(study_domain.ensure_system_goals)
@@ -4611,7 +4684,7 @@ async def post_init(application: Application) -> None:
         )
         if config_settings.ntsc_username() and config_settings.ntsc_password():
             application.job_queue.run_repeating(
-                _guard_scheduled(_periodic_ntsc_sync),
+                _guard_ntsc_sync(_periodic_ntsc_sync),
                 interval=config_settings.ntsc_sync_interval_seconds(),
                 first=10,
                 name="periodic_ntsc_sync",
