@@ -213,9 +213,9 @@ def _parse_tag(reply: str) -> tuple[str, str | None]:
     text = str(reply).strip()
     lowered = text.lower()
     for tag in TAGS:
-        if tag in lowered:
+        if re.search(rf"\b{re.escape(tag)}\b", lowered):
             reason = re.sub(rf"\b{tag}\b", "", text, flags=re.IGNORECASE)
-            reason = reason.strip().strip(":-—–\u2013\u2014 ").strip()
+            reason = reason.strip().strip(":-\u2014\u2013 ").strip()
             return tag, reason or None
     return DEFAULT_TAG, text or None
 

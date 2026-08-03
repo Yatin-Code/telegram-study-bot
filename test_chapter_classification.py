@@ -490,9 +490,13 @@ def test_classify_callback_confirm_edits_and_confirms(db, monkeypatch):
         "metrics": {"avg_accuracy": 0.7, "avg_cy": 60.0, "sessions": 2},
     }, tag="mastery", reason="ok", db_path=db)
     monkeypatch.setattr(cc, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     edits = []
     query = _fake_query(f"classify:confirm:{key}", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = types.SimpleNamespace(
+        callback_query=query,
+        effective_user=types.SimpleNamespace(id=1),
+    )
     asyncio.run(bot.on_classify_callback(update, types.SimpleNamespace()))
     assert edits and edits[0] == "✅ Kinematics tagged mastery."
     assert cc.confirm_classification(key, db_path=db)["status"] == "confirmed"
@@ -507,9 +511,13 @@ def test_classify_callback_dismiss_edits_and_dismisses(db, monkeypatch):
         "metrics": {"avg_accuracy": 0.7, "avg_cy": 60.0, "sessions": 2},
     }, tag="revision", reason="ok", db_path=db)
     monkeypatch.setattr(cc, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     edits = []
     query = _fake_query(f"classify:dismiss:{key}", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = types.SimpleNamespace(
+        callback_query=query,
+        effective_user=types.SimpleNamespace(id=1),
+    )
     asyncio.run(bot.on_classify_callback(update, types.SimpleNamespace()))
     assert edits and edits[0] == "Okay, Kinematics left untagged."
     assert cc.dismiss_classification(key, db_path=db)["status"] == "dismissed"
