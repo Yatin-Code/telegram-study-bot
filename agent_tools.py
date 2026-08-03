@@ -210,14 +210,21 @@ def get_schema(table: Optional[str] = None, *, db_path: str | Path = DEFAULT_DB_
     try:
         with sqlite3.connect(str(db_path)) as conn:
             conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            names = [r["name"] for r in rows]
             if table is None:
-                rows = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                ).fetchall()
-                names = [
-                    r["name"] for r in rows if r["name"] not in _SQL_OWNED_KEYS
-                ]
-                return {"tables": names}
+                return {"tables": [n for n in names if n not in _SQL_OWNED_KEYS]}
+
+            # Whitelist: only names the listing above would surface are
+            # interrogated. Anything else — a bare SQL-owned mirror name or a
+            # made-up identifier — is rejected so no caller-supplied string is
+            # ever interpolated into SQL as an identifier.
+            allowed = {n for n in names if n not in _SQL_OWNED_KEYS}
+            if table not in allowed:
+                logger.warning("get_schema rejected non-whitelisted table %r", table)
+                return {"error": True, "message": f"unknown table: {table}"}
 
             cols = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
             columns = [

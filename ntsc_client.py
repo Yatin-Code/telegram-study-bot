@@ -20,6 +20,28 @@ class NTSCError(RuntimeError):
     pass
 
 
+_PAGE_META_KEYS = (
+    "totalPages", "totalPage", "pageCount",
+    "totalCount", "totalRecords", "totalResults", "total", "recordCount",
+    "hasMore", "hasNext",
+)
+
+
+def _first_int(data: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        try:
+            value = int(data[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        return value
+    return None
+
+
+def _page_meta(data: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort extraction of pagination metadata from a payload's data dict."""
+    return {key: data[key] for key in _PAGE_META_KEYS if key in data}
+
+
 def _encrypt_password(password: str) -> str:
     try:
         from cryptography.hazmat.primitives import serialization
@@ -119,17 +141,79 @@ class Client:
 
     def course_results(self, course_id: int) -> dict[str, Any]:
         self.ensure_login()
-        return self._request("POST", "/exam-service/api/CourseResult/GetResult", {
-            "courseId": course_id, "startDate": None, "endDate": None,
-            "searchKey": "", "pageNumber": 1, "pageSize": 100,
-        })
+        rows = self._fetch_all_pages(
+            "/exam-service/api/CourseResult/GetResult",
+            {"courseId": course_id, "startDate": None, "endDate": None,
+             "searchKey": "", "pageSize": 100},
+            list_key="result",
+        )
+        return {"data": {"result": rows}}
 
     def appeared_results(self, result_id: int) -> dict[str, Any]:
         self.ensure_login()
-        return self._request("POST", "/exam-service/api/ExaminationHall/GetAppearedResult", {
-            "id": result_id, "pageNumber": 1, "pageSize": 20,
-        })
+        rows = self._fetch_all_pages(
+            "/exam-service/api/ExaminationHall/GetAppearedResult",
+            {"id": result_id, "pageSize": 20},
+            list_key="result",
+        )
+        return {"data": {"result": rows}}
 
     def result_analysis(self, exam_id: int) -> dict[str, Any]:
         self.ensure_login()
         return self._request("GET", f"/exam-service/api/ExaminationHall/GetResultAnalysis/{exam_id}")
+
+    def _fetch_all_pages(
+        self, path: str, body: dict[str, Any], *, list_key: str,
+    ) -> list[dict[str, Any]]:
+        """POST ``path`` for every page of ``list_key`` and return all rows.
+
+        These endpoints page by ``pageNumber``/``pageSize`` inside the request
+        body and echo pagination metadata in the response's ``data`` object.
+        Recognised signals: a page count (``totalPages``/``totalPage``/
+        ``pageCount``), a row count (``totalCount``/``totalRecords``/
+        ``total``/``recordCount``), or a ``hasMore``/``hasNext`` flag. With no
+        signal it keeps fetching while a page comes back full. When the API
+        exposes no pagination at all the caller's large ``pageSize`` makes the
+        single page complete in practice; that fallback may still truncate,
+        which is a known limitation of this client.
+        """
+        combined: list[dict[str, Any]] = []
+        page_size = _first_int(body, "pageSize") or 0
+        max_pages = 500  # defensive bound against a broken pagination echo
+        page = 1
+        while page <= max_pages:
+            payload = self._request("POST", path, {**body, "pageNumber": page})
+            data = payload.get("data") if isinstance(payload, dict) else None
+            items = data.get(list_key) if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                # Unexpected shape: return what we already have; callers that
+                # read payload["data"][list_key] still work for a single page.
+                return combined
+            combined.extend(items)
+            meta = _page_meta(data) if isinstance(data, dict) else {}
+            total_pages = _first_int(meta, "totalPages", "totalPage", "pageCount")
+            if total_pages is not None:
+                if page >= total_pages:
+                    break
+                page += 1
+                continue
+            total_rows = _first_int(
+                meta, "totalCount", "totalRecords", "totalResults", "total", "recordCount"
+            )
+            if total_rows is not None and len(combined) >= total_rows:
+                break
+            if meta.get("hasMore") is False or meta.get("hasNext") is False:
+                break
+            # Short-page fallback applies only when the API exposes no
+            # pagination signal: a short page can still be followed by more
+            # when an explicit totalPages / totalRows / hasMore is present.
+            has_signal = bool(
+                total_pages
+                or total_rows
+                or meta.get("hasMore") is not None
+                or meta.get("hasNext") is not None
+            )
+            if not has_signal and (not items or (page_size and len(items) < page_size)):
+                break
+            page += 1
+        return combined
