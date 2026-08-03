@@ -288,6 +288,53 @@ def test_day_type_non_coaching_when_no_classes(db):
     assert ed.day_type_for("2026-08-05", db) == "non_coaching"
 
 
+def test_day_type_non_coaching_when_only_doubt_classes(db):
+    ed.seed_templates(db)
+    conn = ntsc_coaching._connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO coaching_classes "
+            "(source_id, class_date, start_time, duration_min, class_type) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("doubt-only", "2026-08-05", "15:00", 60, "Doubt Class"),
+        )
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO coaching_sync_runs (started_at, finished_at, status, datasets) "
+            "VALUES (?, ?, 'success', '[\"classes\"]')",
+            (now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert ed.day_type_for("2026-08-05", db) == "non_coaching"
+
+
+def test_day_type_coaching_when_regular_class_and_doubt_class(db):
+    ed.seed_templates(db)
+    conn = ntsc_coaching._connect(db)
+    try:
+        conn.executemany(
+            "INSERT INTO coaching_classes "
+            "(source_id, class_date, start_time, duration_min, class_type) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                ("regular", "2026-08-05", "09:00", 60, "Regular Class"),
+                ("doubt", "2026-08-05", "15:00", 60, "Doubt Class"),
+            ],
+        )
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO coaching_sync_runs (started_at, finished_at, status, datasets) "
+            "VALUES (?, ?, 'success', '[\"classes\"]')",
+            (now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert ed.day_type_for("2026-08-05", db) == "coaching"
+
+
 def test_day_type_non_coaching_when_sync_failed(db):
     ed.seed_templates(db)
     conn = ntsc_coaching._connect(db)

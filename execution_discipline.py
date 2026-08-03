@@ -271,7 +271,10 @@ def day_type_for(date_iso: str, db_path: str | Path = DEFAULT_DB_PATH) -> str:
     finally:
         conn.close()
 
-    classes = ntsc_coaching.classes_for_date(date_iso, db_path=db_path)
+    classes = [
+        row for row in ntsc_coaching.classes_for_date(date_iso, db_path=db_path)
+        if "doubt" not in str(row.get("class_type") or "").strip().lower()
+    ]
     day_type = (
         "coaching"
         if classes and coaching_lifecycle.fresh(
