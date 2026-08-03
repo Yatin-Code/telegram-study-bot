@@ -2861,7 +2861,6 @@ async def _handle_debrief_text(message, chat_id: int, state: dict, text: str) ->
         await message.reply_text("📝 Saved onto this session. ✅ Block wrapped up.")
     except Exception as exc:
         logger.exception("debrief notes failed")
-        draft_store.clear_session_debrief(chat_id)
         await message.reply_text("⚠️ I couldn't save those notes right now — please try again.")
 
 
@@ -3062,6 +3061,8 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handle Confirm/Cancel on agent write previews."""
     query = update.callback_query
     await query.answer()
+    if not _is_allowed(update):
+        return
     data = query.data or ""
     parts = data.split(":", 2)
     if len(parts) != 3:
@@ -3123,6 +3124,8 @@ async def on_discipline_callback(update: Update, context: ContextTypes.DEFAULT_T
     """
     query = update.callback_query
     await query.answer()
+    if not _is_allowed(update):
+        return
     data = query.data or ""
     parts = data.split(":")
     if len(parts) != 4:
@@ -3160,6 +3163,8 @@ async def on_classify_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     """
     query = update.callback_query
     await query.answer()
+    if not _is_allowed(update):
+        return
     data = query.data or ""
     parts = data.split(":")
     if len(parts) != 3:
@@ -3656,15 +3661,20 @@ async def on_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "confirm":
         await query.edit_message_text("Saving…")
-        payload = dict(draft["payload"])
-        active = None
-        if payload.get("db_key") == "ledger":
-            active = await asyncio.to_thread(study_domain.active_plan, draft["chat_id"])
-            if active and active.get("work_item_id"):
-                payload["local_work_item_id"] = active["work_item_id"]
-        result = await asyncio.to_thread(
-            logging_flow.commit_write, payload, do_sync=False
-        )
+        try:
+            payload = dict(draft["payload"])
+            active = None
+            if payload.get("db_key") == "ledger":
+                active = await asyncio.to_thread(study_domain.active_plan, draft["chat_id"])
+                if active and active.get("work_item_id"):
+                    payload["local_work_item_id"] = active["work_item_id"]
+            result = await asyncio.to_thread(
+                logging_flow.commit_write, payload, do_sync=False
+            )
+        except Exception:
+            logger.exception("draft write failed")
+            await query.edit_message_text("⚠️ Could not save this entry. Try Confirm again.")
+            return
         draft_store.delete_draft(draft_id)
         # A committed execution block ends the current stint — restart the
         # session timer so the next log gets its own elapsed time.
@@ -4183,12 +4193,14 @@ async def _weekly_gap_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    event_key: str | None = None
     try:
         now = session_context.local_now()
         if now.weekday() != config_settings.timetable_reminder_weekday():
             return
         week = now.date().isocalendar()[:2]
-        if not reminders.claim(f"weekly-report:{week[0]}:{week[1]}"):
+        event_key = f"weekly-report:{week[0]}:{week[1]}"
+        if not reminders.claim(event_key):
             return
         await sync.sync_once_locked()
         report = await asyncio.to_thread(study_domain.weekly_report)
@@ -4232,9 +4244,10 @@ async def _weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(chat_id=telegram_allowed_user_id(), text=text)
         except Exception:
-            reminders.release(f"weekly-report:{week[0]}:{week[1]}")
             raise
     except Exception:
+        if event_key is not None:
+            reminders.release(event_key)
         logger.exception("weekly report job failed")
 
 
@@ -4495,6 +4508,8 @@ async def on_mockprep_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     """
     query = update.callback_query
     await query.answer()
+    if not _is_allowed(update):
+        return
     data = query.data or ""
     if data == "mockprep:dismiss":
         await _mockprep_reply(query, "Okay, skipping the pre-mock plan.")

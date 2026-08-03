@@ -452,7 +452,7 @@ def _seed_discipline(db, *, day_type="coaching"):
         conn.execute(
             f"INSERT OR REPLACE INTO {ed.DAY_TYPES_TABLE} "
             "(local_date, day_type, resolved_at) VALUES (?, ?, ?)",
-            ("2026-08-02", day_type, "2026-08-02T12:00:00+00:00"),
+            ("2026-08-02", day_type, session_context.local_now().isoformat()),
         )
         conn.commit()
 
@@ -544,12 +544,20 @@ def _fake_query(data, edits):
     return Query()
 
 
+def _callback_update(query):
+    return types.SimpleNamespace(
+        callback_query=query,
+        effective_user=types.SimpleNamespace(id=1),
+    )
+
+
 def test_discipline_callback_start_records_and_edits(db, monkeypatch):
     _seed_discipline(db)
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     edits = []
     query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = _callback_update(query)
     asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
     assert edits and "time to start" in edits[0]
@@ -558,10 +566,11 @@ def test_discipline_callback_start_records_and_edits(db, monkeypatch):
 def test_discipline_callback_start_on_skipped_shows_skipped(db, monkeypatch):
     _seed_discipline(db)
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     ed.confirm_skip("2026-08-02", "coach_b02_exec_a", db)
     edits = []
     query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = _callback_update(query)
     asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
     assert edits and "skipped" in edits[0]
     assert "time to start" not in edits[0]
@@ -570,9 +579,10 @@ def test_discipline_callback_start_on_skipped_shows_skipped(db, monkeypatch):
 def test_discipline_callback_skip_records_skipped(db, monkeypatch):
     _seed_discipline(db)
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     edits = []
     query = _fake_query("discipline:skip:2026-08-02:coach_b02_exec_a", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = _callback_update(query)
     asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "skipped"
     assert edits and "skipped" in edits[0]
@@ -619,6 +629,7 @@ def test_full_day_drive(db, monkeypatch):
     _seed_coaching_day(db)
     assert ed.day_type_for("2026-08-02", db_path=db) == "coaching"
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
 
     # --- Block A (08:30-10:00): start once -> confirm -> ledger -> complete.
     sent = asyncio.run(_run_discipline_scan(db, _at(8, 31), monkeypatch))
@@ -627,7 +638,7 @@ def test_full_day_drive(db, monkeypatch):
     edits = []
     query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
     asyncio.run(bot.on_discipline_callback(
-        types.SimpleNamespace(callback_query=query), types.SimpleNamespace()))
+            _callback_update(query), types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
     insert(db, "ledger", notion_page_id="cached-a",
            created_time="2026-08-02T09:00:00.000+00:00")
@@ -638,7 +649,7 @@ def test_full_day_drive(db, monkeypatch):
     # --- Block B (10:30-12:00): started, no ledger -> checkin claimed once.
     query = _fake_query("discipline:start:2026-08-02:coach_b04_exec_b", edits)
     asyncio.run(bot.on_discipline_callback(
-        types.SimpleNamespace(callback_query=query), types.SimpleNamespace()))
+            _callback_update(query), types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b04_exec_b", db)["status"] == "started"
 
     # --- Acquisition Block (12:00-14:00): unconfirmed escalation ladder.
@@ -880,11 +891,12 @@ def test_mockprep_confirm_writes_daily_plan_rows(db, monkeypatch):
     seed_coaching(db, test_date="2026-08-04")
     import coaching_planner
     monkeypatch.setattr(coaching_planner, "build_plan", lambda **kw: _two_day_plan())
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     sent = asyncio.run(_run_mockprep_proposal(db, monkeypatch))
     assert len(sent) == 1
     edits = []
     query = _fake_query("mockprep:confirm:2026-08-02:2026-08-03", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = _callback_update(query)
     asyncio.run(bot.on_mockprep_callback(update, types.SimpleNamespace()))
     rows = study_domain._rows("daily_plan", "archived=0", db_path=db)
     assert len(rows) == 2
@@ -908,9 +920,10 @@ def test_mockprep_plans_t2_and_t1_not_exam_day(db, monkeypatch):
 def test_mockprep_dismiss_no_rows_and_reply(db, monkeypatch):
     seed_coaching(db, test_date="2026-08-04")
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
     edits = []
     query = _fake_query("mockprep:dismiss", edits)
-    update = types.SimpleNamespace(callback_query=query)
+    update = _callback_update(query)
     asyncio.run(bot.on_mockprep_callback(update, types.SimpleNamespace()))
     assert study_domain._rows("daily_plan", "archived=0", db_path=db) == []
     assert edits and "Okay, skipping the pre-mock plan." in edits[0]
