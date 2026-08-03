@@ -140,6 +140,16 @@ def sync_once(
         ntsc_coaching.replace_classes(class_rows, db_path=db_path)
         datasets.append("classes")
 
+        # Invalidate cached day-type resolutions so they re-resolve against the
+        # freshly-synced coaching cache. Without this a day resolved as
+        # non_coaching during a stale/empty-cache window stays wrong forever.
+        try:
+            with ntsc_coaching._connect(db_path) as conn:
+                conn.execute("DELETE FROM execution_day_types")
+                conn.commit()
+        except Exception:
+            logger.warning("day-type cache invalidation failed", exc_info=True)
+
         _record_run(started, "success", datasets, None, db_path=db_path)
         return {"status": "success", "datasets": datasets, "course_id": course_id,
                 "classes": len(class_rows)}

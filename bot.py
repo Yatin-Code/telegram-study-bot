@@ -4580,6 +4580,16 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(BOT_COMMANDS)
     logger.info("Registered %d bot commands", len(BOT_COMMANDS))
     await asyncio.to_thread(study_domain.ensure_system_goals)
+    # Seed the execution-discipline templates (2 day templates, 20 blocks)
+    # idempotently. Without this the discipline system is inert in production
+    # (tests seed manually). INSERT OR IGNORE — safe to re-run.
+    try:
+        import execution_discipline
+        seeded = await asyncio.to_thread(execution_discipline.seed_templates)
+        if seeded:
+            logger.info("seeded %d execution-discipline blocks", seeded)
+    except Exception:
+        logger.exception("seed_templates failed at startup")
     # Retry any writes that were queued while Notion was unreachable.
     try:
         pending = logging_flow.pending_count()

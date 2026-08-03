@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import re
 import sqlite3
 from pathlib import Path
@@ -17,6 +18,8 @@ from zoneinfo import ZoneInfo
 import coaching_syllabus
 import session_context
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "sqlite_mirror.db"
 
@@ -174,6 +177,13 @@ def update_profile_context(
 
 def replace_classes(rows: list[dict[str, Any]], *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
     with _connect(db_path) as conn:
+        if not rows:
+            existing = conn.execute("SELECT COUNT(*) FROM coaching_classes").fetchone()[0]
+            if existing:
+                logger.warning(
+                    "replace_classes: portal returned 0 rows with %d cached — "
+                    "skipping wipe (likely partial outage)", existing)
+                return
         conn.execute("DELETE FROM coaching_classes")
         for index, row in enumerate(rows):
             class_date = _iso_date(row.get("classDate"))
@@ -192,6 +202,13 @@ def replace_classes(rows: list[dict[str, Any]], *, db_path: str | Path = DEFAULT
 
 def replace_tests(rows: list[dict[str, Any]], *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
     with _connect(db_path) as conn:
+        if not rows:
+            existing = conn.execute("SELECT COUNT(*) FROM coaching_tests").fetchone()[0]
+            if existing:
+                logger.warning(
+                    "replace_tests: portal returned 0 rows with %d cached — "
+                    "skipping wipe (likely partial outage)", existing)
+                return
         conn.execute("DELETE FROM coaching_tests")
         for row in rows:
             source_id = str(row.get("id") or row.get("testPaperId") or "")
@@ -210,6 +227,13 @@ def replace_tests(rows: list[dict[str, Any]], *, db_path: str | Path = DEFAULT_D
 
 def replace_results(rows: list[dict[str, Any]], *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
     with _connect(db_path) as conn:
+        if not rows:
+            existing = conn.execute("SELECT COUNT(*) FROM coaching_results").fetchone()[0]
+            if existing:
+                logger.warning(
+                    "replace_results: portal returned 0 rows with %d cached — "
+                    "skipping wipe (likely partial outage)", existing)
+                return
         conn.execute("DELETE FROM coaching_subject_results")
         conn.execute("DELETE FROM coaching_results")
         for result in rows:

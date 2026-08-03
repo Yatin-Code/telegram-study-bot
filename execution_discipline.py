@@ -240,7 +240,9 @@ def blocks_for_template(template_key: str, db_path: str | Path = DEFAULT_DB_PATH
 def day_type_for(date_iso: str, db_path: str | Path = DEFAULT_DB_PATH) -> str:
     """Resolve a local date to 'coaching' or 'non_coaching', cached once per date.
 
-    A cached execution_day_types row for the date is returned unchanged. On a
+    A cached execution_day_types row for the date is returned while it is
+    fresher than coaching_lifecycle.FRESHNESS_MAX_AGE_MINUTES; a stale cached
+    row is re-resolved against the current coaching cache. On a
     miss the date is 'coaching' iff the coaching cache holds at least one class
     for it AND had a recent successful sync — freshness is judged against the
     ACTUAL current local time (a fixed noon would wrongly mark after-noon syncs
@@ -251,11 +253,21 @@ def day_type_for(date_iso: str, db_path: str | Path = DEFAULT_DB_PATH) -> str:
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            f"SELECT day_type FROM {DAY_TYPES_TABLE} WHERE local_date = ?",
+            f"SELECT day_type, resolved_at FROM {DAY_TYPES_TABLE} WHERE local_date = ?",
             (date_iso[:10],),
         ).fetchone()
         if row is not None:
-            return row["day_type"]
+            cached_day_type = row["day_type"]
+            try:
+                resolved_at = dt.datetime.fromisoformat(row["resolved_at"])
+                if resolved_at.tzinfo is None:
+                    resolved_at = resolved_at.replace(tzinfo=dt.timezone.utc)
+                age_minutes = (session_context.local_now() - resolved_at).total_seconds() / 60
+                if age_minutes <= coaching_lifecycle.FRESHNESS_MAX_AGE_MINUTES:
+                    return cached_day_type
+                # stale cache — fall through to re-resolve
+            except (ValueError, TypeError):
+                return cached_day_type  # unparseable timestamp — trust the cache
     finally:
         conn.close()
 
