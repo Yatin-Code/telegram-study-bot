@@ -382,6 +382,7 @@ def record_route_result(
 ) -> None:
     now = now or _utcnow()
     with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         old = conn.execute(
             "SELECT consecutive_failures FROM llm_route_state WHERE route_id=?", (route_id,)
         ).fetchone()

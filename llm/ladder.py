@@ -123,6 +123,10 @@ CANDIDATES: tuple[Candidate, ...] = (
 
 _BY_ID = {c.id: c for c in CANDIDATES}
 
+_GATEWAY_PRIORITY: dict[str, int] = {
+    "eaon": 0, "google": 1, "groq": 2, "openrouter": 3, "g4f": 4,
+}
+
 
 def get(candidate_id: str) -> Candidate | None:
     return _BY_ID.get(candidate_id)
@@ -376,5 +380,5 @@ def ordered(
             (_score_from_row(c, rows.get(c.id), _cooldown_active(c.id, conn, now), purpose), c)
             for c in candidates
         ]
-    scored.sort(key=lambda t: (t[0], t[1].id))
+    scored.sort(key=lambda t: (t[0], _GATEWAY_PRIORITY.get(t[1].gateway, 99), t[1].id))
     return [c for _, c in scored]
