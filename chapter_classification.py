@@ -301,6 +301,27 @@ def propose_chapter_classification(
     return _write_proposal(candidate, tag=tag, reason=reason, db_path=db_path)
 
 
+def discard_proposal(
+    chapter_key: str, db_path: str | Path = DEFAULT_DB_PATH,
+) -> bool:
+    """Delete a 'proposed' row so the chapter can be re-proposed.
+
+    Called when the proposal message failed to send: the row was written before
+    the Telegram send, so without this the 'proposed' row would permanently
+    block re-proposal (``classify_candidates`` skips any chapter that already
+    has a classification row). Only 'proposed' rows are ever removed — a
+    confirmed or dismissed decision is never discarded.
+    """
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            f"DELETE FROM {CLASSIFICATIONS_TABLE} "
+            "WHERE chapter_key=? AND status='proposed'",
+            (chapter_key,),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
 def _set_status(
     chapter_key: str, status: str, db_path: str | Path = DEFAULT_DB_PATH,
 ) -> dict | None:

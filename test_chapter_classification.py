@@ -552,3 +552,64 @@ def test_classify_callback_registered_once():
         'CallbackQueryHandler(on_classify_callback, pattern=r"^classify:")'
     )
     assert classify_site > discipline_site
+
+
+# --- Bug #4 regression: failed send must not orphan the 'proposed' row ------
+
+def test_discard_proposal_removes_only_proposed_rows(db):
+    """``discard_proposal`` deletes a 'proposed' row but never a decision."""
+    cc = _cc()
+    key = cc.chapter_key_for("Physics", "Kinematics")
+    cand = {
+        "chapter_key": key, "subject": "Physics", "chapter": "Kinematics",
+        "metrics": {"avg_accuracy": 0.7, "avg_cy": 60.0, "sessions": 2},
+    }
+    cc._write_proposal(cand, tag="revision", reason="ok", db_path=db)
+    assert cc.discard_proposal(key, db_path=db) is True
+    assert _query(db, f"SELECT 1 FROM {cc.CLASSIFICATIONS_TABLE} WHERE chapter_key=?",
+                  (key,)) == []
+    cc._write_proposal(cand, tag="hard", reason="ok", db_path=db)
+    cc.confirm_classification(key, db_path=db)
+    assert cc.discard_proposal(key, db_path=db) is False
+    assert cc.confirm_classification(key, db_path=db)["status"] == "confirmed"
+
+
+def test_classify_scan_failed_send_discards_proposal_and_reproposes(db, monkeypatch):
+    """A failed send must NOT leave a 'proposed' row that blocks re-proposal:
+    the next scan still produces a proposal for the same chapter."""
+    _completed_chapter_env(db)
+    import chapter_classification as cc
+    key = cc.chapter_key_for("Physics", "Kinematics")
+
+    async def failing_send(_bot, chat_id, text, **_kw):
+        raise RuntimeError("network")
+
+    async def run_scan():
+        monkeypatch.setattr(bot, "_send_markdown", failing_send)
+        monkeypatch.setattr(bot.sync, "sync_once_locked", lambda **_kw: {})
+        monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+        monkeypatch.setattr(cc, "_classify_llm_complete", lambda messages: "revision — ok")
+        monkeypatch.setattr(session_context, "local_now", lambda: _at(8, 0))
+        monkeypatch.setattr(cc, "DEFAULT_DB_PATH", db)
+        context = types.SimpleNamespace(bot=types.SimpleNamespace())
+        await bot._chapter_classify_scan(context)
+
+    asyncio.run(run_scan())
+    # Claim released AND the just-written proposed row discarded.
+    with sqlite3.connect(db) as conn:
+        claimed = conn.execute(
+            "SELECT 1 FROM reminder_events WHERE event_key=?",
+            (f"classify:{key}",),
+        ).fetchone()
+    assert claimed is None
+    assert _query(db, f"SELECT 1 FROM {cc.CLASSIFICATIONS_TABLE} WHERE chapter_key=?",
+                  (key,)) == []
+
+    # A later scan re-proposes the same chapter (no orphaned row suppressing it).
+    sent = []
+    asyncio.run(_run_classify_scan(db, _at(8, 5), monkeypatch, sent))
+    assert len(sent) == 1
+    buttons = [
+        b.callback_data for row in sent[0][2].inline_keyboard for b in row
+    ]
+    assert f"classify:confirm:{key}" in buttons
