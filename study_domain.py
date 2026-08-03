@@ -610,6 +610,8 @@ def record_doubt_attempt(
         comparable = attempted_at
         if comparable.tzinfo is None and latest_valid.tzinfo is not None:
             comparable = comparable.replace(tzinfo=latest_valid.tzinfo)
+        elif comparable.tzinfo is not None and latest_valid.tzinfo is None:
+            latest_valid = latest_valid.replace(tzinfo=comparable.tzinfo)
         if (comparable - latest_valid).total_seconds() < 30 * 60:
             valid = False
     attempt_no = len(previous) + 1
