@@ -355,16 +355,18 @@ def due_exams(*, now: dt.datetime | None = None, db_path: str | Path = DEFAULT_D
         raw = row.get("exam_date")
         if not raw:
             continue
-        try:
-            stamp = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=now.tzinfo)
-            due = stamp <= now
-        except ValueError:
+        raw_str = str(raw).strip()
+        if "T" not in raw_str and len(raw_str[:10]) == 10:
             try:
-                # A date-only exam has no finish time.  Do not ask whether it
-                # has finished at midnight before the paper has even started.
-                due = dt.date.fromisoformat(str(raw)[:10]) < now.date()
+                due = dt.date.fromisoformat(raw_str[:10]) < now.date()
+            except ValueError:
+                continue
+        else:
+            try:
+                stamp = dt.datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=now.tzinfo)
+                due = stamp <= now
             except ValueError:
                 continue
         if due:
