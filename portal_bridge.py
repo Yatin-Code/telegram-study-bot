@@ -62,9 +62,11 @@ def promote_tests_to_exams(*, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str
     """
     counts = {"inserted": 0, "linked": 0, "skipped": 0}
     try:
-        tests = ntsc_coaching.next_tests(
-            today="1900-01-01", limit=1000, db_path=db_path
-        )
+        # Only promote UPCOMING tests (test_date >= today). Past tests are
+        # already in coaching_results; promoting them as status='Planned'
+        # would trigger spurious "has it finished?" reminders.
+        today = session_context.local_today_iso()
+        tests = ntsc_coaching.next_tests(today=today, limit=50, db_path=db_path)
         for row in tests:
             source_id = row.get("source_id")
             title = row.get("title")
