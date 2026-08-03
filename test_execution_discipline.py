@@ -212,10 +212,46 @@ def test_confirmations_and_day_types_exist_with_correct_columns(db):
     assert _column_names(db, ed.CONFIRMATIONS_TABLE) == {
         "local_date", "block_key", "template_key", "status",
         "started_at", "skipped_at", "completed_at",
+        "stopped_at", "duration_min", "completion_source",
     }
     assert _column_names(db, ed.DAY_TYPES_TABLE) == {
         "local_date", "day_type", "resolved_at",
     }
+
+
+def test_init_db_migrates_old_confirmations_table_additively(tmp_path):
+    """A pre-stop-metadata table gains the three columns without a rebuild,
+    and its existing rows survive untouched."""
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            f"CREATE TABLE {ed.CONFIRMATIONS_TABLE} ("
+            "local_date TEXT NOT NULL, block_key TEXT NOT NULL, template_key TEXT, "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending','started','skipped','completed')), "
+            "started_at TEXT, skipped_at TEXT, completed_at TEXT, "
+            "PRIMARY KEY (local_date, block_key))"
+        )
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status) VALUES (?, ?, ?, ?)",
+            ("2026-08-05", "coach_b02_exec_a", ed.COACHING_TEMPLATE_KEY, "pending"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    ed._connect(db)
+    cols = _column_names(db, ed.CONFIRMATIONS_TABLE)
+    assert {"stopped_at", "duration_min", "completion_source"} <= cols
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            f"SELECT status, stopped_at, duration_min, completion_source "
+            f"FROM {ed.CONFIRMATIONS_TABLE} "
+            "WHERE local_date='2026-08-05' AND block_key='coach_b02_exec_a'"
+        ).fetchone()
+    assert row[0] == "pending"
+    assert row[1] is None and row[2] is None and row[3] is None
 
 
 def test_templates_and_blocks_exist_with_correct_columns(db):
@@ -595,6 +631,157 @@ def test_full_lifecycle_leaves_one_completed_row(db):
     assert len(rows) == 1
     assert rows[0]["status"] == "completed"
     assert rows[0]["completed_at"]
+
+
+# ---------------------------------------------------------------------------
+# Stopwatch: elapsed_minutes + confirm_stop + stop metadata
+# ---------------------------------------------------------------------------
+
+def _pin_started_at(db, date_iso, block_key, started_at):
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            f"UPDATE {ed.CONFIRMATIONS_TABLE} SET started_at=? "
+            "WHERE local_date=? AND block_key=?",
+            (started_at, date_iso, block_key),
+        )
+        conn.commit()
+
+
+def test_elapsed_minutes_from_persisted_started_at(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    _pin_started_at(db, "2026-08-05", "coach_b02_exec_a", "2026-08-05T08:30:00+00:00")
+    now = dt.datetime(2026, 8, 5, 9, 5, tzinfo=dt.timezone.utc)
+    assert ed.elapsed_minutes("2026-08-05", "coach_b02_exec_a", now=now, db_path=db) == 35
+
+
+def test_elapsed_minutes_rounds_and_never_negative(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    _pin_started_at(db, "2026-08-05", "coach_b02_exec_a", "2026-08-05T08:30:00+00:00")
+    # A clock before started_at must clamp to 0, never go negative.
+    early = dt.datetime(2026, 8, 5, 8, 15, tzinfo=dt.timezone.utc)
+    assert ed.elapsed_minutes("2026-08-05", "coach_b02_exec_a", now=early, db_path=db) == 0
+    # 40s after start rounds up to 1 minute.
+    just_after = dt.datetime(2026, 8, 5, 8, 30, 40, tzinfo=dt.timezone.utc)
+    assert ed.elapsed_minutes("2026-08-05", "coach_b02_exec_a", now=just_after, db_path=db) == 1
+    # 10m20s rounds down to 10.
+    ten = dt.datetime(2026, 8, 5, 8, 40, 20, tzinfo=dt.timezone.utc)
+    assert ed.elapsed_minutes("2026-08-05", "coach_b02_exec_a", now=ten, db_path=db) == 10
+
+
+def test_elapsed_minutes_none_when_not_started(db):
+    ed.seed_templates(db)
+    assert ed.elapsed_minutes("2026-08-05", "coach_b02_exec_a", db_path=db) is None
+    ed.confirm_skip("2026-08-05", "coach_b02_exec_a", db)
+    assert ed.elapsed_minutes("2026-08-05", "coach_b02_exec_a", db_path=db) is None
+
+
+def test_confirm_stop_started_to_completed_with_metadata(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    _pin_started_at(db, "2026-08-05", "coach_b02_exec_a", "2026-08-05T08:30:00+00:00")
+    now = dt.datetime(2026, 8, 5, 9, 5, tzinfo=dt.timezone.utc)
+    stopped = ed.confirm_stop("2026-08-05", "coach_b02_exec_a", now=now, db_path=db)
+    assert stopped["status"] == "completed"
+    assert dt.datetime.fromisoformat(stopped["stopped_at"]) == now
+    assert stopped["duration_min"] == 35
+    assert stopped["completion_source"] == "stop"
+
+
+def test_confirm_stop_repeated_is_idempotent(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    _pin_started_at(db, "2026-08-05", "coach_b02_exec_a", "2026-08-05T08:30:00+00:00")
+    first = ed.confirm_stop(
+        "2026-08-05", "coach_b02_exec_a",
+        now=dt.datetime(2026, 8, 5, 9, 5, tzinfo=dt.timezone.utc), db_path=db,
+    )
+    again = ed.confirm_stop(
+        "2026-08-05", "coach_b02_exec_a",
+        now=dt.datetime(2026, 8, 5, 9, 10, tzinfo=dt.timezone.utc), db_path=db,
+    )
+    assert again["status"] == "completed"
+    assert again["duration_min"] == first["duration_min"] == 35
+    assert again["stopped_at"] == first["stopped_at"]
+
+
+def test_confirm_stop_pending_and_skipped_do_not_transition(db):
+    ed.seed_templates(db)
+    conn = ed._connect(db)
+    try:
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status) VALUES (?, ?, ?, 'pending')",
+            ("2026-08-05", "coach_b02_exec_a", ed.COACHING_TEMPLATE_KEY),
+        )
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status) VALUES (?, ?, ?, 'skipped')",
+            ("2026-08-05", "coach_b03_break", ed.COACHING_TEMPLATE_KEY),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    pending = ed.confirm_stop("2026-08-05", "coach_b02_exec_a", db_path=db)
+    assert pending["status"] == "pending"
+    assert pending["stopped_at"] is None and pending["duration_min"] is None
+    skipped = ed.confirm_stop("2026-08-05", "coach_b03_break", db_path=db)
+    assert skipped["status"] == "skipped"
+    assert skipped["stopped_at"] is None
+
+
+def test_confirm_stop_no_row_and_unknown_block_none(db):
+    ed.seed_templates(db)
+    # Known block, no confirmation row: a stop never invents a completion.
+    assert ed.confirm_stop("2026-08-05", "coach_b02_exec_a", db_path=db) is None
+    assert ed.confirm_stop("2099-01-01", "nope", db_path=db) is None
+
+
+def test_mark_completed_sets_ledger_source(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    done = ed.mark_completed("2026-08-05", "coach_b02_exec_a", db)
+    assert done["status"] == "completed"
+    assert done["completion_source"] == "ledger"
+    assert done["stopped_at"] is None and done["duration_min"] is None
+
+
+def test_mark_completed_preserves_stop_metadata(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    _pin_started_at(db, "2026-08-05", "coach_b02_exec_a", "2026-08-05T08:30:00+00:00")
+    stopped = ed.confirm_stop(
+        "2026-08-05", "coach_b02_exec_a",
+        now=dt.datetime(2026, 8, 5, 9, 5, tzinfo=dt.timezone.utc), db_path=db,
+    )
+    assert stopped["completion_source"] == "stop"
+    after = ed.mark_completed("2026-08-05", "coach_b02_exec_a", db)
+    assert after["status"] == "completed"
+    assert after["completion_source"] == "stop"
+    assert after["duration_min"] == 35
+
+
+def test_get_block_returns_seeded_block_with_local_date(db):
+    ed.seed_templates(db)
+    _set_day_type(db, "2026-08-05", "coaching")
+    block = ed.get_block("2026-08-05", "coach_b02_exec_a", db)
+    assert block is not None
+    assert block["title"] == "Execution Block A"
+    assert block["local_date"] == "2026-08-05"
+
+
+def test_get_block_uses_confirmation_template_without_day_type(db):
+    ed.seed_templates(db)
+    ed.confirm_start("2026-08-05", "coach_b02_exec_a", db)
+    block = ed.get_block("2026-08-05", "coach_b02_exec_a", db)
+    assert block is not None
+    assert block["title"] == "Execution Block A"
+
+
+def test_get_block_unknown_returns_none(db):
+    ed.seed_templates(db)
+    assert ed.get_block("2099-01-01", "nope", db) is None
 
 
 # ---------------------------------------------------------------------------

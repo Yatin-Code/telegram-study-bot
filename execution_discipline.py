@@ -88,6 +88,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             started_at TEXT,
             skipped_at TEXT,
             completed_at TEXT,
+            stopped_at TEXT,
+            duration_min REAL,
+            completion_source TEXT,
             PRIMARY KEY (local_date, block_key)
         );
         CREATE TABLE IF NOT EXISTS {DAY_TYPES_TABLE} (
@@ -96,7 +99,26 @@ def init_db(conn: sqlite3.Connection) -> None:
             resolved_at TEXT NOT NULL
         );
     """)
+    # Additive migration: CREATE TABLE IF NOT EXISTS never adds columns to an
+    # existing table, so pre-stop-metadata databases need ALTER TABLE here.
+    for column, sql_type in (
+        ("stopped_at", "TEXT"),
+        ("duration_min", "REAL"),
+        ("completion_source", "TEXT"),
+    ):
+        _ensure_column(conn, CONFIRMATIONS_TABLE, column, sql_type)
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
+    """ALTER TABLE ADD COLUMN when the column is missing (no-op otherwise).
+
+    ``table``/``column`` are module-level constants, never user input, so no
+    identifier quoting is needed here.
+    """
+    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if column not in {r[1] for r in info}:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
 def _connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -384,7 +406,8 @@ def get_state(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_DB_PA
     try:
         row = conn.execute(
             f"SELECT local_date, block_key, template_key, status, started_at, "
-            f"skipped_at, completed_at FROM {CONFIRMATIONS_TABLE} "
+            f"skipped_at, completed_at, stopped_at, duration_min, completion_source "
+            f"FROM {CONFIRMATIONS_TABLE} "
             f"WHERE local_date = ? AND block_key = ?",
             (date_iso[:10], block_key),
         ).fetchone()
@@ -473,7 +496,9 @@ def mark_completed(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_
 
     ONLY from started: from pending/skipped/completed this is a no-op returning
     the current row, and with no existing row it returns None — a completion is
-    never invented. None for an unknown block_key.
+    never invented. The completion source is 'ledger' (evidence-driven); an
+    existing stop metadata block (completion_source='stop') is never
+    overwritten. None for an unknown block_key.
     """
     conn = _connect(db_path)
     try:
@@ -487,7 +512,8 @@ def mark_completed(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_
         ).fetchone()
         if row is not None and row["status"] == "started":
             conn.execute(
-                f"UPDATE {CONFIRMATIONS_TABLE} SET status='completed', completed_at=? "
+                f"UPDATE {CONFIRMATIONS_TABLE} SET status='completed', completed_at=?, "
+                f"completion_source=COALESCE(completion_source, 'ledger') "
                 f"WHERE local_date=? AND block_key=?",
                 (session_context.local_now().isoformat(), local_date, block_key),
             )
@@ -495,6 +521,84 @@ def mark_completed(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_
         return get_state(local_date, block_key, db_path=db_path)
     finally:
         conn.close()
+
+
+def elapsed_minutes(date_iso: str, block_key: str, now=None, db_path: str | Path = DEFAULT_DB_PATH) -> int | None:
+    """Whole minutes since the persisted started_at, rounded and never negative.
+
+    Based ONLY on the persisted ``started_at`` — never the wall-clock block
+    window — so a late start reports real time on task. ``now`` defaults to the
+    current local time. Returns None when there is no started row or its
+    timestamp cannot be parsed.
+    """
+    state = get_state(date_iso[:10], block_key, db_path=db_path)
+    if state is None or not state.get("started_at"):
+        return None
+    try:
+        started = dt.datetime.fromisoformat(state["started_at"])
+    except (ValueError, TypeError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=_tz())
+    seconds = (_as_local(now or session_context.local_now()) - started).total_seconds()
+    return max(0, int(round(seconds / 60.0)))
+
+
+def confirm_stop(date_iso: str, block_key: str, now=None, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """Transition a block 'started' → 'completed' with stop metadata.
+
+    Only from started: sets stopped_at=now, duration_min=elapsed and
+    completion_source='stop'. From pending/skipped/completed this is a no-op
+    returning the current row unchanged; with no existing row it returns None —
+    a stop never invents a completion. None for an unknown block_key.
+    """
+    conn = _connect(db_path)
+    try:
+        template_key = _block_template_key(conn, block_key)
+        if template_key is None:
+            return None
+        local_date = date_iso[:10]
+        row = conn.execute(
+            f"SELECT * FROM {CONFIRMATIONS_TABLE} WHERE local_date=? AND block_key=?",
+            (local_date, block_key),
+        ).fetchone()
+        if row is None or row["status"] != "started":
+            return get_state(local_date, block_key, db_path=db_path)
+        conn.execute(
+            f"UPDATE {CONFIRMATIONS_TABLE} SET status='completed', stopped_at=?, "
+            f"duration_min=?, completion_source='stop' "
+            f"WHERE local_date=? AND block_key=?",
+            (
+                _as_local(now or session_context.local_now()).isoformat(),
+                elapsed_minutes(local_date, block_key, now=now, db_path=db_path),
+                local_date,
+                block_key,
+            ),
+        )
+        conn.commit()
+        return get_state(local_date, block_key, db_path=db_path)
+    finally:
+        conn.close()
+
+
+def get_block(date_iso: str, block_key: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """The seeded block row (with ``local_date``) for a (date, block_key).
+
+    Uses the confirmation row's template when present (no day-type work);
+    otherwise resolves the date's template. Returns None when the block is
+    unknown. Message renderers that only carry date + block_key use this to
+    show the block title/window.
+    """
+    local_date = date_iso[:10]
+    state = get_state(local_date, block_key, db_path=db_path)
+    if state is not None and state["template_key"]:
+        blocks = blocks_for_template(state["template_key"], db_path=db_path)
+    else:
+        blocks = blocks_for_date(local_date, db_path=db_path)
+    for block in blocks:
+        if block["block_key"] == block_key:
+            return {**block, "local_date": local_date}
+    return None
 
 
 # ---------------------------------------------------------------------------

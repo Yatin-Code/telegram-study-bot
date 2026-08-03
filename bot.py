@@ -3113,14 +3113,29 @@ async def on_agent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await agent_renderer.render(query, result["response"])
 
 
-async def on_discipline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Started/Skip on execution-discipline block messages.
+def _discipline_kb(date_iso: str, block_key: str, *pairs) -> InlineKeyboardMarkup:
+    """One-row inline keyboard of ``(label, action)`` buttons for a discipline card."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            label, callback_data=f"discipline:{action}:{date_iso}:{block_key}"
+        )
+        for label, action in pairs
+    ]])
 
-    ``discipline:start:<date>:<block_key>`` transitions the block to started;
-    ``discipline:skip:<date>:<block_key>`` to skipped. The buttons are removed
-    by editing the message. The "time to start" coach text is shown ONLY when
-    the start transition actually happened (status 'started'); an already
-    skipped/completed block shows its actual state instead.
+
+async def on_discipline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Start/Skip/Stop on execution-discipline block messages.
+
+    Starting is two-step: ``discipline:start`` edits to a confirm card (no
+    state mutation) with Confirm start / Not now; ``discipline:confirmstart``
+    persists ``started_at`` idempotently and shows a running card with a Stop
+    button; ``discipline:cancelstart`` returns to the pending card. Stopping is
+    also two-step: ``discipline:stop`` shows the elapsed with Stop & log /
+    Keep going; ``discipline:confirmstop`` persists ``stopped_at``,
+    ``duration_min`` and completion_source='stop' and prompts to log the work
+    (no Ledger row is ever created); ``discipline:keepgoing`` returns to the
+    running card. ``discipline:skip`` stays immediate. Every action is
+    idempotent: a duplicate tap renders the actual state.
     """
     query = update.callback_query
     await query.answer()
@@ -3133,25 +3148,115 @@ async def on_discipline_callback(update: Update, context: ContextTypes.DEFAULT_T
     _, action, date, block_key = parts
     import execution_discipline
     db_path = execution_discipline.DEFAULT_DB_PATH
+    state = execution_discipline.get_state(date, block_key, db_path=db_path)
+    status = state["status"] if state else None
+    block = execution_discipline.get_block(date, block_key, db_path=db_path)
+    title = block["title"] if block else block_key
+    window = f"{block['start_hhmm']}-{block['end_hhmm']}" if block else ""
+
+    async def show(text: str, markup: InlineKeyboardMarkup | None = None) -> None:
+        await query.edit_message_text(text, reply_markup=markup)
+
+    async def render_pending() -> None:
+        await show(
+            f"⏰ {title} ({window}) — time to start.",
+            _discipline_kb(date, block_key, ("▶️ Start", "start"), ("Skip", "skip")),
+        )
+
+    async def render_confirm_start() -> None:
+        await show(
+            f"Ready to start {title} ({window})?",
+            _discipline_kb(
+                date, block_key,
+                ("✅ Confirm start", "confirmstart"), ("Not now", "cancelstart"),
+            ),
+        )
+
+    async def render_running(state_: dict) -> None:
+        started = state_.get("started_at") or ""
+        stamp = f" at {started[:16].replace('T', ' ')}" if started else ""
+        await show(
+            f"▶️ {title} ({window}) — started{stamp}. Keep going!",
+            _discipline_kb(date, block_key, ("⏹ Stop", "stop")),
+        )
+
+    async def render_stop_confirm() -> None:
+        elapsed = execution_discipline.elapsed_minutes(
+            date, block_key, db_path=db_path
+        )
+        minutes = elapsed if elapsed is not None else 0
+        await show(
+            f"⏹ {title} — {minutes} min elapsed. Stop and log?",
+            _discipline_kb(
+                date, block_key, ("Stop & log", "confirmstop"), ("Keep going", "keepgoing"),
+            ),
+        )
+
+    async def render_stopped(state_: dict) -> None:
+        minutes = state_.get("duration_min")
+        if minutes is None:
+            await render_actual(state_)
+            return
+        await show(
+            f"✅ {title} stopped — {int(minutes)} min of work. "
+            "Log what you did (subject, topic, questions, minutes) so it counts."
+        )
+
+    async def render_actual(state_: dict) -> None:
+        st = state_["status"]
+        if st == "skipped":
+            await show(f"⏭ {title} skipped.")
+        elif st == "completed":
+            await show(f"✅ {title} already completed.")
+        else:
+            await show(f"{title} is still pending.")
+
     if action == "start":
+        if status in (None, "pending"):
+            await render_confirm_start()
+        else:
+            await render_actual(state)
+        return
+    if action == "confirmstart":
         state = execution_discipline.confirm_start(date, block_key, db_path=db_path)
-    elif action == "skip":
+        if state is None:
+            await show("Unknown block.")
+            return
+        await render_running(state)
+        return
+    if action == "cancelstart":
+        if status in (None, "pending"):
+            await render_pending()
+        else:
+            await render_actual(state)
+        return
+    if action == "stop":
+        if status == "started":
+            await render_stop_confirm()
+        else:
+            await render_actual(state)
+        return
+    if action == "confirmstop":
+        state = execution_discipline.confirm_stop(date, block_key, db_path=db_path)
+        if state is None:
+            await show("Unknown block.")
+            return
+        await render_stopped(state)
+        return
+    if action == "keepgoing":
+        if status == "started":
+            await render_running(state)
+        else:
+            await render_actual(state)
+        return
+    if action == "skip":
         state = execution_discipline.confirm_skip(date, block_key, db_path=db_path)
-    else:
+        if state is None:
+            await show("Unknown block.")
+            return
+        await render_actual(state)
         return
-    if state is None:
-        await query.edit_message_text("Unknown block.")
-        return
-    status = state["status"]
-    if status == "started":
-        text = f"⏰ {block_key} — time to start. Go!"
-    elif status == "skipped":
-        text = f"⏭ {block_key} skipped."
-    elif status == "completed":
-        text = f"✅ {block_key} already completed."
-    else:
-        text = f"{block_key} is still pending."
-    await query.edit_message_text(text)
+    await render_actual(state)
 
 
 async def on_classify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3888,8 +3993,15 @@ async def _out_of_box_execution_check(chat_id: int, context: ContextTypes.DEFAUL
                     f"You're already mid-block ({title}) — keep going, and "
                     "log it when done."
                 )
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "⏹ Stop", callback_data=f"discipline:stop:{date}:{key}"
+                    ),
+                ]])
                 try:
-                    await _send_markdown(context.bot, chat_id, text)
+                    await _send_markdown(
+                        context.bot, chat_id, text, reply_markup=keyboard
+                    )
                 except Exception:
                     reminders.release(claim_key, db_path=db_path)
                     raise
@@ -3993,7 +4105,15 @@ async def _execution_discipline_scan(context: ContextTypes.DEFAULT_TYPE) -> None
                 text = execution_discipline.discipline_message(
                     candidate["tier"], candidate["block"], db_path=db_path, now=now
                 )
-                await _send_markdown(context.bot, chat_id, text)
+                markup = None
+                if candidate["kind"] == "discipline_start":
+                    markup = _discipline_kb(
+                        candidate["date"], candidate["block_key"],
+                        ("▶️ Start", "start"), ("Skip", "skip"),
+                    )
+                await _send_markdown(
+                    context.bot, chat_id, text, reply_markup=markup
+                )
             except Exception:
                 reminders.release(candidate["event_key"], db_path=db_path)
                 logger.exception(

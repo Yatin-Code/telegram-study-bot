@@ -534,12 +534,14 @@ def _fake_query(data, edits):
     class Query:
         def __init__(self):
             self.data = data
+            self.markups = []
 
         async def answer(self):
             pass
 
         async def edit_message_text(self, text, **_kw):
             edits.append(text)
+            self.markups.append(_kw.get("reply_markup"))
 
     return Query()
 
@@ -551,7 +553,10 @@ def _callback_update(query):
     )
 
 
-def test_discipline_callback_start_records_and_edits(db, monkeypatch):
+def test_discipline_callback_start_shows_confirm_then_confirmstart_records(db, monkeypatch):
+    """Given a pending block, tapping Start edits to a confirm card (no state
+    mutation); tapping Confirm start then persists started_at and shows the
+    running card with a Stop button."""
     _seed_discipline(db)
     monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
     monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
@@ -559,8 +564,37 @@ def test_discipline_callback_start_records_and_edits(db, monkeypatch):
     query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
     update = _callback_update(query)
     asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
-    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
-    assert edits and "time to start" in edits[0]
+    # Two-step: start alone must NOT mutate state.
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db) is None
+    assert edits and "Ready to start" in edits[0]
+    actions = [btn.callback_data for row in query.markups[0].inline_keyboard for btn in row]
+    assert "discipline:confirmstart:2026-08-02:coach_b02_exec_a" in actions
+    assert "discipline:cancelstart:2026-08-02:coach_b02_exec_a" in actions
+
+    edits.clear()
+    query = _fake_query("discipline:confirmstart:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    state = ed.get_state("2026-08-02", "coach_b02_exec_a", db)
+    assert state["status"] == "started"
+    assert state["started_at"]
+    assert edits and "started" in edits[0]
+    assert "Execution Block A" in edits[0]
+    actions = [btn.callback_data for row in query.markups[0].inline_keyboard for btn in row]
+    assert "discipline:stop:2026-08-02:coach_b02_exec_a" in actions
+
+
+def test_discipline_callback_confirmstart_is_idempotent(db, monkeypatch):
+    """Given an already-started block, a second Confirm start keeps the same
+    started_at and still renders the running card."""
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    first = ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    edits = []
+    query = _fake_query("discipline:confirmstart:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["started_at"] == first["started_at"]
+    assert edits and "started" in edits[0]
 
 
 def test_discipline_callback_start_on_skipped_shows_skipped(db, monkeypatch):
@@ -586,6 +620,105 @@ def test_discipline_callback_skip_records_skipped(db, monkeypatch):
     asyncio.run(bot.on_discipline_callback(update, types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "skipped"
     assert edits and "skipped" in edits[0]
+
+
+def test_discipline_callback_stop_flow_renders_stopped_with_elapsed(db, monkeypatch):
+    """Full two-step stop: Start -> confirm -> running -> Stop confirm ->
+    Stop & log -> stopped card with elapsed, persisted stop metadata, and a
+    log prompt — and NO Ledger row is created."""
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    with _conn(db) as conn:
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status, started_at) "
+            "VALUES ('2026-08-02', 'coach_b02_exec_a', ?, 'started', "
+            "'2026-08-02T08:30:00+00:00')",
+            (ed.COACHING_TEMPLATE_KEY,),
+        )
+        conn.commit()
+
+    edits = []
+    query = _fake_query("discipline:stop:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    assert edits and "elapsed" in edits[0]
+    actions = [btn.callback_data for row in query.markups[0].inline_keyboard for btn in row]
+    assert "discipline:confirmstop:2026-08-02:coach_b02_exec_a" in actions
+    assert "discipline:keepgoing:2026-08-02:coach_b02_exec_a" in actions
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
+
+    edits.clear()
+    query = _fake_query("discipline:confirmstop:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    state = ed.get_state("2026-08-02", "coach_b02_exec_a", db)
+    assert state["status"] == "completed"
+    assert state["completion_source"] == "stop"
+    assert state["duration_min"] is not None
+    assert state["stopped_at"]
+    assert edits and "stopped" in edits[0]
+    assert "min" in edits[0]
+    with _conn(db) as conn:
+        ledger = conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+    assert ledger == 0
+
+
+def test_discipline_callback_stop_confirm_duplicate_is_idempotent(db, monkeypatch):
+    """Given an already stop-completed block, a repeated Stop & log keeps the
+    persisted duration and does not rewrite the state."""
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    with _conn(db) as conn:
+        conn.execute(
+            f"INSERT INTO {ed.CONFIRMATIONS_TABLE} "
+            "(local_date, block_key, template_key, status, started_at) "
+            "VALUES ('2026-08-02', 'coach_b02_exec_a', ?, 'started', "
+            "'2026-08-02T08:30:00+00:00')",
+            (ed.COACHING_TEMPLATE_KEY,),
+        )
+        conn.commit()
+    query = _fake_query("discipline:confirmstop:2026-08-02:coach_b02_exec_a", [])
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    first = ed.get_state("2026-08-02", "coach_b02_exec_a", db)
+    edits = []
+    again = _fake_query("discipline:confirmstop:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(again), types.SimpleNamespace()))
+    second = ed.get_state("2026-08-02", "coach_b02_exec_a", db)
+    assert second["duration_min"] == first["duration_min"]
+    assert second["stopped_at"] == first["stopped_at"]
+    assert edits and "stopped" in edits[0]
+
+
+def test_discipline_callback_keepgoing_returns_to_running(db, monkeypatch):
+    """Given a started block, Keep going returns to the running card and the
+    state stays started."""
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    ed.confirm_start("2026-08-02", "coach_b02_exec_a", db)
+    edits = []
+    query = _fake_query("discipline:keepgoing:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
+    assert edits and "started" in edits[0]
+    actions = [btn.callback_data for row in query.markups[0].inline_keyboard for btn in row]
+    assert "discipline:stop:2026-08-02:coach_b02_exec_a" in actions
+
+
+def test_discipline_callback_cancelstart_returns_to_pending(db, monkeypatch):
+    """Given a pending block, Not now returns to the pending Start/Skip card."""
+    _seed_discipline(db)
+    monkeypatch.setattr(ed, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(bot, "telegram_allowed_user_id", lambda: 1)
+    edits = []
+    query = _fake_query("discipline:cancelstart:2026-08-02:coach_b02_exec_a", edits)
+    asyncio.run(bot.on_discipline_callback(_callback_update(query), types.SimpleNamespace()))
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db) is None
+    assert edits and "time to start" in edits[0]
+    actions = [btn.callback_data for row in query.markups[0].inline_keyboard for btn in row]
+    assert "discipline:start:2026-08-02:coach_b02_exec_a" in actions
+    assert "discipline:skip:2026-08-02:coach_b02_exec_a" in actions
 
 
 def _seed_coaching_day(db):
@@ -636,7 +769,7 @@ def test_full_day_drive(db, monkeypatch):
     assert len(sent) == 1
     assert sent[0][1] == "coach text"
     edits = []
-    query = _fake_query("discipline:start:2026-08-02:coach_b02_exec_a", edits)
+    query = _fake_query("discipline:confirmstart:2026-08-02:coach_b02_exec_a", edits)
     asyncio.run(bot.on_discipline_callback(
             _callback_update(query), types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "started"
@@ -645,9 +778,10 @@ def test_full_day_drive(db, monkeypatch):
     sent = asyncio.run(_run_discipline_scan(db, _at(10, 15), monkeypatch))
     assert sent == []
     assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["status"] == "completed"
+    assert ed.get_state("2026-08-02", "coach_b02_exec_a", db)["completion_source"] == "ledger"
 
     # --- Block B (10:30-12:00): started, no ledger -> checkin claimed once.
-    query = _fake_query("discipline:start:2026-08-02:coach_b04_exec_b", edits)
+    query = _fake_query("discipline:confirmstart:2026-08-02:coach_b04_exec_b", edits)
     asyncio.run(bot.on_discipline_callback(
             _callback_update(query), types.SimpleNamespace()))
     assert ed.get_state("2026-08-02", "coach_b04_exec_b", db)["status"] == "started"
