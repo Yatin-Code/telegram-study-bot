@@ -81,13 +81,36 @@ def sync_once(
             scheduled_payload = client.scheduled_exams(course_id)
             scheduled_rows = _list_at(scheduled_payload, "examPaper")
             by_id = {str(row.get("id")): row for row in scheduled_rows}
+            # The exam calendar (GetStudentCalendar) is the ONLY endpoint that
+            # returns UPCOMING tests. Merge it so future test dates (TEST-7/8)
+            # reach coaching_tests and the portal bridge.
+            try:
+                calendar_rows = client.test_calendar()
+                if isinstance(calendar_rows, dict):
+                    calendar_rows = calendar_rows.get("data") or []
+                if isinstance(calendar_rows, list):
+                    for cal_row in calendar_rows:
+                        cid = str(cal_row.get("id") or "")
+                        if cid and cid not in by_id:
+                            by_id[cid] = cal_row
+            except Exception:
+                logger.warning("test_calendar fetch failed", exc_info=True)
             combined_tests = []
+            seen_ids = set()
             for row in test_rows:
                 merged = dict(row)
-                scheduled = by_id.get(str(row.get("id")))
+                rid = str(row.get("id") or "")
+                if rid:
+                    seen_ids.add(rid)
+                scheduled = by_id.get(rid)
                 if scheduled:
                     merged.update({k: v for k, v in scheduled.items() if v not in (None, "")})
                 combined_tests.append(merged)
+            # Calendar-only rows (upcoming tests not in GetTests) are appended
+            # so replace_tests stores them too.
+            for cal_id, cal_row in by_id.items():
+                if cal_id not in seen_ids:
+                    combined_tests.append(dict(cal_row))
             ntsc_coaching.replace_tests(combined_tests, db_path=db_path)
             coaching_syllabus.replace_syllabi(combined_tests, db_path=db_path)
             datasets.append("tests")

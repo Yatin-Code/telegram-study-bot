@@ -25,10 +25,15 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent / "sqlite_mirror.db"
 
 _ISO_DATE_RE = re.compile(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})")
 _DMY_DATE_RE = re.compile(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})")
+_ALPHA_MONTH_DATE_RE = re.compile(r"^(\d{1,2})-([A-Za-z]{3})-(\d{4})")
+_MONTHS = {name: i for i, name in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
 
 
 def _iso_date(value: Any) -> str | None:
-    """Normalize YYYY-MM-DD or DD-MM-YYYY (optionally with a time suffix) to ISO."""
+    """Normalize YYYY-MM-DD, DD-MM-YYYY or DD-MMM-YYYY (alpha month, e.g.
+    "16-Aug-2026", optionally with a time suffix) to ISO."""
     if value is None:
         return None
     text = str(value).strip()
@@ -38,8 +43,16 @@ def _iso_date(value: Any) -> str | None:
     else:
         match = _DMY_DATE_RE.match(text)
         if not match:
-            return None
-        day, month, year = (int(part) for part in match.groups())
+            match = _ALPHA_MONTH_DATE_RE.match(text)
+            if not match:
+                return None
+            day, month_name, year = match.groups()
+            month = _MONTHS.get(month_name.lower())
+            if month is None:
+                return None
+            day, year = int(day), int(year)
+        else:
+            day, month, year = (int(part) for part in match.groups())
     return f"{year:04d}-{month:02d}-{day:02d}"
 
 

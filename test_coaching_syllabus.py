@@ -340,6 +340,9 @@ class _FakeClient:
     def scheduled_exams(self, course_id):
         return {"data": {"examPaper": []}}
 
+    def test_calendar(self):
+        return {"data": []}
+
     def course_results(self, course_id):
         return {"data": {"result": []}}
 
@@ -367,3 +370,29 @@ def test_sync_once_populates_syllabus(tmp_path):
     upcoming = cs.upcoming_syllabus(today="2026-08-01", db_path=db)
     assert len(upcoming) == 1
     assert upcoming[0]["syllabus_count"] == 2
+
+
+def test_iso_date_alpha_month():
+    assert ntsc_coaching._iso_date("16-Aug-2026") == "2026-08-16"
+    assert ntsc_coaching._iso_date("06-Sep-2026 09:00 AM") == "2026-09-06"
+
+
+class _FakeClientWithCalendar(_FakeClient):
+    def test_calendar(self):
+        return {"data": [
+            {"id": 1003, "testName": "Internal Test-07", "syllabus": "",
+             "testDateTime": "16-Aug-2026 09:00 AM", "venue": "Ph 1A,1B",
+             "course": "", "batch": "", "goal": "", "createDate": "",
+             "isActive": 1},
+        ]}
+
+
+def test_calendar_upcoming_merged_into_tests(tmp_path):
+    db = _fresh_db(tmp_path)
+    result = ntsc_sync.sync_once(client=_FakeClientWithCalendar(), db_path=db)
+    assert result["status"] == "success"
+
+    upcoming = ntsc_coaching.next_tests(today="2026-08-01", db_path=db)
+    titles = {t["title"]: t for t in upcoming}
+    assert "Internal Test-07" in titles
+    assert titles["Internal Test-07"]["test_date"] == "2026-08-16"
