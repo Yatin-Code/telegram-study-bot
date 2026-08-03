@@ -259,7 +259,7 @@ def _set_day_type(db, date_iso, day_type):
         conn.execute(
             f"INSERT OR REPLACE INTO {ed.DAY_TYPES_TABLE} "
             "(local_date, day_type, resolved_at) VALUES (?, ?, ?)",
-            (date_iso, day_type, "2026-08-02T12:00:00+00:00"),
+            (date_iso, day_type, session_context.local_now().isoformat()),
         )
         conn.commit()
 

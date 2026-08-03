@@ -24,6 +24,7 @@ import pytest
 import coaching_planner as cp
 import ntsc_coaching
 import operational_store
+import session_context
 import sync
 
 
@@ -262,7 +263,9 @@ def test_over_capacity_warns_and_unplaces_candidates(db):
     )
 
 
-def test_teacher_window_doubt_prep_is_anchored(db):
+def test_teacher_window_doubt_prep_is_anchored(db, monkeypatch):
+    fixed_now = dt.datetime(2026, 8, 3, 8, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setattr(session_context, "local_now", lambda: fixed_now)
     add_class(db, "2026-08-03", "09:00", subjects="Physics")
     insert(
         db, "timetable", notion_page_id="window-1", title="Teacher doubts",
@@ -279,6 +282,13 @@ def test_teacher_window_doubt_prep_is_anchored(db):
             doubt="d1", valid=1, outcome="Unsolved", attempt_no=n,
             attempted_at=f"2026-08-0{n}T09:00:00+00:00",
         )
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE op_timetable SET weekday=? WHERE notion_page_id='window-1'",
+            (dt.date.fromisoformat("2026-08-03").strftime("%A"),),
+        )
+        conn.commit()
 
     plan = cp.build_plan(target_date="2026-08-03", days=1, db_path=db)
 
