@@ -140,6 +140,20 @@ def sync_once(
         ntsc_coaching.replace_classes(class_rows, db_path=db_path)
         datasets.append("classes")
 
+        # Promote portal data into the op_* tables so every feature that reads
+        # op_exams / op_timetable sees portal tests/classes without a separate
+        # manual entry. Additive upserts — never overwrites user edits.
+        try:
+            import portal_bridge
+            exams_promo = portal_bridge.promote_tests_to_exams(db_path=db_path)
+            if any(exams_promo.values()):
+                logger.info("portal_bridge exams: %s", exams_promo)
+            tt_promo = portal_bridge.promote_classes_to_timetable(db_path=db_path)
+            if any(tt_promo.values()):
+                logger.info("portal_bridge timetable: %s", tt_promo)
+        except Exception:
+            logger.warning("portal_bridge promotion failed", exc_info=True)
+
         # Invalidate cached day-type resolutions so they re-resolve against the
         # freshly-synced coaching cache. Without this a day resolved as
         # non_coaching during a stale/empty-cache window stays wrong forever.
