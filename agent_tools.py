@@ -54,6 +54,37 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "sqlite_mirror.db"
 
+# Internal/system tables that must never be advertised to the LLM via
+# get_schema.  These hold user transcripts, pending writes, draft state,
+# health/probe data, or sync metadata — none are business tables the agent
+# should query.  A prompt-injection via Notion page_content could otherwise
+# steer the LLM to read other chats' pending states or write payloads.
+_INTERNAL_TABLES = frozenset({
+    "agent_pending_states",
+    "drafts",
+    "pending_clarifications",
+    "pending_writes",
+    "chat_qa_history",
+    "bug_reports",
+    "pending_doubt_resolutions",
+    "pending_session_debrief",
+    "pending_setting_edits",
+    "reset_confirmations",
+    "operational_schema_meta",
+    "sync_meta",
+    "reminder_events",
+    "reminder_deliveries",
+    "coaching_sync_runs",
+    "llm_model_health",
+    "llm_route_state",
+    "llm_requests",
+    "conversation_history",
+    "chat_context",
+    "commitment_checks",
+    "op_execution_links",
+    "sqlite_sequence",
+})
+
 
 class ToolArgError(ValueError):
     """Invalid tool arguments — message is shown to the model for self-correction."""
@@ -214,14 +245,11 @@ def get_schema(table: Optional[str] = None, *, db_path: str | Path = DEFAULT_DB_
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
             ).fetchall()
             names = [r["name"] for r in rows]
+            visible = [n for n in names if n not in _SQL_OWNED_KEYS and n not in _INTERNAL_TABLES]
             if table is None:
-                return {"tables": [n for n in names if n not in _SQL_OWNED_KEYS]}
+                return {"tables": visible}
 
-            # Whitelist: only names the listing above would surface are
-            # interrogated. Anything else — a bare SQL-owned mirror name or a
-            # made-up identifier — is rejected so no caller-supplied string is
-            # ever interpolated into SQL as an identifier.
-            allowed = {n for n in names if n not in _SQL_OWNED_KEYS}
+            allowed = set(visible)
             if table not in allowed:
                 logger.warning("get_schema rejected non-whitelisted table %r", table)
                 return {"error": True, "message": f"unknown table: {table}"}
@@ -312,7 +340,7 @@ def _prep_logging(tool: str, args: dict[str, Any], chat_id: int | str, db_path: 
         filters=IntentFilters(),
     )
     try:
-        plan = logging_flow.build_write_plan(intent, chat_id, db_path=db_path)
+        plan = logging_flow.build_write_plan(intent, chat_id, db_path=db_path, first_round=False)
     except Exception as exc:
         logger.exception("build_write_plan failed for %s", tool)
         return {"ok": False, "error": f"could not prepare the write: {exc}"}
