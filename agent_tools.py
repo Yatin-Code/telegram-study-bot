@@ -39,6 +39,7 @@ Flow for writes:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import sqlite3
 import uuid
@@ -273,6 +274,156 @@ def get_schema(table: Optional[str] = None, *, db_path: str | Path = DEFAULT_DB_
     except Exception as exc:
         logger.exception("get_schema failed: %s", table)
         return _err(exc)
+
+
+# ---------------------------------------------------------------------------
+# JEE analytics read tools (read-only, parameterized SELECTs only)
+# ---------------------------------------------------------------------------
+
+def _jee_conn(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_jee_patterns(
+    subject: str | None = None, chapter: str | None = None, limit: int = 10,
+    *, db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    """Top repeating JEE patterns, filtered by subject/chapter, by frequency."""
+    try:
+        limit = max(1, min(int(limit), 20))
+    except (TypeError, ValueError):
+        limit = 10
+    where = []
+    params: list[Any] = []
+    if subject:
+        where.append("LOWER(subject) = LOWER(?)")
+        params.append(str(subject).strip())
+    if chapter:
+        where.append("LOWER(chapter) = LOWER(?)")
+        params.append(str(chapter).strip())
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    try:
+        with _jee_conn(db_path) as conn:
+            rows = conn.execute(
+                f"SELECT pattern_id, subject, chapter, sub_topic, frequency, "
+                f"years_json, exams_json, core_concept, key_formula, common_trap, "
+                f"difficulty, question_type FROM op_jee_patterns{clause} "
+                f"ORDER BY frequency DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("get_jee_patterns failed: %s", exc)
+        return _err(exc)
+    return {
+        "patterns": [
+            {
+                "pattern_id": row["pattern_id"],
+                "subject": row["subject"],
+                "chapter": row["chapter"],
+                "sub_topic": row["sub_topic"],
+                "frequency": row["frequency"],
+                "years": _load_json(row["years_json"]),
+                "exams": _load_json(row["exams_json"]),
+                "core_concept": row["core_concept"],
+                "key_formula": row["key_formula"],
+                "common_trap": row["common_trap"],
+                "difficulty": row["difficulty"],
+                "question_type": row["question_type"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def get_chapter_roi(
+    exam_type: str = "mains", subject: str | None = None, limit: int = 10,
+    *, db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    """Chapters ranked by importance (ROI) for an exam type."""
+    try:
+        limit = max(1, min(int(limit), 20))
+    except (TypeError, ValueError):
+        limit = 10
+    exam_type = str(exam_type or "mains").strip().lower()
+    where = ["LOWER(exam_type) = LOWER(?)", "LOWER(COALESCE(chapter,'')) <> 'unclassified'"]
+    params: list[Any] = [exam_type]
+    if subject:
+        where.append("LOWER(subject) = LOWER(?)")
+        params.append(str(subject).strip())
+    clause = " WHERE " + " AND ".join(where)
+    try:
+        with _jee_conn(db_path) as conn:
+            rows = conn.execute(
+                f"SELECT subject, chapter, exam_type, total_questions, repeat_ratio, "
+                f"easy_ratio, importance_score FROM op_jee_chapter_stats{clause} "
+                f"ORDER BY importance_score DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("get_chapter_roi failed: %s", exc)
+        return _err(exc)
+    return {
+        "chapters": [
+            {
+                "subject": row["subject"],
+                "chapter": row["chapter"],
+                "exam_type": row["exam_type"],
+                "total_questions": row["total_questions"],
+                "repeat_ratio": row["repeat_ratio"],
+                "easy_ratio": row["easy_ratio"],
+                "importance_score": row["importance_score"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def get_exam_weightage(
+    subject: str | None = None, chapter: str | None = None,
+    *, db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    """Per-chapter weightage (SUM of total_questions) across exam types."""
+    where = ["LOWER(COALESCE(chapter,'')) <> 'unclassified'"]
+    params: list[Any] = []
+    if subject:
+        where.append("LOWER(subject) = LOWER(?)")
+        params.append(str(subject).strip())
+    if chapter:
+        where.append("LOWER(chapter) = LOWER(?)")
+        params.append(str(chapter).strip())
+    clause = " WHERE " + " AND ".join(where)
+    try:
+        with _jee_conn(db_path) as conn:
+            rows = conn.execute(
+                f"SELECT subject, chapter, SUM(total_questions) AS total_questions "
+                f"FROM op_jee_chapter_stats{clause} GROUP BY subject, chapter "
+                f"ORDER BY total_questions DESC",
+                params,
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("get_exam_weightage failed: %s", exc)
+        return _err(exc)
+    return {
+        "weightage": [
+            {
+                "subject": row["subject"],
+                "chapter": row["chapter"],
+                "total_questions": row["total_questions"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def _load_json(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +874,7 @@ READ_TOOLS = frozenset({
     "get_plan_suggestions", "get_chapter_progress", "get_next_doubt",
     "get_doubt_interaction", "get_score_prediction", "get_backlog_status",
     "get_today_blocks", "get_current_block", "get_chapter_classifications",
+    "get_jee_patterns", "get_chapter_roi", "get_exam_weightage",
 })
 
 
@@ -973,6 +1125,55 @@ TOOL_SPECS = [
             "dict when between windows. Read-only."
         ),
         "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_jee_patterns",
+        "description": (
+            "Read the top repeating JEE question patterns (mined from 414 past papers, "
+            "2016-2026), filtered by subject/chapter, ordered by frequency. Use for "
+            "'which questions repeat most in X', 'what patterns come up in chapter Y'. "
+            "Read-only. If it returns an empty list, the JEE analytics are not loaded."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Optional subject: Physics, Chemistry or Mathematics"},
+                "chapter": {"type": "string", "description": "Optional exact chapter name"},
+                "limit": {"type": "integer", "description": "How many patterns to return (default 10, max 20)"},
+            },
+        },
+    },
+    {
+        "name": "get_chapter_roi",
+        "description": (
+            "Read JEE chapters ranked by importance (ROI score) for an exam type "
+            "(mains or advanced), optionally filtered by subject. Use for 'which "
+            "chapters give the easiest marks', 'best chapters for Advanced'. Read-only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "exam_type": {"type": "string", "description": "mains or advanced (default mains)"},
+                "subject": {"type": "string", "description": "Optional subject: Physics, Chemistry or Mathematics"},
+                "limit": {"type": "integer", "description": "How many chapters to return (default 10, max 20)"},
+            },
+        },
+    },
+    {
+        "name": "get_exam_weightage",
+        "description": (
+            "Read per-chapter JEE weightage (total historical question counts) across "
+            "exam types, optionally filtered by subject/chapter. Use for 'what is the "
+            "weightage of Electrostatics', 'which chapters carry the most marks'. "
+            "Read-only. If it returns an empty list, the JEE analytics are not loaded."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Optional subject: Physics, Chemistry or Mathematics"},
+                "chapter": {"type": "string", "description": "Optional exact chapter name"},
+            },
+        },
     },
     {
         "name": "set_context",
@@ -1629,6 +1830,12 @@ def execute_tool(
             return _run_get_current_block(chat_id, db_path)
         if name == "get_chapter_classifications":
             return _run_get_chapter_classifications(chat_id, db_path)
+        if name == "get_jee_patterns":
+            return get_jee_patterns(db_path=db_path, **dict(arguments or {}))
+        if name == "get_chapter_roi":
+            return get_chapter_roi(db_path=db_path, **dict(arguments or {}))
+        if name == "get_exam_weightage":
+            return get_exam_weightage(db_path=db_path, **dict(arguments or {}))
         if name in WRITE_TOOLS:
             return {
                 "error": True,
