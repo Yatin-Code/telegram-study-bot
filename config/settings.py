@@ -250,6 +250,20 @@ def sync_interval_seconds() -> int:
     return _get_int("SYNC_INTERVAL_SECONDS", 240, lo=60, hi=3600)
 
 
+def jee_refresh_days() -> int:
+    """How often the JEE analytics file is re-ingested (weekly default)."""
+    return _get_int("JEE_REFRESH_DAYS", 7, lo=1, hi=90)
+
+
+def jee_dashboard_url() -> str:
+    """GitHub Pages dashboard for JEE analytics. Fallback when not published."""
+    return (
+        get_override("JEE_DASHBOARD_URL")
+        or os.environ.get("JEE_DASHBOARD_URL", "").strip()
+        or "https://Yatin-Code.github.io/jee-dashboard/"
+    )
+
+
 def ntsc_username() -> str:
     """Portal username. Secret: env-only, never settings.json."""
     return os.environ.get("NTSC_USERNAME", "").strip()

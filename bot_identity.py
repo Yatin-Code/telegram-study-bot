@@ -73,6 +73,11 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("exam_summary", "Record an exam result summary"),
     CommandSpec("question_review", "Record one exam mistake"),
     CommandSpec("complete_exam_analysis", "Close an exam analysis"),
+    CommandSpec("pattern", "Top repeating JEE patterns [subject] [chapter]"),
+    CommandSpec("chapter_ranking", "Chapters by ROI [mains|advanced] [subject]"),
+    CommandSpec("jee_stats", "JEE analytics dataset summary"),
+    CommandSpec("roi_plan", "Top-5 high-ROI chapters to study first [subject]"),
+    CommandSpec("dashboard", "JEE analytics dashboard link + summary"),
     CommandSpec("reset", "Guarded reset of pages, data, or context"),
 )
 
