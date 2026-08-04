@@ -123,4 +123,10 @@ Update from the phone (Termux):
       --command-id RunShellScript \
       --scripts "sudo -u azureuser git -C /home/azureuser/studybot pull && systemctl restart studybot"
 
+JEE analytics data (`jee-analysis/raw_data/final_data.json`) is untracked and
+does NOT arrive via `git pull` — copy it to the VM manually once (e.g.
+`scp jee-analysis/raw_data/final_data.json azureuser@20.219.16.206:/home/azureuser/studybot/jee-analysis/raw_data/`).
+Without it, JEE features reply "not loaded yet" gracefully and the weekly
+refresh job skips silently.
+
 Logs: `ssh azureuser@20.219.16.206 'journalctl -u studybot -n 50 --no-pager'`
