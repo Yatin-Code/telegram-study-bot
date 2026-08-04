@@ -55,6 +55,7 @@ TREND_SHIFT_CAP = 5.0
 COVERAGE_ADJUST_CAP = 6.0
 REVISION_DRAG_CAP = 3.0
 PLAN_ADJUST_CAP = 1.0
+DIFFICULTY_SHIFT_CAP = 5.0
 
 SAMPLE_UNCERTAINTY = {0: 15.0, 1: 14.0, 2: 10.0, 3: 8.0}
 
@@ -667,6 +668,35 @@ def _build_actions(
 # public entry point
 # ---------------------------------------------------------------------------
 
+def _difficulty_evidence(
+    subjects: set[str] | None, *, db_path: str | Path,
+) -> dict[str, Any]:
+    """Historical JEE difficulty factor for the test's subjects.
+
+    ``factor = clamp(mean over matched subjects of (0.5 + mean(hard_ratio +
+    0.5 * medium_ratio)), 0.5, 1.5)`` from the derived ratio columns; the
+    'Unclassified' chapter rows are excluded by ``subject_difficulty``. Falls
+    back to the mean across ALL subjects when none of the test's subjects have
+    JEE evidence. Degrades to ``factor 1.0, jee_evidence False`` when the
+    ``op_jee_*`` tables are empty or unreadable.
+    """
+    try:
+        import jee_data_loader
+        factors = jee_data_loader.subject_difficulty(db_path=db_path)
+    except Exception:
+        return {"difficulty_factor": 1.0, "jee_evidence": False}
+    if not factors:
+        return {"difficulty_factor": 1.0, "jee_evidence": False}
+    matched = [
+        factor for subject, factor in factors.items()
+        if subjects is None or _canonical_subject(subject) in subjects
+    ]
+    if not matched:
+        matched = list(factors.values())
+    factor = _clamp(round(sum(matched) / len(matched), 3), 0.5, 1.5)
+    return {"difficulty_factor": factor, "jee_evidence": True}
+
+
 def project_coaching_score(
     *, test_id: str | None = None, today: str | None = None,
     db_path: str | Path = DEFAULT_DB_PATH, store: bool = False,
@@ -785,8 +815,17 @@ def project_coaching_score(
     )
     plan_adjust = float(plan["plan_adjust"]) if plan else 0.0
 
+    difficulty = _difficulty_evidence(syllabus_subjects, db_path=db_path)
+    difficulty_factor = float(difficulty["difficulty_factor"])
+    difficulty_adjust = (
+        _clamp((1.0 - difficulty_factor) * recent_mean, -DIFFICULTY_SHIFT_CAP, DIFFICULTY_SHIFT_CAP)
+        if difficulty["jee_evidence"]
+        else 0.0
+    )
+
     center = _clamp(
-        recent_mean + trend_shift + coverage_adjust + revision_adjust + plan_adjust,
+        recent_mean + trend_shift + coverage_adjust + revision_adjust + plan_adjust
+        + difficulty_adjust,
         0.0, 100.0,
     )
     uncertainty = _total_uncertainty(n, slope, days_to_test, coverage["coverage_known"])
@@ -814,11 +853,16 @@ def project_coaching_score(
         "revision": revision,
         "plan": plan,
         "uncertainty": uncertainty,
+        "difficulty": {
+            "difficulty_factor": difficulty_factor,
+            "jee_evidence": difficulty["jee_evidence"],
+        },
         "adjustments_pct": {
             "trend": round(trend_shift, 1),
             "coverage": coverage_adjust,
             "revision": revision_adjust,
             "plan": plan_adjust,
+            "difficulty": round(difficulty_adjust, 1),
             "center_pct": round(center, 1),
         },
     }
@@ -854,6 +898,8 @@ def project_coaching_score(
         },
         "subjects": subjects,
         "factors": factors,
+        "difficulty_factor": difficulty_factor,
+        "jee_evidence": difficulty["jee_evidence"],
         "risks": risks,
         "actions": actions,
         "missing": [],

@@ -447,3 +447,63 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# JEE difficulty weighting (todo 7)
+# ---------------------------------------------------------------------------
+
+def _seed_jee_chapter_stats(path, rows):
+    import jee_data_loader
+    with _conn(path) as conn:
+        jee_data_loader.init_db(conn)
+        for subject, chapter, hard, medium, easy in rows:
+            conn.execute(
+                "INSERT OR REPLACE INTO op_jee_chapter_stats "
+                "(subject, chapter, exam_type, total_questions, repeating_questions,"
+                " unique_questions, repeat_ratio, easy_ratio, medium_ratio, hard_ratio,"
+                " importance_score, by_year_json, by_difficulty_json,"
+                " by_question_type_json, sub_topics_json, needs_figure) "
+                "VALUES (?,?,?,?,0,0,0,?,?,?,0,'{}','{}','{}','{}',0)",
+                (subject, chapter, "mains", 100, easy, medium, hard),
+            )
+        conn.commit()
+
+
+def test_difficulty_evidence_absent_without_jee_data(db):
+    add_test(db, "T1", "Weekly Test", "2026-08-15", "Physics: Kinematics")
+    for i, pct in enumerate((50, 60, 70)):
+        add_result(db, f"r{i}", f"2026-07-0{i+1}", pct, 100)
+    snap = cp.project_coaching_score(today="2026-08-02", db_path=db)
+    assert snap["status"] == "ok"
+    assert snap["jee_evidence"] is False
+    assert snap["difficulty_factor"] == 1.0
+    assert snap["factors"]["difficulty"]["jee_evidence"] is False
+
+
+def test_difficulty_evidence_applies_and_clamps(db):
+    add_test(db, "T1", "Weekly Test", "2026-08-15", "Physics: Kinematics")
+    for i, pct in enumerate((50, 60, 70, 80)):
+        add_result(db, f"r{i}", f"2026-07-0{i+1}", pct, 100)
+    # hard_ratio=1.0, medium=0 → subject factor = 0.5 + 1.0 = 1.5 (max clamp)
+    _seed_jee_chapter_stats(db, [("Physics", "Kinematics", 1.0, 0.0, 0.0)])
+    snap = cp.project_coaching_score(today="2026-08-02", db_path=db)
+    assert snap["status"] == "ok"
+    assert snap["jee_evidence"] is True
+    assert 0.5 <= snap["difficulty_factor"] <= 1.5
+    adj = snap["factors"]["adjustments_pct"]["difficulty"]
+    assert -cp.DIFFICULTY_SHIFT_CAP <= adj <= cp.DIFFICULTY_SHIFT_CAP
+    # factor 1.5 (very hard) → negative adjustment
+    assert adj <= 0.0
+    assert snap["factors"]["difficulty"]["jee_evidence"] is True
+
+
+def test_difficulty_correction_bounded_within_cap(db):
+    add_test(db, "T1", "Weekly Test", "2026-08-15")
+    for i, pct in enumerate((90, 92, 94)):
+        add_result(db, f"r{i}", f"2026-07-0{i+1}", pct, 100)
+    _seed_jee_chapter_stats(db, [("Physics", "Kinematics", 1.0, 0.0, 0.0)])
+    snap = cp.project_coaching_score(today="2026-08-02", db_path=db)
+    adj = snap["factors"]["adjustments_pct"]["difficulty"]
+    # recent_mean=92, factor=1.5 → (1-1.5)*92 = -46 → clamped to -5
+    assert adj == -cp.DIFFICULTY_SHIFT_CAP
