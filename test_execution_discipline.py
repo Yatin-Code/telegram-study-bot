@@ -1088,3 +1088,68 @@ def test_has_ledger_evidence_no_ledger_table_false(db):
     _coaching_window(db)
     block = _exec_block(db, "2026-08-02", "coach_b02_exec_a")
     assert ed.has_ledger_evidence("2026-08-02", block, db) is False
+
+
+# ---------------------------------------------------------------------------
+# JEE chapter-ROI context in build_llm_context (todo 8)
+# ---------------------------------------------------------------------------
+
+def _seed_jee_stats(db_path, chapter="Electrostatics", total=107, repeat=0.972):
+    import jee_data_loader
+    with sqlite3.connect(db_path) as conn:
+        jee_data_loader.init_db(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO op_jee_chapter_stats "
+            "(subject, chapter, exam_type, total_questions, repeating_questions,"
+            " unique_questions, repeat_ratio, easy_ratio, medium_ratio, hard_ratio,"
+            " importance_score, by_year_json, by_difficulty_json,"
+            " by_question_type_json, sub_topics_json, needs_figure) "
+            "VALUES ('Physics', ?, 'mains', ?, 0, 0, ?, 0, 0, 0, 0,"
+            " '{}','{}','{}','{}',0)",
+            (chapter, total, repeat),
+        )
+        conn.commit()
+
+
+def _block_for_context(db):
+    return {
+        "local_date": "2026-08-02",
+        "date": "2026-08-02",
+        "block_key": "coach_b02_exec_a",
+        "title": "Execution Block A",
+        "start_hhmm": "10:30",
+        "end_hhmm": "12:00",
+        "kind": "study",
+        "day_type": "coaching",
+    }
+
+
+def test_build_llm_context_includes_jee_evidence_on_chapter_match(db, monkeypatch):
+    _seed_jee_stats(db)
+    monkeypatch.setattr(
+        ed.study_domain, "plan_facts",
+        lambda date, db_path=None: {"active_items": [{"title": "Electrostatics", "estimated_min": 90}]},
+    )
+    ctx = ed.build_llm_context(_at(10, 45), _block_for_context(db), db_path=db)
+    assert "jee_evidence" in ctx
+    assert "Electrostatics" in ctx["jee_evidence"]
+    assert "107" in ctx["jee_evidence"]
+
+
+def test_build_llm_context_omits_jee_evidence_without_match(db, monkeypatch):
+    _seed_jee_stats(db)
+    monkeypatch.setattr(
+        ed.study_domain, "plan_facts",
+        lambda date, db_path=None: {"active_items": [{"title": "Not A Real Chapter", "estimated_min": 30}]},
+    )
+    ctx = ed.build_llm_context(_at(10, 45), _block_for_context(db), db_path=db)
+    assert "jee_evidence" not in ctx
+
+
+def test_build_llm_context_omits_jee_evidence_when_tables_empty(db, monkeypatch):
+    monkeypatch.setattr(
+        ed.study_domain, "plan_facts",
+        lambda date, db_path=None: {"active_items": [{"title": "Electrostatics", "estimated_min": 90}]},
+    )
+    ctx = ed.build_llm_context(_at(10, 45), _block_for_context(db), db_path=db)
+    assert "jee_evidence" not in ctx

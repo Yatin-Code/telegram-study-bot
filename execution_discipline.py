@@ -858,6 +858,22 @@ def build_llm_context(now: dt.datetime, block: dict, db_path: str | Path = DEFAU
                 for it in items[:5]
             ]
     except Exception:
+        items = []
+
+    try:  # JEE-evidence line (no rank/AIR); silent when no chapter matches
+        import jee_data_loader
+        for it in (items or [])[:5]:
+            evidence = jee_data_loader.chapter_evidence(
+                None, it.get("title"), db_path=db_path,
+            )
+            if evidence:
+                context["jee_evidence"] = (
+                    f"{evidence['chapter']} appears in "
+                    f"{evidence['total_questions']} JEE questions; "
+                    f"repeat ratio {round(evidence['repeat_ratio'] * 100)}%"
+                )
+                break
+    except Exception:
         pass
 
     try:
