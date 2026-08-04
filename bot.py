@@ -2413,6 +2413,137 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _reply_markdown(update.effective_message, text, disable_web_page_preview=True)
 
 
+async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save a formula, list formulas, or show recall stats."""
+    if await _reject_if_unauthorized(update):
+        return
+    import learn_formulas
+
+    db_path = learn_formulas.DEFAULT_DB_PATH
+    args = _command_args(update)
+    parts = args.split("|")
+    if not args.strip() or args.strip().lower() in ("stats", "list"):
+        s = await asyncio.to_thread(learn_formulas.stats, db_path=db_path)
+        lines = [
+            f"📝 *Formula memory* — {s['total']} stored",
+            f"Due for recall: {s['due_for_recall']} · Locked: {s['locked']}",
+        ]
+        for subject, count in s["by_subject"].items():
+            lines.append(f"  {subject}: {count}")
+        lines.append("\n_Use `/learn Physics | Kinematics | v=u+at` to add a formula._")
+        await _reply_markdown(update.effective_message, "\n".join(lines))
+        return
+
+    if len(parts) < 2:
+        await _reply_markdown(
+            update.effective_message,
+            "Format: `/learn Subject | Chapter | formula text`\n"
+            "Example: `/learn Physics | Kinematics | v = u + at`",
+        )
+        return
+
+    subject = parts[0].strip()
+    chapter = parts[1].strip() if len(parts) > 2 else None
+    formula_text = "|".join(parts[2:]).strip() if len(parts) > 2 else parts[1].strip()
+    if len(parts) == 2:
+        chapter = None
+        formula_text = parts[1].strip()
+
+    try:
+        row = await asyncio.to_thread(
+            learn_formulas.add, subject, chapter, None, formula_text, db_path=db_path,
+        )
+    except ValueError as exc:
+        await _reply_markdown(update.effective_message, f"Error: {exc}")
+        return
+    await _reply_markdown(
+        update.effective_message,
+        f"✅ Saved formula #{row['formula_id']}: *{row['formula_text']}*\n"
+        f"Subject: {row['subject']}" +
+        (f"\nChapter: {row['chapter']}" if row.get("chapter") else "") +
+        f"\nUnlocks for recall in {learn_formulas.UNLOCK_DAYS} days.",
+    )
+
+
+async def insights_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Personalized JEE coaching insights from cross-referenced data."""
+    if await _reject_if_unauthorized(update):
+        return
+    import jee_insights as ji
+
+    args = _command_args(update).strip().lower()
+    db_path = ji.DEFAULT_DB_PATH
+
+    if args in ("", "all"):
+        results = await asyncio.to_thread(ji.missed_opportunities, db_path=db_path)
+        lines = [f"📊 *Personalized Insights*"]
+        match results.get("status"):
+            case "no_jee_data":
+                lines.append("JEE analytics not loaded — insights unavailable.")
+            case "no_ledger":
+                lines.append("No study sessions logged yet — log sessions to get insights.")
+            case "insufficient_sessions":
+                lines.append(f"Need 5+ sessions for insights (have {results.get('total_minutes', 0)} min total).")
+            case "ok":
+                if results.get("over_allocated"):
+                    lines.append("\n⏰ *Over-allocated time* (high time, low ROI):")
+                    for a in results["over_allocated"][:3]:
+                        lines.append(f"  {a['subject']}: {a['chapter']} ({a['minutes']:.0f} min)")
+                if results.get("under_allocated"):
+                    lines.append("\n💡 *Under-allocated* (low time, high ROI):")
+                    for a in results["under_allocated"][:3]:
+                        lines.append(f"  {a['subject']}: {a['chapter']} (ROI {a['roi_score']:.0f})")
+                if results.get("top_recommendation"):
+                    lines.append(f"\n🎯 {results['top_recommendation']}")
+        await _reply_markdown(update.effective_message, "\n".join(lines))
+        return
+
+    if args in ("doubts", "doubt"):
+        results = await asyncio.to_thread(ji.doubt_prioritization, db_path=db_path)
+        match results.get("status"):
+            case "no_jee_data":
+                await _reply_markdown(update.effective_message, "JEE analytics not loaded.")
+            case "no_doubts":
+                await _reply_markdown(update.effective_message, "No open doubts to prioritize.")
+            case "ok":
+                lines = ["🔍 *Doubt prioritization* (ranked by JEE weightage)"]
+                for d in results["doubts"][:5]:
+                    marks = d.get("estimated_marks") or "?"
+                    lines.append(
+                        f"  [{d['urgency'].upper()}] {d['core_concept'][:50]} — ~{marks} marks"
+                    )
+                if results.get("highest_priority"):
+                    lines.append(f"\n🎯 {results['highest_priority']}")
+                await _reply_markdown(update.effective_message, "\n".join(lines))
+        return
+
+    if args in ("trends", "trending"):
+        results = await asyncio.to_thread(ji.trending_chapters, db_path=db_path)
+        match results.get("status"):
+            case "no_jee_data":
+                await _reply_markdown(update.effective_message, "No JEE trend data loaded.")
+            case "ok":
+                lines = ["📈 *Trending chapters* (year-over-year)"]
+                if results.get("trending_up"):
+                    lines.append("\n⬆ Rising:")
+                    for c in results["trending_up"][:5]:
+                        lines.append(f"  {c['subject']}: {c['chapter']} ({c['change_pct']:.0f}%)")
+                if results.get("trending_down"):
+                    lines.append("\n⬇ Falling:")
+                    for c in results["trending_down"][:3]:
+                        lines.append(f"  {c['subject']}: {c['chapter']} ({c['change_pct']:.0f}%)")
+                await _reply_markdown(update.effective_message, "\n".join(lines))
+        return
+
+    await _reply_markdown(
+        update.effective_message,
+        "Usage: `/insights [all|doubts|trends]`\n"
+        "• all — missed opportunities (default)\n"
+        "• doubts — rank open doubts by JEE marks\n"
+        "• trends — chapters rising/falling in recent years",
+    )
+
+
 async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -5229,6 +5360,8 @@ def main() -> None:
     app.add_handler(CommandHandler("jee_stats", jee_stats_command))
     app.add_handler(CommandHandler("roi_plan", roi_plan_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
+    app.add_handler(CommandHandler("learn", learn_command))
+    app.add_handler(CommandHandler("insights", insights_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CallbackQueryHandler(on_domain_callback, pattern=r"^domain:"))
     app.add_handler(CallbackQueryHandler(on_readiness_callback, pattern=r"^ready:"))

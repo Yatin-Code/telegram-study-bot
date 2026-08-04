@@ -368,3 +368,94 @@ def test_execute_tool_dispatches_jee_patterns(jee_db):
 def test_execute_tool_unknown_name_returns_error(jee_db):
     result = agent_tools.execute_tool("nonexistent_jee_tool", {}, db_path=jee_db)
     assert result.get("error") is True
+
+
+# ---------------------------------------------------------------------------
+# /learn and /insights handlers (personalization wiring)
+# ---------------------------------------------------------------------------
+
+def _seed_ledger_rows(db, rows):
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger ("
+            " notion_page_id TEXT, archived INTEGER DEFAULT 0, subject TEXT,"
+            " chapter_text TEXT, actual_time_min REAL, questions_attempted INTEGER,"
+            " questions_correct INTEGER)"
+        )
+        for i, (subject, chapter, minutes, attempted, correct) in enumerate(rows):
+            conn.execute(
+                "INSERT INTO ledger (notion_page_id, archived, subject, chapter_text,"
+                " actual_time_min, questions_attempted, questions_correct) "
+                "VALUES (?,0,?,?,?,?,?)",
+                (f"l{i}", subject, chapter, minutes, attempted, correct),
+            )
+        conn.commit()
+
+
+def test_learn_command_saves_formula(jee_db, monkeypatch):
+    import learn_formulas
+    monkeypatch.setattr(learn_formulas, "DEFAULT_DB_PATH", jee_db)
+    reply = _run_handler(bot.learn_command, "/learn Physics | Kinematics | v = u + at")
+    assert "Saved formula" in reply
+    assert "v = u + at" in reply
+    rows = learn_formulas.list(db_path=jee_db)
+    assert len(rows) == 1
+    assert rows[0]["subject"] == "Physics"
+    assert rows[0]["chapter"] == "Kinematics"
+
+
+def test_learn_command_stats_reply(jee_db, monkeypatch):
+    import learn_formulas
+    monkeypatch.setattr(learn_formulas, "DEFAULT_DB_PATH", jee_db)
+    reply = _run_handler(bot.learn_command, "/learn")
+    assert "Formula memory" in reply
+    assert "Due for recall" in reply
+
+
+def test_learn_command_bad_format_returns_usage(jee_db, monkeypatch):
+    import learn_formulas
+    monkeypatch.setattr(learn_formulas, "DEFAULT_DB_PATH", jee_db)
+    reply = _run_handler(bot.learn_command, "/learn Physics")
+    assert "Format:" in reply
+
+
+def test_insights_command_all_replies(jee_db, monkeypatch):
+    import jee_insights
+    monkeypatch.setattr(jee_insights, "DEFAULT_DB_PATH", jee_db)
+    _seed_ledger_rows(jee_db, [
+        ("Physics", "Electric Charges and Fields", 300, 20, 15),
+        ("Physics", "Electric Charges and Fields", 200, 20, 15),
+        ("Physics", "Electric Charges and Fields", 250, 20, 14),
+        ("Physics", "Kinematics", 10, 5, 4),
+        ("Physics", "Kinematics", 8, 5, 3),
+    ])
+    reply = _run_handler(bot.insights_command, "/insights")
+    assert "Personalized Insights" in reply
+    assert "ok" or "over-allocated" or "under-allocated" in reply.lower() or "roi" in reply.lower()
+
+
+def test_insights_command_doubts_replies(jee_db, monkeypatch):
+    import jee_insights
+    monkeypatch.setattr(jee_insights, "DEFAULT_DB_PATH", jee_db)
+    with sqlite3.connect(str(jee_db)) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS doubts ("
+            " notion_page_id TEXT, archived INTEGER DEFAULT 0, subject TEXT,"
+            " core_concept TEXT, status TEXT, created_time TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO doubts (notion_page_id, archived, subject, core_concept,"
+            " status, created_time) VALUES ('d1',0,'Physics',"
+            " 'Electric Charges and Fields confusion','open','2026-07-10')"
+        )
+        conn.commit()
+    reply = _run_handler(bot.insights_command, "/insights doubts")
+    assert "Doubt prioritization" in reply
+
+
+def test_insights_command_no_jee_data_fallback(empty_db, monkeypatch):
+    import jee_insights
+    monkeypatch.setattr(jee_insights, "DEFAULT_DB_PATH", empty_db)
+    reply = _run_handler(bot.insights_command, "/insights")
+    lowered = reply.lower()
+    assert "not loaded" in lowered or "sessions" in lowered or "unavailable" in lowered

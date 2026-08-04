@@ -51,6 +51,7 @@ LOCAL_SQL_TABLES: tuple[str, ...] = (
     "op_jee_trends",
     "op_jee_questions_meta",
     "op_jee_sync_state",
+    "learn_formulas",
 )
 
 NOTION_OWNED_LABELS: dict[str, str] = {

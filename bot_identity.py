@@ -78,6 +78,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("jee_stats", "JEE analytics dataset summary"),
     CommandSpec("roi_plan", "Top-5 high-ROI chapters to study first [subject]"),
     CommandSpec("dashboard", "JEE analytics dashboard link + summary"),
+    CommandSpec("learn", "Save or list formulas for active recall"),
+    CommandSpec("insights", "Personalized JEE study insights [all|doubts|trends]"),
     CommandSpec("reset", "Guarded reset of pages, data, or context"),
 )
 
