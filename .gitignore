@@ -61,3 +61,8 @@ install.sh.[0-9]
 fedora.sh*
 fix-psutil.sh
 telegram-study-bot-gap-fixes.pdf
+
+# Nested jee-analysis project: never sweep into the parent repo
+# (raw_data/final_data.json is the one tracked exception, see commit a76d6c0)
+jee-analysis/
+!jee-analysis/raw_data/final_data.json
