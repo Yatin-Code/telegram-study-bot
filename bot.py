@@ -1276,27 +1276,92 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force an immediate Notion→SQLite mirror refresh. No LLM involved."""
+    """Show an inline keyboard to choose what to sync."""
     if await _reject_if_unauthorized(update):
         return
-    status = await update.effective_message.reply_text("🔄 Syncing from Notion…")
-    try:
-        counts = await asyncio.to_thread(
-            sync.sync_once, db_keys=sync.NOTION_SOURCE_KEYS
-        )
-    except Exception as e:
-        logger.exception("manual /sync failed")
-        try:
-            await status.edit_text("⚠️ Sync didn't complete — please try again in a minute.")
-        except Exception:
-            await update.effective_message.reply_text("⚠️ Sync didn't complete — please try again in a minute.")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Notion (Ledger, Doubts, Revision)", callback_data="sync:notion")],
+        [InlineKeyboardButton("🏫 NTSC Portal (Classes, Tests, Results)", callback_data="sync:ntsc")],
+        [InlineKeyboardButton("🔄 Both", callback_data="sync:both")],
+    ])
+    await update.effective_message.reply_text(
+        "What would you like to sync?", reply_markup=keyboard
+    )
+
+
+async def on_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle sync choice from the inline keyboard."""
+    query = update.callback_query
+    if not query:
         return
-    total = sum(counts.values())
-    detail = ", ".join(f"{k}={v}" for k, v in counts.items()) or "nothing to sync"
-    try:
-        await status.edit_text(f"✅ Synced {total} record(s): {detail}")
-    except Exception:
-        await update.effective_message.reply_text(f"✅ Synced {total} record(s): {detail}")
+    await query.answer()
+    if not _is_allowed(query):
+        return
+    choice = (query.data or "").removeprefix("sync:")
+    chat_id = query.message.chat_id
+
+    if choice == "notion":
+        await _edit_markdown(query, "🔄 Syncing from Notion…")
+        try:
+            counts = await asyncio.to_thread(
+                sync.sync_once, db_keys=sync.NOTION_SOURCE_KEYS
+            )
+            total = sum(counts.values())
+            detail = ", ".join(f"{k}={v}" for k, v in counts.items()) or "nothing to sync"
+            await _edit_markdown(query, f"✅ Synced {total} record(s): {detail}")
+        except Exception:
+            logger.exception("manual /sync notion failed")
+            await _edit_markdown(query, "⚠️ Notion sync didn't complete — try again in a minute.")
+
+    elif choice == "ntsc":
+        await _edit_markdown(query, "🔄 Syncing from NTSC Portal…")
+        try:
+            result = await asyncio.to_thread(ntsc_sync.sync_once)
+            if result.get("status") == "success":
+                datasets = result.get("datasets", [])
+                classes = result.get("classes", 0)
+                await _edit_markdown(
+                    query,
+                    f"✅ Portal synced: {', '.join(datasets) or 'no data'}"
+                    + (f" ({classes} classes)" if classes else ""),
+                )
+            else:
+                err = result.get("error", "unknown error")
+                await _edit_markdown(query, f"⚠️ Portal sync failed: {err}")
+        except Exception:
+            logger.exception("manual /sync ntsc failed")
+            await _edit_markdown(query, "⚠️ Portal sync didn't complete — try again in a minute.")
+
+    elif choice == "both":
+        await _edit_markdown(query, "🔄 Syncing from Notion + NTSC Portal…")
+        try:
+            counts = await asyncio.to_thread(
+                sync.sync_once, db_keys=sync.NOTION_SOURCE_KEYS
+            )
+            total = sum(counts.values())
+            detail = ", ".join(f"{k}={v}" for k, v in counts.items()) or "nothing to sync"
+        except Exception:
+            logger.exception("manual /sync notion (both) failed")
+            total, detail = 0, "notion failed"
+
+        try:
+            result = await asyncio.to_thread(ntsc_sync.sync_once)
+            if result.get("status") == "success":
+                datasets = result.get("datasets", [])
+                classes = result.get("classes", 0)
+                ntsc_detail = f"portal: {', '.join(datasets) or 'no data'}"
+                if classes:
+                    ntsc_detail += f" ({classes} classes)"
+            else:
+                ntsc_detail = f"portal failed: {result.get('error', '?')}"
+        except Exception:
+            logger.exception("manual /sync ntsc (both) failed")
+            ntsc_detail = "portal failed"
+
+        await _edit_markdown(
+            query,
+            f"✅ Sync complete:\n• Notion: {total} record(s) — {detail}\n• {ntsc_detail}",
+        )
 
 
 def _command_args(update: Update) -> str:
@@ -2196,6 +2261,156 @@ async def complete_exam_analysis_command(update: Update, context: ContextTypes.D
         await update.effective_message.reply_text(f"Exam analysis closed after {result['questions_reviewed']} question reviews.")
     except Exception as exc:
         await update.effective_message.reply_text(f"Analysis cannot close yet: {exc}")
+
+
+_JEE_NOT_LOADED = "JEE analytics not loaded yet — it refreshes automatically every week."
+
+
+def _jee_loaded(db_path=None) -> bool:
+    import jee_data_loader
+
+    if db_path is None:
+        db_path = jee_data_loader.DEFAULT_DB_PATH
+    counts = (jee_data_loader.summary(db_path=db_path).get("counts") or {})
+    return bool(counts.get("op_jee_patterns"))
+
+
+def _jee_stats_text(db_path=None) -> str:
+    import jee_data_loader
+
+    if db_path is None:
+        db_path = jee_data_loader.DEFAULT_DB_PATH
+    summary = jee_data_loader.summary(db_path=db_path)
+    meta = summary.get("metadata") or {}
+    counts = summary.get("counts") or {}
+    total_papers = int(meta.get("total_papers") or 0)
+    total_questions = int(meta.get("total_questions") or 0)
+    total_patterns = int(meta.get("total_patterns") or 0)
+    total_chapters = int(meta.get("total_chapters") or 0)
+    return (
+        f"📊 *JEE Analytics* — {total_papers} papers · {total_questions} questions "
+        f"· {total_patterns} repeating patterns · {total_chapters} ranked chapters.\n"
+        f"Tracked rows: {counts.get('op_jee_chapter_stats', 0)} chapter/exam rows · "
+        f"{counts.get('op_jee_trends', 0)} year-wise trend rows."
+    )
+
+
+async def pattern_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    import agent_tools
+
+    db_path = agent_tools.DEFAULT_DB_PATH
+    parts = _command_args(update).split()
+    subject = parts[0] if parts else None
+    chapter = " ".join(parts[1:]) if len(parts) > 1 else None
+    result = await asyncio.to_thread(
+        agent_tools.get_jee_patterns, subject, chapter, db_path=db_path
+    )
+    if result.get("error") or not _jee_loaded(db_path):
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    patterns = result.get("patterns") or []
+    if not patterns:
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    scope = " / ".join(part for part in (subject, chapter) if part)
+    lines = [f"🔁 *Top JEE repeating patterns*" + (f" — {scope}" if scope else "")]
+    for index, pattern in enumerate(patterns[:10], 1):
+        years = ", ".join(str(year) for year in (pattern.get("years") or [])[:4]) or "—"
+        topic = str(pattern.get("sub_topic") or pattern.get("chapter") or "pattern")
+        lines.append(
+            f"{index}. *{topic}* — {pattern.get('frequency')}× ({years})"
+        )
+    await _reply_markdown(update.effective_message, "\n".join(lines))
+
+
+async def chapter_ranking_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    import agent_tools
+
+    db_path = agent_tools.DEFAULT_DB_PATH
+    parts = _command_args(update).split()
+    exam_type = parts[0] if parts and parts[0] in ("mains", "advanced") else "mains"
+    subject = parts[1] if len(parts) > 1 else None
+    result = await asyncio.to_thread(
+        agent_tools.get_chapter_roi, exam_type, subject, db_path=db_path
+    )
+    if result.get("error") or not _jee_loaded(db_path):
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    chapters = result.get("chapters") or []
+    if not chapters:
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    scope = f"{exam_type}" + (f" · {subject}" if subject else "")
+    lines = [f"🏆 *Chapter ranking* — {scope}"]
+    for index, chapter in enumerate(chapters[:10], 1):
+        repeat = chapter.get("repeat_ratio")
+        repeat_pct = f"{repeat * 100:.0f}%" if repeat is not None else "—"
+        lines.append(
+            f"{index}. *{chapter['chapter']}* — ROI {chapter.get('importance_score')} · "
+            f"{chapter.get('total_questions')} Q · repeat {repeat_pct}"
+        )
+    await _reply_markdown(update.effective_message, "\n".join(lines))
+
+
+async def jee_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    import jee_data_loader
+
+    db_path = jee_data_loader.DEFAULT_DB_PATH
+    if not _jee_loaded(db_path):
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    await _reply_markdown(update.effective_message, _jee_stats_text(db_path))
+
+
+async def roi_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    import agent_tools
+
+    db_path = agent_tools.DEFAULT_DB_PATH
+    subject = _command_args(update).split()[0] if _command_args(update).strip() else None
+    result = await asyncio.to_thread(
+        agent_tools.get_chapter_roi, "mains", subject, 5, db_path=db_path
+    )
+    if result.get("error") or not _jee_loaded(db_path):
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    chapters = result.get("chapters") or []
+    if not chapters:
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    scope = f" ({subject})" if subject else ""
+    lines = [f"🎯 *ROI plan{scope}* — easiest marks first"]
+    for index, chapter in enumerate(chapters[:5], 1):
+        repeat = chapter.get("repeat_ratio")
+        repeat_pct = f"{repeat * 100:.0f}%" if repeat is not None else "—"
+        lines.append(
+            f"{index}. *{chapter['chapter']}* — ROI {chapter.get('importance_score')} · "
+            f"repeat {repeat_pct}"
+        )
+    lines.append("_Study the top chapters first: highest ROI, most repeats, least effort._")
+    await _reply_markdown(update.effective_message, "\n".join(lines))
+
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    import jee_data_loader
+    from config import settings as config_settings
+
+    db_path = jee_data_loader.DEFAULT_DB_PATH
+    url = config_settings.jee_dashboard_url().strip()
+    if not url or not _jee_loaded(db_path):
+        await _reply_markdown(update.effective_message, _JEE_NOT_LOADED)
+        return
+    text = f"📈 *JEE dashboard*: {url}\n\n{_jee_stats_text(db_path)}"
+    await _reply_markdown(update.effective_message, text, disable_web_page_preview=True)
 
 
 async def on_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4982,6 +5197,11 @@ def main() -> None:
     app.add_handler(CommandHandler("exam_summary", exam_summary_command))
     app.add_handler(CommandHandler("question_review", question_review_command))
     app.add_handler(CommandHandler("complete_exam_analysis", complete_exam_analysis_command))
+    app.add_handler(CommandHandler("pattern", pattern_command))
+    app.add_handler(CommandHandler("chapter_ranking", chapter_ranking_command))
+    app.add_handler(CommandHandler("jee_stats", jee_stats_command))
+    app.add_handler(CommandHandler("roi_plan", roi_plan_command))
+    app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CallbackQueryHandler(on_domain_callback, pattern=r"^domain:"))
     app.add_handler(CallbackQueryHandler(on_readiness_callback, pattern=r"^ready:"))
@@ -4998,6 +5218,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_discipline_callback, pattern=r"^discipline:"))
     app.add_handler(CallbackQueryHandler(on_classify_callback, pattern=r"^classify:"))
     app.add_handler(CallbackQueryHandler(on_mockprep_callback, pattern=r"^mockprep:"))
+    app.add_handler(CallbackQueryHandler(on_sync_callback, pattern=r"^sync:"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, catch_all))
     logger.info("Starting Telegram long polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

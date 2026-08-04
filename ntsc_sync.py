@@ -86,8 +86,16 @@ def sync_once(
             # reach coaching_tests and the portal bridge.
             try:
                 calendar_rows = client.test_calendar()
+                # The endpoint returns {"data": {"totalRecord": N, "data": [...]}}
+                # Drill through both levels to reach the actual list.
                 if isinstance(calendar_rows, dict):
-                    calendar_rows = calendar_rows.get("data") or []
+                    inner = calendar_rows.get("data")
+                    if isinstance(inner, dict):
+                        calendar_rows = inner.get("data") or []
+                    elif isinstance(inner, list):
+                        calendar_rows = inner
+                    else:
+                        calendar_rows = []
                 if isinstance(calendar_rows, list):
                     for cal_row in calendar_rows:
                         cid = str(cal_row.get("id") or "")
