@@ -372,6 +372,44 @@ def _iso_from_mtime(mtime: float) -> str:
     return dt.datetime.fromtimestamp(mtime, tz=dt.timezone.utc).isoformat()
 
 
+def refresh_if_stale(
+    data_path: str | Path | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Reload ``final_data.json`` only when the file changed since the last load.
+
+    ``load()`` resets ``op_jee_sync_state.last_load_mtime`` to NULL, so this
+    records the file mtime after a successful load and skips when the stored
+    mtime is current. NULL means never-loaded → always load. Missing file
+    returns ``{"skipped": "missing"}`` without raising; a corrupt file lets
+    ``load()`` raise so the caller can log + keep prior rows.
+    """
+    import os
+
+    data_path = Path(data_path) if data_path is not None else JEE_DATA_PATH
+    db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    if not data_path.exists():
+        return {"skipped": "missing", "path": str(data_path)}
+    mtime = os.path.getmtime(data_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT last_load_mtime FROM op_jee_sync_state WHERE id=1"
+        ).fetchone()
+        last = float(row["last_load_mtime"]) if row and row["last_load_mtime"] is not None else None
+    if last is not None and mtime <= last:
+        return {"skipped": "current", "mtime": mtime}
+    result = load(data_path=data_path, db_path=db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            "UPDATE op_jee_sync_state SET last_load_mtime=?, last_loaded_at=? WHERE id=1",
+            (mtime, _iso_from_mtime(mtime)),
+        )
+        conn.commit()
+    result["loaded"] = True
+    result["mtime"] = mtime
+    return result
+
+
 def summary(db_path: str | Path | None = None) -> dict[str, Any]:
     """Per-table row counts plus the persisted metadata block."""
     db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH

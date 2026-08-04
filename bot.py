@@ -4997,6 +4997,19 @@ async def _llm_health_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("llm health tick failed")
 
 
+async def _jee_data_refresh(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-ingest JEE analytics when the file changed; never blocks the bot."""
+    try:
+        import jee_data_loader
+        result = await asyncio.to_thread(jee_data_loader.refresh_if_stale)
+        if result.get("loaded"):
+            logger.info("jee data refreshed: %s", result.get("tables"))
+        elif result.get("skipped") == "missing":
+            logger.warning("jee analytics file missing (%s) — features stay 'not loaded'", result.get("path"))
+    except Exception:
+        logger.exception("jee data refresh failed")
+
+
 async def post_init(application: Application) -> None:
     application.bot_data.setdefault(_MAINTENANCE_LOCK_KEY, asyncio.Lock())
     application.bot_data.setdefault(_NTSC_SYNC_LOCK_KEY, asyncio.Lock())
@@ -5013,6 +5026,14 @@ async def post_init(application: Application) -> None:
             logger.info("seeded %d execution-discipline blocks", seeded)
     except Exception:
         logger.exception("seed_templates failed at startup")
+    # First JEE ingestion; the data file is untracked so it may be absent on the VM.
+    try:
+        import jee_data_loader
+        result = await asyncio.to_thread(jee_data_loader.refresh_if_stale)
+        if result.get("loaded"):
+            logger.info("jee analytics ingested at startup: %s", result.get("tables"))
+    except Exception:
+        logger.exception("startup jee ingestion failed")
     # Retry any writes that were queued while Notion was unreachable.
     try:
         pending = logging_flow.pending_count()
@@ -5126,6 +5147,12 @@ async def post_init(application: Application) -> None:
         )
         application.job_queue.run_repeating(
             _guard_scheduled(_user_jobs_scan), interval=60, first=75, name="user_jobs"
+        )
+        application.job_queue.run_repeating(
+            _guard_scheduled(_jee_data_refresh),
+            interval=config_settings.jee_refresh_days() * 86400,
+            first=300,
+            name="jee_data_refresh",
         )
         application.job_queue.run_repeating(
             _guard_scheduled(_llm_health_tick), interval=270, first=30, name="llm_health"
