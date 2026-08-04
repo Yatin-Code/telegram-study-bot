@@ -38,6 +38,9 @@ CAPABILITIES: tuple[str, ...] = (
     "active_recall",     # /learn active recall unlock
     "discipline",        # execution-block discipline nudges
     "teacher_window",    # teacher escalation window
+    "jee_insights",      # personalized missed-opportunity / strength insights
+    "doubt_prioritizer", # rank open doubts by JEE weightage
+    "trend_awareness",   # year-over-year chapter trend insights
 )
 
 
@@ -137,6 +140,33 @@ def _gate_teacher_window(conn: sqlite3.Connection) -> tuple[bool, str]:
     return True, f"{attempts} doubt attempt(s) recorded"
 
 
+def _gate_jee_insights(conn: sqlite3.Connection) -> tuple[bool, str]:
+    """Unlocked when JEE analytics + ≥5 study sessions exist (enough to compare)."""
+    if _count(conn, "op_jee_metadata") == 0:
+        return False, "JEE analytics not loaded yet"
+    ledger = _count(conn, "ledger", "archived=0")
+    if ledger < 5:
+        return False, f"need 5+ study sessions for insights (have {ledger})"
+    return True, f"insights ready ({ledger} sessions)"
+
+
+def _gate_doubt_prioritizer(conn: sqlite3.Connection) -> tuple[bool, str]:
+    """Unlocked when JEE analytics + ≥1 open doubt exist."""
+    if _count(conn, "op_jee_metadata") == 0:
+        return False, "JEE analytics not loaded yet"
+    open_doubts = _count(conn, "doubts", "archived=0 AND status='open'")
+    if open_doubts == 0:
+        return False, "no open doubts to prioritize"
+    return True, f"{open_doubts} open doubt(s) to rank"
+
+
+def _gate_trend_awareness(conn: sqlite3.Connection) -> tuple[bool, str]:
+    """Unlocked when JEE year-trend data is loaded."""
+    if _count(conn, "op_jee_trends") == 0:
+        return False, "no JEE trend data loaded yet"
+    return True, "trend data available"
+
+
 _GATE_FUNCS: dict[str, Any] = {
     "agent_chat": _gate_agent_chat,
     "discipline": _gate_discipline,
@@ -146,6 +176,9 @@ _GATE_FUNCS: dict[str, Any] = {
     "jee_analytics": _gate_jee_analytics,
     "active_recall": _gate_active_recall,
     "teacher_window": _gate_teacher_window,
+    "jee_insights": _gate_jee_insights,
+    "doubt_prioritizer": _gate_doubt_prioritizer,
+    "trend_awareness": _gate_trend_awareness,
 }
 
 

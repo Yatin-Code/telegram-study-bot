@@ -55,6 +55,15 @@ def seeded_db(tmp_path: Path) -> Path:
 
         CREATE TABLE op_doubt_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, doubt_title TEXT);
         INSERT INTO op_doubt_attempts VALUES (1, 'doubt 1'), (2, 'doubt 2');
+
+        CREATE TABLE doubts (id TEXT, status TEXT, archived INTEGER DEFAULT 0);
+        INSERT INTO doubts VALUES ('d1', 'open', 0);
+
+        CREATE TABLE op_jee_trends (
+            id INTEGER PRIMARY KEY, subject TEXT, chapter TEXT,
+            year TEXT, question_count INTEGER
+        );
+        INSERT INTO op_jee_trends VALUES (1, 'Physics', 'Kinematics', '2025', 8);
     """)
     conn.commit()
     conn.close()
@@ -166,6 +175,39 @@ def test_check_teacher_window_unlocked_with_two_attempts(seeded_db: Path):
     assert result["unlocked"] is True
 
 
+def test_check_jee_insights_locked_without_jee_data(db: Path):
+    result = capability_gates.check("jee_insights", db_path=db)
+    assert result["unlocked"] is False
+    assert "not loaded" in result["reason"]
+
+
+def test_check_jee_insights_unlocked_with_data_and_sessions(seeded_db: Path):
+    result = capability_gates.check("jee_insights", db_path=seeded_db)
+    assert result["unlocked"] is True
+    assert "8" in result["reason"]
+
+
+def test_check_doubt_prioritizer_locked_without_open_doubts(db: Path):
+    result = capability_gates.check("doubt_prioritizer", db_path=db)
+    assert result["unlocked"] is False
+
+
+def test_check_doubt_prioritizer_unlocked_with_open_doubt(seeded_db: Path):
+    result = capability_gates.check("doubt_prioritizer", db_path=seeded_db)
+    assert result["unlocked"] is True
+    assert "1" in result["reason"]
+
+
+def test_check_trend_awareness_locked_without_trends(db: Path):
+    result = capability_gates.check("trend_awareness", db_path=db)
+    assert result["unlocked"] is False
+
+
+def test_check_trend_awareness_unlocked_with_trends(seeded_db: Path):
+    result = capability_gates.check("trend_awareness", db_path=seeded_db)
+    assert result["unlocked"] is True
+
+
 def test_check_unknown_capability_returns_locked(db: Path):
     """Given an unknown capability name, check should return unlocked=False."""
     result = capability_gates.check("nonexistent_feature", db_path=db)
@@ -229,20 +271,20 @@ def test_locked_reason_returns_string_when_locked(db: Path):
 # ---------------------------------------------------------------------------
 
 def test_progress_summary_empty_db(db: Path):
-    """Given empty db, progress_summary should show 1 unlocked, 7 locked."""
+    """Given empty db, progress_summary should show 1 unlocked, 10 locked."""
     summary = capability_gates.progress_summary(db_path=db)
-    assert summary["total"] == 8
+    assert summary["total"] == 11
     assert summary["unlocked_count"] == 1
     assert "agent_chat" in summary["unlocked"]
-    assert len(summary["locked"]) == 7
+    assert len(summary["locked"]) == 10
     assert "discipline" in summary["locked"]
 
 
 def test_progress_summary_seeded_db(seeded_db: Path):
-    """Given seeded db, progress_summary should show all 8 unlocked."""
+    """Given seeded db, progress_summary should show all 11 unlocked."""
     summary = capability_gates.progress_summary(db_path=seeded_db)
-    assert summary["total"] == 8
-    assert summary["unlocked_count"] == 8
+    assert summary["total"] == 11
+    assert summary["unlocked_count"] == 11
     assert len(summary["locked"]) == 0
 
 
@@ -301,4 +343,4 @@ def test_check_handles_archived_ledger_rows(tmp_path: Path):
 def test_capabilities_tuple_is_complete():
     """Given CAPABILITIES, it should match the gate function registry keys."""
     assert set(capability_gates.CAPABILITIES) == set(capability_gates._GATE_FUNCS.keys())
-    assert len(capability_gates.CAPABILITIES) == 8
+    assert len(capability_gates.CAPABILITIES) == 11
