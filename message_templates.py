@@ -260,6 +260,17 @@ def exam_readiness(snapshot: dict[str, Any]) -> str:
         sections.append(("Open doubts", ["No teacher-ready doubt remains for an exam-day escalation."]))
     else:
         sections.append(("Open doubts", ["No matching open doubt is recorded."]))
+    high_weightage = list(snapshot.get("high_weightage_doubts") or [])
+    if high_weightage:
+        weightage_lines = []
+        for row in high_weightage[:5]:
+            weight = row.get("weightage") or {}
+            chapter = weight.get("chapter") or clip(row.get("core_concept"), 60)
+            weightage_lines.append(
+                f"{clip(chapter, 60)} — #{weight.get('weightage_rank')} by "
+                f"weightage · {weight.get('total_questions')} Q, still open"
+            )
+        sections.append(("High-weightage open doubts", weightage_lines))
     if excluded:
         sections.append(("Excluded for this exam", [
             clip(row.get("core_concept") or "Untitled doubt", 90)

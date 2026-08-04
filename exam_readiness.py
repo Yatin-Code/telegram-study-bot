@@ -416,6 +416,43 @@ def _strategy_priorities(
     return priorities, summary
 
 
+def _enrich_weightage(
+    rows: list[dict[str, Any]], *, db_path: str | Path,
+) -> list[dict[str, Any]]:
+    """Attach JEE chapter weightage to open doubts that match a known chapter.
+
+    Matching is case-insensitive and whitespace-normalised on BOTH sides (the
+    doubt's subject/chapter come from Notion with unknown casing; the JEE
+    chapter names are canonical). A doubt whose chapter ranks in the top 15% of
+    weightage is flagged ``high_weightage=True``. Degrades to a no-op when the
+    ``op_jee_*`` tables are empty or the chapter does not match.
+    """
+    try:
+        from jee_data_loader import _norm, chapter_weightage
+        weightage = chapter_weightage(db_path=db_path)
+    except Exception:
+        return rows
+    if not weightage:
+        return rows
+    for row in rows:
+        subject = str(row.get("subject") or "").strip()
+        chapter = str(row.get("chapter") or "").strip()
+        if not subject or not chapter:
+            continue
+        entry = weightage.get((_norm(subject), _norm(chapter)))
+        if entry is None:
+            continue
+        row["weightage"] = {
+            "chapter": entry["chapter"],
+            "weightage_rank": entry["rank"],
+            "total_questions": entry["total_questions"],
+        }
+        row["high_weightage"] = (
+            entry["rank"] <= max(1, int(round(0.15 * entry["total_chapters"])))
+        )
+    return rows
+
+
 def collect(
     exam: dict[str, Any], *, now: dt.datetime | None = None,
     db_path: str | Path = DEFAULT_DB_PATH, phase: str | None = None,
@@ -517,6 +554,8 @@ def collect(
         exam=exam, syllabus=syllabus, doubts=relevant, revision=revision,
         days=days, db_path=db_path,
     )
+    relevant = _enrich_weightage(relevant, db_path=db_path)
+    high_weightage = [row for row in relevant if row.get("high_weightage")]
     return {
         "exam": exam, "exam_id": exam_id, "exam_day": exam_day,
         "days_until": days, "phase": phase or "manual",
@@ -527,6 +566,7 @@ def collect(
         "scope_uncertain_count": sum(
             1 for row in relevant if row.get("scope_uncertain")
         ),
+        "high_weightage_doubts": high_weightage,
         "strategy_priorities": strategy_priorities,
         "strategy": strategy,
         "collected_at": now.isoformat(), "created_plan_rows": 0,

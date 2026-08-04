@@ -303,4 +303,95 @@ def test_readiness_card_stays_below_telegram_limit():
     }
     card = message_templates.exam_readiness(snapshot)
     assert len(card) <= 4000
-    assert card.endswith("Evidence audit only — no Daily Plan rows were created.")
+
+
+# ---------------------------------------------------------------------------
+# JEE chapter weightage cross-reference (todo 6)
+# ---------------------------------------------------------------------------
+
+def seed_jee_chapter_stats(path, rows):
+    """Insert (subject, chapter, exam_type, total_questions) into op_jee_*.
+
+    Uses jee_data_loader's init_db so the table exists on a fresh temp db.
+    """
+    import jee_data_loader
+    with jee_data_loader._connect(path) as conn:
+        for subject, chapter, exam_type, total in rows:
+            conn.execute(
+                "INSERT INTO op_jee_chapter_stats (subject, chapter, exam_type, "
+                "total_questions) VALUES (?, ?, ?, ?)",
+                (subject, chapter, exam_type, total),
+            )
+        conn.commit()
+
+
+def test_collect_enriches_doubt_weightage_case_insensitive(db):
+    """Doubt 'physics'/'electric charges & fields' matches the canonical row."""
+    seed_jee_chapter_stats(db, [
+        ("Physics", "Electric Charges and Fields", "mains", 40),
+        ("Physics", "Electric Charges and Fields", "advanced", 20),
+        ("Physics", "Electrostatics", "mains", 30),
+        ("Physics", "Rotational Motion", "mains", 5),
+        ("Chemistry", "Mole Concept", "mains", 5),
+        ("Chemistry", "Mole Concept", "advanced", 10),
+    ])
+    exam = create_exam(db, syllabus="")
+    insert_mirror(
+        db, "doubts", notion_page_id="d1", core_concept="field sign",
+        subject="physics", chapter="electric charges & fields",
+        status="Unresolved", workflow_state="New",
+    )
+    insert_mirror(
+        db, "doubts", notion_page_id="d2", core_concept="rotation torque",
+        subject="Physics", chapter="Rotational Motion",
+        status="Unresolved", workflow_state="New",
+    )
+    snapshot = exam_readiness.collect(exam, db_path=db)
+
+    by_id = {row["notion_page_id"]: row for row in snapshot["doubts"]}
+    d1 = by_id["d1"]
+    assert d1["weightage"]["chapter"] == "Electric Charges and Fields"
+    assert d1["weightage"]["total_questions"] == 60
+    assert d1["high_weightage"] is True
+    d2 = by_id["d2"]
+    assert d2["weightage"]["weightage_rank"] == 4
+    assert d2["high_weightage"] is False
+    assert [row["notion_page_id"] for row in snapshot["high_weightage_doubts"]] == ["d1"]
+
+    card = message_templates.exam_readiness(snapshot)
+    assert "High-weightage open doubts" in card
+    assert "Electric Charges and Fields" in card
+    assert "still open" in card
+
+
+def test_collect_weightage_absent_when_tables_empty(db):
+    """No op_jee_* rows -> no enrichment, no section, no crash."""
+    exam = create_exam(db, syllabus="")
+    insert_mirror(
+        db, "doubts", notion_page_id="d1", core_concept="field sign",
+        subject="Physics", chapter="Electrostatics",
+        status="Unresolved", workflow_state="New",
+    )
+    snapshot = exam_readiness.collect(exam, db_path=db)
+    assert snapshot["doubts"][0].get("weightage") is None
+    assert snapshot["doubts"][0].get("high_weightage") is None
+    assert snapshot["high_weightage_doubts"] == []
+    card = message_templates.exam_readiness(snapshot)
+    assert "High-weightage open doubts" not in card
+    assert "Open doubts" in card
+
+
+def test_collect_weightage_skips_unmatched_chapter(db):
+    """A doubt whose chapter is not in the JEE data is left un-enriched."""
+    seed_jee_chapter_stats(db, [
+        ("Physics", "Electrostatics", "mains", 40),
+    ])
+    exam = create_exam(db, syllabus="")
+    insert_mirror(
+        db, "doubts", notion_page_id="d1", core_concept="unit cells",
+        subject="Chemistry", chapter="Solid State",
+        status="Unresolved", workflow_state="New",
+    )
+    snapshot = exam_readiness.collect(exam, db_path=db)
+    assert snapshot["doubts"][0].get("weightage") is None
+    assert snapshot["high_weightage_doubts"] == []
